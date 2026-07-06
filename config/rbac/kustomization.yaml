@@ -18,3 +18,29 @@ resources:
 - metrics_auth_role.yaml
 - metrics_auth_role_binding.yaml
 - metrics_reader_role.yaml
+# For each CRD, "Admin", "Editor" and "Viewer" roles are scaffolded by
+# default, aiding admins in cluster management. Those roles are
+# not used by the pulsar-operator itself. You can comment the following lines
+# if you do not want those helpers be installed with your Project.
+- metadata_oxiacluster_admin_role.yaml
+- metadata_oxiacluster_editor_role.yaml
+- metadata_oxiacluster_viewer_role.yaml
+- cluster_functionsworker_admin_role.yaml
+- cluster_functionsworker_editor_role.yaml
+- cluster_functionsworker_viewer_role.yaml
+- cluster_autorecovery_admin_role.yaml
+- cluster_autorecovery_editor_role.yaml
+- cluster_autorecovery_viewer_role.yaml
+- cluster_proxy_admin_role.yaml
+- cluster_proxy_editor_role.yaml
+- cluster_proxy_viewer_role.yaml
+- cluster_bookkeeper_admin_role.yaml
+- cluster_bookkeeper_editor_role.yaml
+- cluster_bookkeeper_viewer_role.yaml
+- cluster_broker_admin_role.yaml
+- cluster_broker_editor_role.yaml
+- cluster_broker_viewer_role.yaml
+- cluster_pulsarcluster_admin_role.yaml
+- cluster_pulsarcluster_editor_role.yaml
+- cluster_pulsarcluster_viewer_role.yaml
+

@@ -9,4 +9,68 @@ layout:
 multigroup: true
 projectName: pulsar-operator
 repo: github.com/andrew01234567890/pulsar-operator
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: pulsaroperator.io
+  group: cluster
+  kind: PulsarCluster
+  path: github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: pulsaroperator.io
+  group: cluster
+  kind: Broker
+  path: github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: pulsaroperator.io
+  group: cluster
+  kind: BookKeeper
+  path: github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: pulsaroperator.io
+  group: cluster
+  kind: Proxy
+  path: github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: pulsaroperator.io
+  group: cluster
+  kind: AutoRecovery
+  path: github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: pulsaroperator.io
+  group: cluster
+  kind: FunctionsWorker
+  path: github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: pulsaroperator.io
+  group: metadata
+  kind: OxiaCluster
+  path: github.com/andrew01234567890/pulsar-operator/api/metadata/v1alpha1
+  version: v1alpha1
 version: "3"

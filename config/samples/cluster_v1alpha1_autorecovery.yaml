@@ -1,0 +1,9 @@
+apiVersion: cluster.pulsaroperator.io/v1alpha1
+kind: AutoRecovery
+metadata:
+  labels:
+    app.kubernetes.io/name: pulsar-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: autorecovery-sample
+spec:
+  # TODO(user): Add fields here
