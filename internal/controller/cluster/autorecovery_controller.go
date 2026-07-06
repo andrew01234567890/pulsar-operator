@@ -61,6 +61,11 @@ const (
 	autoRecoveryConfigFileName  = "bookkeeper.conf"
 	autoRecoveryConfigMountPath = "/pulsar/conf/" + autoRecoveryConfigFileName
 	autoRecoveryConfigVolume    = "config"
+
+	// autoRecoveryKeyMetadataServiceURI is the bookkeeper.conf key pointing at
+	// the metadata store. Left blank in the operator defaults - AutoRecovery
+	// never invents a store URL; it is supplied only via spec.config.
+	autoRecoveryKeyMetadataServiceURI = "metadataServiceUri"
 )
 
 // AutoRecoveryReconciler reconciles an AutoRecovery object.
@@ -163,7 +168,7 @@ func (r *AutoRecoveryReconciler) reconcileEmbedded(ctx context.Context, autoReco
 	autoRecovery.Status.ReadyReplicas = 0
 
 	return metav1.Condition{
-		Type:               readyConditionType,
+		Type:               conditionTypeReady,
 		Status:             metav1.ConditionTrue,
 		Reason:             "EmbeddedMode",
 		ObservedGeneration: autoRecovery.Generation,
@@ -278,9 +283,9 @@ func autoRecoveryReplicas(spec clusterv1alpha1.AutoRecoverySpec) int32 {
 // it is wired in only via spec.config, never invented here.
 func autoRecoveryDefaultConfig() map[string]string {
 	return map[string]string{
-		"metadataServiceUri": "",
-		"httpServerEnabled":  configValTrue,
-		"httpServerPort":     strconv.Itoa(autoRecoveryHTTPPort),
+		autoRecoveryKeyMetadataServiceURI: "",
+		"httpServerEnabled":               configValTrue,
+		"httpServerPort":                  strconv.Itoa(autoRecoveryHTTPPort),
 	}
 }
 

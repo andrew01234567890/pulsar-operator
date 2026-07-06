@@ -77,7 +77,7 @@ var _ = Describe("FunctionsWorker Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-pdb", Namespace: resourceNamespace}, &policyv1.PodDisruptionBudget{})).
 				To(MatchError(errors.IsNotFound, "IsNotFound"))
 
-			cond := apimeta.FindStatusCondition(fw.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(fw.Status.Conditions, conditionTypeReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(cond.Reason).To(Equal("ColocatedMode"))
@@ -122,7 +122,7 @@ var _ = Describe("FunctionsWorker Controller", func() {
 			Expect(rendered).To(ContainSubstring("packagesManagementStorageProvider: " + fileSystemPackagesStorageProviderClass))
 			Expect(rendered).To(ContainSubstring("functionsWorkerEnablePackageManagement: \"true\""))
 
-			cond := apimeta.FindStatusCondition(fw.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(fw.Status.Conditions, conditionTypeReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(reasonProgressing))
@@ -140,7 +140,7 @@ var _ = Describe("FunctionsWorker Controller", func() {
 			By("simulating a fully converged rollout")
 			setStatefulSetRolloutStatus(sts, sts.Generation, 1, 1, 1)
 			fw := reconcileFunctionsWorker(resourceName)
-			cond := apimeta.FindStatusCondition(fw.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(fw.Status.Conditions, conditionTypeReady)
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(cond.Reason).To(Equal(reasonReplicasReady))
 
@@ -148,7 +148,7 @@ var _ = Describe("FunctionsWorker Controller", func() {
 			Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
 			setStatefulSetRolloutStatus(sts, sts.Generation-1, 1, 1, 1)
 			fw = reconcileFunctionsWorker(resourceName)
-			cond = apimeta.FindStatusCondition(fw.Status.Conditions, readyConditionType)
+			cond = apimeta.FindStatusCondition(fw.Status.Conditions, conditionTypeReady)
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(reasonProgressing))
 		})
@@ -171,7 +171,7 @@ var _ = Describe("FunctionsWorker Controller", func() {
 
 		It("reports Ready with a ScaledToZero reason", func() {
 			fw := reconcileFunctionsWorker(resourceName)
-			cond := apimeta.FindStatusCondition(fw.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(fw.Status.Conditions, conditionTypeReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(cond.Reason).To(Equal(reasonScaledToZero))
@@ -216,7 +216,7 @@ var _ = Describe("FunctionsWorker Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-pdb", Namespace: resourceNamespace}, &policyv1.PodDisruptionBudget{})).
 				To(MatchError(errors.IsNotFound, "IsNotFound"))
 
-			cond := apimeta.FindStatusCondition(fw.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(fw.Status.Conditions, conditionTypeReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Reason).To(Equal("ColocatedMode"))
 		})

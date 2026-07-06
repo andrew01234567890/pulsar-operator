@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -75,6 +76,13 @@ const (
 	proxyTLSMountPath = "/pulsar/certs/proxy"
 	proxyTLSCertPath  = proxyTLSMountPath + "/tls.crt"
 	proxyTLSKeyPath   = proxyTLSMountPath + "/tls.key"
+
+	// reasonTLSMisconfigured marks a Proxy that asked for TLS
+	// (tls.enabled=true) without a cert Secret (tls.secretName empty). The
+	// admission CEL rule rejects this, so it only reaches the reconciler on a
+	// cluster whose CRD predates the rule; the reconciler flags it Degraded
+	// rather than silently coming up plaintext.
+	reasonTLSMisconfigured = "TLSMisconfigured"
 )
 
 // ProxyReconciler reconciles a Proxy object.
@@ -86,6 +94,10 @@ const (
 type ProxyReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Recorder emits Warning events for misconfigurations (e.g. TLS enabled
+	// without a cert Secret). Optional: nil-safe so unit/integration tests can
+	// construct the reconciler without a recorder.
+	Recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=cluster.pulsaroperator.io,resources=proxies,verbs=get;list;watch;create;update;patch;delete
@@ -96,6 +108,7 @@ type ProxyReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile drives a Proxy toward its desired StatefulSet/Service/ConfigMap/
 // PodDisruptionBudget state and reports aggregated readiness on its status.
@@ -105,6 +118,14 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	proxy := &clusterv1alpha1.Proxy{}
 	if err := r.Get(ctx, req.NamespacedName, proxy); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Fail closed on a TLS request with no cert Secret rather than bringing
+	// the proxy up plaintext-only behind the user's back. Admission normally
+	// rejects this; handled here as defense in depth for objects predating the
+	// CRD's CEL rule.
+	if proxyTLSMisconfigured(proxy.Spec) {
+		return r.reportTLSMisconfigured(ctx, proxy)
 	}
 
 	labels := builder.Labels(proxy.Name, proxyComponent)
@@ -245,6 +266,39 @@ func proxyReplicas(spec clusterv1alpha1.ProxySpec) int32 {
 // (a cert Secret) to actually be wired into the container/config/ports.
 func proxyTLSWired(tls *clusterv1alpha1.ProxyTlsConfig) bool {
 	return tls != nil && tls.Enabled && tls.SecretName != ""
+}
+
+// proxyTLSMisconfigured reports the fail-closed case: TLS was requested
+// (enabled) but no cert Secret was named, so the operator cannot serve TLS
+// and must not silently fall back to plaintext.
+func proxyTLSMisconfigured(spec clusterv1alpha1.ProxySpec) bool {
+	return spec.Tls != nil && spec.Tls.Enabled && spec.Tls.SecretName == ""
+}
+
+// reportTLSMisconfigured records the Degraded state for a TLS-requested Proxy
+// with no cert Secret: a Warning event plus a Ready=False/TLSMisconfigured
+// condition, without reconciling any workload (so no plaintext proxy is
+// created).
+func (r *ProxyReconciler) reportTLSMisconfigured(ctx context.Context, proxy *clusterv1alpha1.Proxy) (ctrl.Result, error) {
+	const msg = "tls.enabled=true but tls.secretName is empty; refusing to serve the proxy plaintext-only"
+
+	if r.Recorder != nil {
+		r.Recorder.Event(proxy, corev1.EventTypeWarning, reasonTLSMisconfigured, msg)
+	}
+
+	proxy.Status.ObservedGeneration = proxy.Generation
+	apimeta.SetStatusCondition(&proxy.Status.Conditions, metav1.Condition{
+		Type:               conditionTypeReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonTLSMisconfigured,
+		ObservedGeneration: proxy.Generation,
+		Message:            msg,
+	})
+
+	if err := r.Status().Update(ctx, proxy); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating Proxy status: %w", err)
+	}
+	return ctrl.Result{}, nil
 }
 
 // proxyDefaultConfig returns the operator's baseline proxy.conf. metadataStoreUrl

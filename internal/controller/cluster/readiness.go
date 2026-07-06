@@ -23,19 +23,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// conditionTypeReady ("Ready") and reasonProgressing ("Progressing") are
+// declared once for this package (in pulsarcluster_controller.go and
+// bookkeeper_controller.go respectively) and reused here. The two reasons
+// below are specific to the stateless/optional tiers this helper serves and
+// deliberately differ from BookKeeper's (which treats zero replicas as an
+// error, not a parked tier).
 const (
-	readyConditionType = "Ready"
-
 	// reasonReplicasReady marks a fully-converged workload: the controller
 	// has observed the current spec and every desired pod is updated to the
 	// latest template and Ready.
 	reasonReplicasReady = "ReplicasReady"
-
-	// reasonProgressing marks a workload whose rollout has not yet converged
-	// - either the controller hasn't observed the latest generation, or some
-	// pods are still on the old template / not yet Ready. Reported during the
-	// rolling restart that a config-checksum or image change triggers.
-	reasonProgressing = "Progressing"
 
 	// reasonScaledToZero marks a tier deliberately parked at 0 replicas. Kept
 	// Ready=True (non-blocking for umbrella rollups and `kubectl wait`) but
@@ -94,7 +92,7 @@ func deploymentRollout(deploy *appsv1.Deployment) rolloutStatus {
 //
 // noun names the component in the human-readable message (e.g. "proxy").
 func workloadReadyCondition(generation int64, desired int32, rollout rolloutStatus, noun string) metav1.Condition {
-	base := metav1.Condition{Type: readyConditionType, ObservedGeneration: generation}
+	base := metav1.Condition{Type: conditionTypeReady, ObservedGeneration: generation}
 
 	switch {
 	case desired == 0:

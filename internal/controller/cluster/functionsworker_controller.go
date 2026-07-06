@@ -186,7 +186,7 @@ func (r *FunctionsWorkerReconciler) reconcileColocated(ctx context.Context, fw *
 	fw.Status.ReadyReplicas = 0
 
 	return metav1.Condition{
-		Type:               readyConditionType,
+		Type:               conditionTypeReady,
 		Status:             metav1.ConditionTrue,
 		Reason:             "ColocatedMode",
 		ObservedGeneration: fw.Generation,

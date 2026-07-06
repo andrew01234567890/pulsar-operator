@@ -73,7 +73,7 @@ var _ = Describe("AutoRecovery Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-config", Namespace: resourceNamespace}, &corev1.ConfigMap{})).
 				To(MatchError(errors.IsNotFound, "IsNotFound"))
 
-			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, conditionTypeReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(cond.Reason).To(Equal("EmbeddedMode"))
@@ -123,7 +123,7 @@ var _ = Describe("AutoRecovery Controller", func() {
 			// envtest runs no Deployment controller, so it never observes its
 			// generation or gets Ready pods: AutoRecovery must honestly report
 			// Progressing.
-			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, conditionTypeReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(reasonProgressing))
@@ -141,7 +141,7 @@ var _ = Describe("AutoRecovery Controller", func() {
 			By("simulating a fully converged rollout")
 			setDeploymentRolloutStatus(deploy, deploy.Generation, two, two, two)
 			autoRecovery := reconcileAutoRecovery(resourceName)
-			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, conditionTypeReady)
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(cond.Reason).To(Equal(reasonReplicasReady))
 
@@ -149,7 +149,7 @@ var _ = Describe("AutoRecovery Controller", func() {
 			Expect(k8sClient.Get(ctx, key, deploy)).To(Succeed())
 			setDeploymentRolloutStatus(deploy, deploy.Generation, 1, two, two)
 			autoRecovery = reconcileAutoRecovery(resourceName)
-			cond = apimeta.FindStatusCondition(autoRecovery.Status.Conditions, readyConditionType)
+			cond = apimeta.FindStatusCondition(autoRecovery.Status.Conditions, conditionTypeReady)
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(reasonProgressing))
 		})
@@ -172,7 +172,7 @@ var _ = Describe("AutoRecovery Controller", func() {
 
 		It("reports Ready with a ScaledToZero reason", func() {
 			autoRecovery := reconcileAutoRecovery(resourceName)
-			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, conditionTypeReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(cond.Reason).To(Equal(reasonScaledToZero))
@@ -212,7 +212,7 @@ var _ = Describe("AutoRecovery Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-config", Namespace: resourceNamespace}, &corev1.ConfigMap{})).
 				To(MatchError(errors.IsNotFound, "IsNotFound"))
 
-			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, conditionTypeReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Reason).To(Equal("EmbeddedMode"))
 		})
@@ -269,17 +269,18 @@ func TestAutoRecoveryReplicas(t *testing.T) {
 
 func TestAutoRecoveryMergedConfigLeavesMetadataServiceURIBlank(t *testing.T) {
 	got := autoRecoveryMergedConfig(clusterv1alpha1.AutoRecoverySpec{})
-	if v, ok := got["metadataServiceUri"]; !ok || v != "" {
+	if v, ok := got[autoRecoveryKeyMetadataServiceURI]; !ok || v != "" {
 		t.Errorf("metadataServiceUri = %q (present=%v), want blank (must not hardcode a store naming convention)", v, ok)
 	}
 }
 
 func TestAutoRecoveryMergedConfigUserOverrideWins(t *testing.T) {
+	const override = "metadata-store:oxia://oxia-coordinator:6648/bookkeeper"
 	got := autoRecoveryMergedConfig(clusterv1alpha1.AutoRecoverySpec{
-		Config: map[string]string{"metadataServiceUri": "metadata-store:oxia://oxia-coordinator:6648/bookkeeper"},
+		Config: map[string]string{autoRecoveryKeyMetadataServiceURI: override},
 	})
-	if got["metadataServiceUri"] != "metadata-store:oxia://oxia-coordinator:6648/bookkeeper" {
-		t.Errorf("metadataServiceUri = %q, want user override", got["metadataServiceUri"])
+	if got[autoRecoveryKeyMetadataServiceURI] != override {
+		t.Errorf("metadataServiceUri = %q, want user override", got[autoRecoveryKeyMetadataServiceURI])
 	}
 }
 

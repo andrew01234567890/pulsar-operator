@@ -23,13 +23,19 @@ import (
 )
 
 // ProxyTlsConfig configures TLS/mTLS termination on the proxy.
+//
+// enabled without a secretName is rejected at admission: it would otherwise
+// bring the proxy up plaintext-only while the user believed TLS was on, a
+// silent security downgrade.
+// +kubebuilder:validation:XValidation:rule="!self.enabled || (has(self.secretName) && size(self.secretName) > 0)",message="tls.secretName is required when tls.enabled is true"
 type ProxyTlsConfig struct {
 	// enabled turns on TLS termination on the proxy's client-facing ports.
 	// +optional
 	// +kubebuilder:default=false
 	Enabled bool `json:"enabled,omitempty"`
 
-	// secretName is the Secret holding the TLS certificate/key served by the proxy.
+	// secretName is the Secret holding the TLS certificate/key served by the
+	// proxy. Required when enabled is true.
 	// +optional
 	SecretName string `json:"secretName,omitempty"`
 }

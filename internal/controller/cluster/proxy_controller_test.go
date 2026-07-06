@@ -18,6 +18,7 @@ package cluster
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -25,8 +26,13 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -106,7 +112,7 @@ var _ = Describe("Proxy Controller", func() {
 			// envtest runs no StatefulSet controller, so the StatefulSet never
 			// observes its generation or gets Ready pods: the Proxy must
 			// honestly report Progressing rather than lying about readiness.
-			cond := apimeta.FindStatusCondition(proxy.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(proxy.Status.Conditions, conditionTypeReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(reasonProgressing))
@@ -212,6 +218,20 @@ var _ = Describe("Proxy Controller", func() {
 		})
 	})
 
+	// Regression (security): tls.enabled=true with an empty tls.secretName is a
+	// silent plaintext downgrade. Layer 1 - the CRD's CEL rule - must reject it
+	// at admission.
+	Context("admission of a Proxy with TLS enabled but no secretName", func() {
+		It("is rejected by the CRD validation rule", func() {
+			err := k8sClient.Create(ctx, &clusterv1alpha1.Proxy{
+				ObjectMeta: metav1.ObjectMeta{Name: "proxy-tls-nosecret", Namespace: resourceNamespace},
+				Spec:       clusterv1alpha1.ProxySpec{Tls: &clusterv1alpha1.ProxyTlsConfig{Enabled: true}},
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("tls.secretName is required when tls.enabled is true"))
+		})
+	})
+
 	Context("rollout-aware readiness", func() {
 		const resourceName = "proxy-rollout"
 		key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
@@ -240,7 +260,7 @@ var _ = Describe("Proxy Controller", func() {
 			By("simulating a fully converged rollout")
 			setStatefulSetRolloutStatus(sts, sts.Generation, two, two, two)
 			proxy := reconcileProxy(resourceName)
-			cond := apimeta.FindStatusCondition(proxy.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(proxy.Status.Conditions, conditionTypeReady)
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(cond.Reason).To(Equal(reasonReplicasReady))
 
@@ -248,7 +268,7 @@ var _ = Describe("Proxy Controller", func() {
 			Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
 			setStatefulSetRolloutStatus(sts, sts.Generation, 1, two, two)
 			proxy = reconcileProxy(resourceName)
-			cond = apimeta.FindStatusCondition(proxy.Status.Conditions, readyConditionType)
+			cond = apimeta.FindStatusCondition(proxy.Status.Conditions, conditionTypeReady)
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(reasonProgressing))
 
@@ -256,7 +276,7 @@ var _ = Describe("Proxy Controller", func() {
 			Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
 			setStatefulSetRolloutStatus(sts, sts.Generation-1, two, two, two)
 			proxy = reconcileProxy(resourceName)
-			cond = apimeta.FindStatusCondition(proxy.Status.Conditions, readyConditionType)
+			cond = apimeta.FindStatusCondition(proxy.Status.Conditions, conditionTypeReady)
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(reasonProgressing))
 		})
@@ -279,7 +299,7 @@ var _ = Describe("Proxy Controller", func() {
 
 		It("reports Ready with a ScaledToZero reason rather than a serving-looking ReplicasReady", func() {
 			proxy := reconcileProxy(resourceName)
-			cond := apimeta.FindStatusCondition(proxy.Status.Conditions, readyConditionType)
+			cond := apimeta.FindStatusCondition(proxy.Status.Conditions, conditionTypeReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(cond.Reason).To(Equal(reasonScaledToZero))
@@ -346,6 +366,88 @@ func TestProxyTLSWired(t *testing.T) {
 				t.Errorf("proxyTLSWired(%+v) = %v, want %v", tt.tls, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestProxyTLSMisconfigured(t *testing.T) {
+	tests := []struct {
+		name string
+		spec clusterv1alpha1.ProxySpec
+		want bool
+	}{
+		{name: "no tls block", spec: clusterv1alpha1.ProxySpec{}, want: false},
+		{name: "disabled", spec: clusterv1alpha1.ProxySpec{Tls: &clusterv1alpha1.ProxyTlsConfig{Enabled: false}}, want: false},
+		{name: "enabled with secret", spec: clusterv1alpha1.ProxySpec{Tls: &clusterv1alpha1.ProxyTlsConfig{Enabled: true, SecretName: "s"}}, want: false},
+		{name: "enabled without secret", spec: clusterv1alpha1.ProxySpec{Tls: &clusterv1alpha1.ProxyTlsConfig{Enabled: true}}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := proxyTLSMisconfigured(tt.spec); got != tt.want {
+				t.Errorf("proxyTLSMisconfigured(%+v) = %v, want %v", tt.spec, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestProxyReconcileTLSMisconfiguredIsDegraded is the layer-2 (defense in
+// depth) regression: an object that reaches the reconciler with
+// tls.enabled=true and no secretName (e.g. admitted before the CRD's CEL rule
+// existed) must be flagged Degraded, emit a Warning event, and create NO
+// workload - never a silent plaintext proxy. A fake client is used because
+// the envtest apiserver's CEL rule now rejects such objects at admission.
+func TestProxyReconcileTLSMisconfiguredIsDegraded(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clusterv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(appsv1.AddToScheme(scheme))
+	utilruntime.Must(corev1.AddToScheme(scheme))
+
+	const (
+		name = "proxy-degraded"
+		ns   = "default"
+	)
+	proxy := &clusterv1alpha1.Proxy{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec:       clusterv1alpha1.ProxySpec{Tls: &clusterv1alpha1.ProxyTlsConfig{Enabled: true}},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(proxy).
+		WithStatusSubresource(&clusterv1alpha1.Proxy{}).
+		Build()
+	rec := record.NewFakeRecorder(8)
+	r := &ProxyReconciler{Client: c, Scheme: scheme, Recorder: rec}
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: name, Namespace: ns}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("Reconcile returned error: %v", err)
+	}
+
+	got := &clusterv1alpha1.Proxy{}
+	if err := c.Get(ctx, key, got); err != nil {
+		t.Fatalf("get proxy: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
+	if cond == nil {
+		t.Fatal("no Ready condition set")
+	}
+	if cond.Status != metav1.ConditionFalse || cond.Reason != reasonTLSMisconfigured {
+		t.Errorf("Ready condition = %s/%s, want False/%s", cond.Status, cond.Reason, reasonTLSMisconfigured)
+	}
+
+	// No plaintext workload may have been created.
+	if err := c.Get(ctx, key, &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no StatefulSet, got err=%v", err)
+	}
+
+	// A Warning event must have been recorded.
+	select {
+	case e := <-rec.Events:
+		if !strings.Contains(e, reasonTLSMisconfigured) || !strings.Contains(e, "Warning") {
+			t.Errorf("event = %q, want a Warning mentioning %s", e, reasonTLSMisconfigured)
+		}
+	default:
+		t.Error("expected a Warning event, got none")
 	}
 }
 
