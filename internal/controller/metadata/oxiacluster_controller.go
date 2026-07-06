@@ -19,6 +19,11 @@ package metadata
 import (
 	"context"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,28 +41,86 @@ type OxiaClusterReconciler struct {
 // +kubebuilder:rbac:groups=metadata.pulsaroperator.io,resources=oxiaclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=metadata.pulsaroperator.io,resources=oxiaclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=metadata.pulsaroperator.io,resources=oxiaclusters/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the OxiaCluster object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.24.1/pkg/reconcile
+// Reconcile drives an OxiaCluster towards two owned workloads: an
+// oxia-server StatefulSet (the data plane) and an oxia-coordinator
+// Deployment (shard assignment), plus the ConfigMaps, RBAC, and Services
+// that connect them. The server is reconciled first because the
+// coordinator's static servers list is derived from the server's *desired*
+// replica count, so a servers-list change (and the coordinator restart that
+// must follow it) takes effect on the same reconcile a server scale
+// request does, rather than lagging a reconcile behind.
 func (r *OxiaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	var oxia metadatav1alpha1.OxiaCluster
+	if err := r.Get(ctx, req.NamespacedName, &oxia); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if err := r.reconcileServer(ctx, &oxia); err != nil {
+		log.Error(err, "Failed to reconcile oxia-server")
+		return ctrl.Result{}, err
+	}
+
+	if _, err := r.reconcileCoordinator(ctx, &oxia); err != nil {
+		log.Error(err, "Failed to reconcile oxia-coordinator")
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileStatus(ctx, &oxia); err != nil {
+		log.Error(err, "Failed to update OxiaCluster status")
+		return ctrl.Result{}, err
+	}
 
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
+func (r *OxiaClusterReconciler) reconcileStatus(ctx context.Context, oxia *metadatav1alpha1.OxiaCluster) error {
+	coordinator := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Name: coordinatorName(oxia.Name), Namespace: oxia.Namespace}, coordinator); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	server := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Name: serverName(oxia.Name), Namespace: oxia.Namespace}, server); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	newStatus := aggregateStatus(oxia, coordinator, server)
+	if equality.Semantic.DeepEqual(oxia.Status, newStatus) {
+		return nil
+	}
+
+	oxia.Status = newStatus
+	return r.Status().Update(ctx, oxia)
+}
+
+// SetupWithManager sets up the controller with the Manager. Owns() on every
+// child kind matters for more than drift-correction: without it, a change
+// that originates on the child itself — most importantly a StatefulSet/
+// Deployment's status.readyReplicas catching up after a scale — never
+// re-enqueues the OxiaCluster, so status.conditions[Ready] would go stale
+// (stuck reporting "not ready" long after every pod actually turned Ready)
+// until something else happened to touch the OxiaCluster's own spec.
 func (r *OxiaClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&metadatav1alpha1.OxiaCluster{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&appsv1.StatefulSet{}).
+		Owns(&corev1.Service{}).
+		Owns(&corev1.ConfigMap{}).
+		Owns(&corev1.ServiceAccount{}).
+		Owns(&rbacv1.Role{}).
+		Owns(&rbacv1.RoleBinding{}).
 		Named("metadata-oxiacluster").
 		Complete(r)
 }
