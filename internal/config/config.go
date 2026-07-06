@@ -36,19 +36,50 @@ func Merge(base, overrides map[string]string) map[string]string {
 // RenderProperties renders cfg as a flat `key=value` properties file, one
 // entry per line with keys sorted lexicographically for deterministic
 // output. Suitable for broker.conf, bookkeeper.conf, proxy.conf, and
-// standalone.conf ConfigMap data.
+// standalone.conf ConfigMap data. Keys and values are escaped per
+// java.util.Properties semantics so a value containing a newline, CR, or tab
+// cannot split into extra property lines and a key containing `=`/`:`/space
+// stays unambiguous; the output round-trips through a Properties-style parse.
 func RenderProperties(cfg map[string]string) string {
 	keys := sortedKeys(cfg)
 
 	var b strings.Builder
 	for _, k := range keys {
-		b.WriteString(k)
+		b.WriteString(propKeyEscaper.Replace(k))
 		b.WriteByte('=')
-		b.WriteString(cfg[k])
+		b.WriteString(propValueEscaper.Replace(cfg[k]))
 		b.WriteByte('\n')
 	}
 	return b.String()
 }
+
+// propValueEscaper escapes a property value per java.util.Properties store
+// semantics so it round-trips: backslash must come first so escapes we
+// introduce aren't re-escaped. `=` / `:` need no escaping in a value (only
+// the separator between key and value is significant); leading spaces are
+// left as-is (Pulsar conf values are not leading-space-sensitive), so a
+// value is only altered when it contains a backslash or a control char that
+// would otherwise break the single-line-per-property format.
+var propValueEscaper = strings.NewReplacer(
+	"\\", "\\\\",
+	"\n", "\\n",
+	"\r", "\\r",
+	"\t", "\\t",
+)
+
+// propKeyEscaper escapes a property key: everything the value escaper does,
+// plus the token separators (`=`, `:`) and whitespace, each with a leading
+// backslash, so the key is unambiguous and terminates at the literal `=` we
+// emit rather than at any separator character inside the key itself.
+var propKeyEscaper = strings.NewReplacer(
+	"\\", "\\\\",
+	"\n", "\\n",
+	"\r", "\\r",
+	"\t", "\\t",
+	" ", "\\ ",
+	"=", "\\=",
+	":", "\\:",
+)
 
 // PrefixedEnv converts cfg into a deterministic, sorted-by-key list of
 // PULSAR_PREFIX_<key> env vars, the mechanism a per-set override (e.g. one

@@ -12,7 +12,11 @@ const (
 	keyBrokerServicePort = "brokerServicePort"
 	keyWebServicePort    = "webServicePort"
 	keyClusterName       = "clusterName"
+	keyMetadataStoreURL  = "metadataStoreUrl"
+	keyCert              = "cert"
+	keyAEqB              = "a=b"
 	valClusterName       = "pulsar-cluster"
+	valMultiline         = "line1\nline2"
 )
 
 func TestMerge(t *testing.T) {
@@ -106,7 +110,7 @@ func TestRenderProperties(t *testing.T) {
 		},
 		{
 			name: "single key",
-			cfg:  map[string]string{"metadataStoreUrl": "oxia://oxia-coordinator:6648/default"},
+			cfg:  map[string]string{keyMetadataStoreURL: "oxia://oxia-coordinator:6648/default"},
 			want: "metadataStoreUrl=oxia://oxia-coordinator:6648/default\n",
 		},
 		{
@@ -123,6 +127,51 @@ func TestRenderProperties(t *testing.T) {
 			name: "empty value renders trailing equals",
 			cfg:  map[string]string{"managedLedgerDefaultEnsembleSize": ""},
 			want: "managedLedgerDefaultEnsembleSize=\n",
+		},
+		{
+			name: "value colon is not escaped",
+			cfg:  map[string]string{keyMetadataStoreURL: "oxia://svc:6648"},
+			want: "metadataStoreUrl=oxia://svc:6648\n",
+		},
+		{
+			name: "value equals is not escaped",
+			cfg:  map[string]string{"PULSAR_MEM": "-Xms2g -Dfoo=bar"},
+			want: "PULSAR_MEM=-Xms2g -Dfoo=bar\n",
+		},
+		{
+			name: "value newline is escaped",
+			cfg:  map[string]string{keyCert: valMultiline},
+			want: "cert=line1\\nline2\n",
+		},
+		{
+			name: "value carriage return is escaped",
+			cfg:  map[string]string{keyCert: "line1\rline2"},
+			want: "cert=line1\\rline2\n",
+		},
+		{
+			name: "value tab is escaped",
+			cfg:  map[string]string{keyCert: "a\tb"},
+			want: "cert=a\\tb\n",
+		},
+		{
+			name: "value backslash is escaped",
+			cfg:  map[string]string{"winPath": `C:\data`},
+			want: "winPath=C:\\\\data\n",
+		},
+		{
+			name: "key equals is escaped",
+			cfg:  map[string]string{keyAEqB: "v"},
+			want: "a\\=b=v\n",
+		},
+		{
+			name: "key colon is escaped",
+			cfg:  map[string]string{"a:b": "v"},
+			want: "a\\:b=v\n",
+		},
+		{
+			name: "key space is escaped",
+			cfg:  map[string]string{"a b": "v"},
+			want: "a\\ b=v\n",
 		},
 	}
 
@@ -150,6 +199,64 @@ func TestRenderProperties_Deterministic(t *testing.T) {
 		if got := RenderProperties(cfg); got != first {
 			t.Fatalf("RenderProperties is not deterministic across calls: run %d = %q, want %q", i, got, first)
 		}
+	}
+}
+
+func TestRenderProperties_RoundTrip(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  map[string]string
+	}{
+		{name: "value with newline", cfg: map[string]string{"k": valMultiline}},
+		{name: "value with carriage return", cfg: map[string]string{"k": "line1\rline2"}},
+		{name: "value with CRLF", cfg: map[string]string{"k": "line1\r\nline2"}},
+		{name: "value with tab", cfg: map[string]string{"k": "a\tb"}},
+		{name: "value with equals", cfg: map[string]string{"opts": "a=b=c"}},
+		{name: "value with backslash", cfg: map[string]string{"path": `a\b\c`}},
+		{name: "key with equals", cfg: map[string]string{keyAEqB: "v"}},
+		{name: "key with colon", cfg: map[string]string{"a:b": "v"}},
+		{name: "key with space", cfg: map[string]string{"a b": "v"}},
+		{name: "empty value", cfg: map[string]string{"k": ""}},
+		{
+			name: "mixed adversarial keys and values",
+			cfg: map[string]string{
+				keyAEqB: "1\n2",
+				"c:d":   "e\tf",
+				"g h":   `back\slash`,
+				"i":     "plain",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rendered := RenderProperties(tt.cfg)
+
+			// A control char in a value that leaked unescaped would split
+			// one property across multiple lines: entry count must equal
+			// the number of keys.
+			if lines := nonEmptyLineCount(rendered); lines != len(tt.cfg) {
+				t.Errorf("rendered %q has %d entry lines, want %d (layout corrupted by unescaped char)",
+					rendered, lines, len(tt.cfg))
+			}
+
+			got := parseProperties(rendered)
+			if !mapsEqual(got, tt.cfg) {
+				t.Errorf("round-trip mismatch: RenderProperties(%v) => %q => parsed %v", tt.cfg, rendered, got)
+			}
+		})
+	}
+}
+
+// TestRenderProperties_EscapeRegression pins the exact escaped output for an
+// adversarial key/value. If escaping changes, rendered .conf ConfigMaps flip
+// and force a cluster-wide rolling restart on upgrade, so the algorithm must
+// only change deliberately.
+func TestRenderProperties_EscapeRegression(t *testing.T) {
+	const want = "a\\=b=line1\\nline2\n"
+	got := RenderProperties(map[string]string{keyAEqB: valMultiline})
+	if got != want {
+		t.Errorf("RenderProperties escaping changed: got %q, want %q (confirm this is intentional)", got, want)
 	}
 }
 
@@ -206,7 +313,7 @@ func TestPrefixedEnv_Deterministic(t *testing.T) {
 		keyBrokerServicePort: "6650",
 		keyWebServicePort:    "8080",
 		keyClusterName:       valClusterName,
-		"metadataStoreUrl":   "oxia://oxia-coordinator:6648/default",
+		keyMetadataStoreURL:  "oxia://oxia-coordinator:6648/default",
 	}
 
 	first := PrefixedEnv(cfg)
@@ -334,4 +441,70 @@ func mapsEqual(a, b map[string]string) bool {
 		}
 	}
 	return true
+}
+
+func nonEmptyLineCount(rendered string) int {
+	count := 0
+	for line := range strings.SplitSeq(rendered, "\n") {
+		if line != "" {
+			count++
+		}
+	}
+	return count
+}
+
+// parseProperties is an independent, java.util.Properties-style parser used
+// to prove RenderProperties output round-trips. Each rendered entry is a
+// single line (values never span lines because control chars are escaped);
+// the first unescaped separator (`=`, `:`, space, tab) ends the key.
+func parseProperties(rendered string) map[string]string {
+	out := map[string]string{}
+	for line := range strings.SplitSeq(rendered, "\n") {
+		if line == "" {
+			continue
+		}
+		key, val := splitPropertyLine(line)
+		out[unescapeProperty(key)] = unescapeProperty(val)
+	}
+	return out
+}
+
+func splitPropertyLine(line string) (key, value string) {
+	esc := false
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case esc:
+			esc = false
+		case c == '\\':
+			esc = true
+		case c == '=' || c == ':' || c == ' ' || c == '\t':
+			return line[:i], line[i+1:]
+		}
+	}
+	return line, ""
+}
+
+func unescapeProperty(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			switch s[i] {
+			case 'n':
+				b.WriteByte('\n')
+			case 'r':
+				b.WriteByte('\r')
+			case 't':
+				b.WriteByte('\t')
+			case 'f':
+				b.WriteByte('\f')
+			default:
+				b.WriteByte(s[i])
+			}
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
