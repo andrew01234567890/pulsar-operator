@@ -43,10 +43,16 @@ import (
 const (
 	brokerComponent = "broker"
 
-	brokerPortName       = "pulsar"
-	brokerPort     int32 = 6650
-	httpPortName         = "http"
-	httpPort       int32 = 8080
+	brokerPortName = "pulsar"
+	httpPortName   = "http"
+
+	// defaultBrokerServicePort / defaultWebServicePort are the fallbacks used
+	// only when the merged config carries no (or an invalid) port value.
+	// Reconcile always resolves the real ports out of the merged config so
+	// the container ports, probe ports, and Service ports can never desync
+	// from what broker.conf actually binds; the operator owns these keys.
+	defaultBrokerServicePort int32 = 6650
+	defaultWebServicePort    int32 = 8080
 
 	// defaultBrokerReplicas mirrors the HA-defaults table: 3 brokers so a
 	// rolling restart or single-pod disruption never drops to zero capacity.
@@ -94,9 +100,11 @@ const (
 	brokerConfFileName  = "broker.conf"
 	brokerConfMountPath = "/pulsar/conf/broker.conf"
 
-	brokerReadyConditionType = "Ready"
-	reasonReplicasReady      = "ReplicasReady"
-	reasonReplicasNotReady   = "ReplicasNotReady"
+	// The Ready condition type and the reason vocabulary
+	// (reasonAllReady / reasonProgressing / reasonNoReplicas) are shared
+	// across this package's mandatory-tier reconcilers; they are declared
+	// once in pulsarcluster_controller.go / bookkeeper_controller.go and
+	// reused here so the umbrella rollup sees a consistent status language.
 
 	healthCheckPath = "/admin/v2/brokers/health"
 )
@@ -113,7 +121,6 @@ type BrokerReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile moves a Broker's actual cluster state - a StatefulSet, headless
@@ -133,16 +140,17 @@ func (r *BrokerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	mergedConfig := mergedBrokerConfig(broker)
 	renderedConfig := config.RenderProperties(mergedConfig)
+	ports := resolveBrokerPorts(mergedConfig)
 
 	if err := r.reconcileConfigMap(ctx, broker, name, labels, renderedConfig); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling broker configmap: %w", err)
 	}
 
-	if err := r.reconcileHeadlessService(ctx, broker, name, labels, selectorLabels); err != nil {
+	if err := r.reconcileHeadlessService(ctx, broker, name, labels, selectorLabels, ports); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling broker headless service: %w", err)
 	}
 
-	stsSpec := desiredBrokerStatefulSetSpec(broker, name, selectorLabels, labels, mergedConfig, renderedConfig)
+	stsSpec := desiredBrokerStatefulSetSpec(broker, name, selectorLabels, labels, mergedConfig, renderedConfig, ports)
 	if err := r.reconcileStatefulSet(ctx, broker, name, labels, stsSpec); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling broker statefulset: %w", err)
 	}
@@ -170,8 +178,8 @@ func (r *BrokerReconciler) reconcileConfigMap(ctx context.Context, broker *clust
 	return err
 }
 
-func (r *BrokerReconciler) reconcileHeadlessService(ctx context.Context, broker *clusterv1alpha1.Broker, name string, labels, selectorLabels map[string]string) error {
-	built := builder.HeadlessService(name, broker.Namespace, labels, selectorLabels, brokerServicePorts())
+func (r *BrokerReconciler) reconcileHeadlessService(ctx context.Context, broker *clusterv1alpha1.Broker, name string, labels, selectorLabels map[string]string, ports brokerPorts) error {
+	built := builder.HeadlessService(name, broker.Namespace, labels, selectorLabels, brokerServicePorts(ports))
 
 	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: broker.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
@@ -229,29 +237,46 @@ func (r *BrokerReconciler) updateStatus(ctx context.Context, broker *clusterv1al
 	broker.Status.Replicas = sts.Status.Replicas
 	broker.Status.ReadyReplicas = sts.Status.ReadyReplicas
 	broker.Status.ObservedGeneration = broker.Generation
-	apimeta.SetStatusCondition(&broker.Status.Conditions, brokerReadyCondition(sts.Status.ReadyReplicas, desired))
+	apimeta.SetStatusCondition(&broker.Status.Conditions, brokerReadyCondition(sts, desired, broker.Generation))
 
 	return r.Status().Update(ctx, broker)
 }
 
-// brokerReadyCondition reports Ready=True only once every desired replica is
-// Ready, mirroring the StatefulSet rollout itself rather than declaring
-// success as soon as the StatefulSet object is created.
-func brokerReadyCondition(readyReplicas, desired int32) metav1.Condition {
-	if readyReplicas == desired {
-		return metav1.Condition{
-			Type:    brokerReadyConditionType,
-			Status:  metav1.ConditionTrue,
-			Reason:  reasonReplicasReady,
-			Message: fmt.Sprintf("all %d broker replicas ready", desired),
-		}
+// brokerReadyCondition reports Ready only once the StatefulSet's rollout has
+// fully converged, not merely once enough pods are Ready. Gating on
+// ReadyReplicas alone would flip Ready=True mid rolling-restart (e.g. a
+// config-checksum change), while pods still running the previous revision are
+// counted Ready. observedGeneration is stamped onto the condition so the
+// umbrella PulsarCluster reconciler can detect a stale (pre-update) Broker
+// status.
+func brokerReadyCondition(sts *appsv1.StatefulSet, desired int32, observedGeneration int64) metav1.Condition {
+	cond := metav1.Condition{Type: conditionTypeReady, ObservedGeneration: observedGeneration}
+
+	switch {
+	case desired == 0:
+		// Broker is a mandatory data-plane tier: scaled to zero it serves no
+		// traffic, so it must never read as healthy to the umbrella rollup.
+		// (Optional tiers like Proxy/FunctionsWorker intentionally differ -
+		// they report Ready when deliberately parked at zero replicas.)
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = reasonNoReplicas
+		cond.Message = "no broker replicas requested"
+	case sts.Status.ObservedGeneration != sts.Generation ||
+		sts.Status.UpdatedReplicas != desired ||
+		sts.Status.ReadyReplicas != desired:
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = reasonProgressing
+		cond.Message = fmt.Sprintf(
+			"rollout in progress: %d/%d replicas updated, %d/%d ready (statefulset generation %d observed %d)",
+			sts.Status.UpdatedReplicas, desired, sts.Status.ReadyReplicas, desired,
+			sts.Generation, sts.Status.ObservedGeneration)
+	default:
+		cond.Status = metav1.ConditionTrue
+		cond.Reason = reasonAllReady
+		cond.Message = fmt.Sprintf("all %d broker replicas ready and up to date", desired)
 	}
-	return metav1.Condition{
-		Type:    brokerReadyConditionType,
-		Status:  metav1.ConditionFalse,
-		Reason:  reasonReplicasNotReady,
-		Message: fmt.Sprintf("%d/%d broker replicas ready", readyReplicas, desired),
-	}
+
+	return cond
 }
 
 // mergedBrokerConfig layers spec.Config on top of the operator's broker.conf
@@ -265,8 +290,8 @@ func mergedBrokerConfig(broker *clusterv1alpha1.Broker) map[string]string {
 
 func defaultBrokerConfig(spec clusterv1alpha1.BrokerSpec) map[string]string {
 	return map[string]string{
-		confKeyBrokerServicePort:       strconv.Itoa(int(brokerPort)),
-		confKeyWebServicePort:          strconv.Itoa(int(httpPort)),
+		confKeyBrokerServicePort:       strconv.Itoa(int(defaultBrokerServicePort)),
+		confKeyWebServicePort:          strconv.Itoa(int(defaultWebServicePort)),
 		confKeyLoadManagerClassName:    loadManagerClassName(spec.LoadBalancer),
 		confKeyBrokerShutdownTimeoutMs: strconv.FormatInt(defaultBrokerShutdownTimeoutMs, 10),
 	}
@@ -325,10 +350,38 @@ func terminationGracePeriodSeconds(mergedConfig map[string]string) int64 {
 	return brokerShutdownTimeoutSeconds(mergedConfig) + preStopDrainSeconds
 }
 
-func brokerServicePorts() []corev1.ServicePort {
+// brokerPorts holds the ports the broker actually binds, resolved from the
+// merged broker.conf so the container ports, probe ports, and Service ports
+// all track a spec.config override in lockstep with the rendered config.
+type brokerPorts struct {
+	binary int32
+	http   int32
+}
+
+func resolveBrokerPorts(mergedConfig map[string]string) brokerPorts {
+	return brokerPorts{
+		binary: resolveConfigPort(mergedConfig, confKeyBrokerServicePort, defaultBrokerServicePort),
+		http:   resolveConfigPort(mergedConfig, confKeyWebServicePort, defaultWebServicePort),
+	}
+}
+
+// resolveConfigPort reads a TCP port out of the merged config, falling back to
+// def when the key is absent or the value is not a valid port. The operator
+// owns these keys (they are always present in the defaults), so the fallback
+// only matters if a user override sets a malformed value.
+func resolveConfigPort(mergedConfig map[string]string, key string, def int32) int32 {
+	if v, ok := mergedConfig[key]; ok {
+		if parsed, err := strconv.ParseInt(v, 10, 32); err == nil && parsed > 0 && parsed <= 65535 {
+			return int32(parsed)
+		}
+	}
+	return def
+}
+
+func brokerServicePorts(ports brokerPorts) []corev1.ServicePort {
 	return []corev1.ServicePort{
-		{Name: brokerPortName, Port: brokerPort, TargetPort: intstr.FromInt32(brokerPort)},
-		{Name: httpPortName, Port: httpPort, TargetPort: intstr.FromInt32(httpPort)},
+		{Name: brokerPortName, Port: ports.binary, TargetPort: intstr.FromInt32(ports.binary)},
+		{Name: httpPortName, Port: ports.http, TargetPort: intstr.FromInt32(ports.http)},
 	}
 }
 
@@ -344,21 +397,21 @@ func brokerImage(specImage string) string {
 // broker.conf ConfigMap is already the fully-rendered, final config
 // (operator defaults merged with spec.Config), mounted straight over the
 // image's own conf/broker.conf.
-func brokerContainer(broker *clusterv1alpha1.Broker) corev1.Container {
+func brokerContainer(broker *clusterv1alpha1.Broker, ports brokerPorts) corev1.Container {
 	return corev1.Container{
 		Name:    brokerComponent,
 		Image:   brokerImage(broker.Spec.Image),
 		Command: []string{"bin/pulsar", "broker"},
 		Ports: []corev1.ContainerPort{
-			{Name: brokerPortName, ContainerPort: brokerPort},
-			{Name: httpPortName, ContainerPort: httpPort},
+			{Name: brokerPortName, ContainerPort: ports.binary},
+			{Name: httpPortName, ContainerPort: ports.http},
 		},
 		Resources: broker.Spec.Resources,
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: configVolumeName, MountPath: brokerConfMountPath, SubPath: brokerConfFileName, ReadOnly: true},
 		},
-		ReadinessProbe: brokerProbe(10, 10, 3),
-		LivenessProbe:  brokerProbe(30, 30, 5),
+		ReadinessProbe: brokerProbe(ports.http, 10, 10, 3),
+		LivenessProbe:  brokerProbe(ports.http, 30, 30, 5),
 		Lifecycle: &corev1.Lifecycle{
 			PreStop: &corev1.LifecycleHandler{
 				Exec: &corev1.ExecAction{Command: []string{"sh", "-c", fmt.Sprintf("sleep %d", preStopDrainSeconds)}},
@@ -367,7 +420,7 @@ func brokerContainer(broker *clusterv1alpha1.Broker) corev1.Container {
 	}
 }
 
-func brokerProbe(initialDelaySeconds, periodSeconds, failureThreshold int32) *corev1.Probe {
+func brokerProbe(httpPort, initialDelaySeconds, periodSeconds, failureThreshold int32) *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
@@ -390,7 +443,7 @@ func brokerPodAnnotations(renderedConfig string) map[string]string {
 	return builder.WithConfigChecksum(nil, renderedConfig)
 }
 
-func desiredBrokerStatefulSetSpec(broker *clusterv1alpha1.Broker, name string, selectorLabels, podLabels map[string]string, mergedConfig map[string]string, renderedConfig string) appsv1.StatefulSetSpec {
+func desiredBrokerStatefulSetSpec(broker *clusterv1alpha1.Broker, name string, selectorLabels, podLabels map[string]string, mergedConfig map[string]string, renderedConfig string, ports brokerPorts) appsv1.StatefulSetSpec {
 	replicas := brokerReplicas(broker.Spec.Replicas)
 	gracePeriod := terminationGracePeriodSeconds(mergedConfig)
 
@@ -405,7 +458,7 @@ func desiredBrokerStatefulSetSpec(broker *clusterv1alpha1.Broker, name string, s
 			},
 			Spec: corev1.PodSpec{
 				TerminationGracePeriodSeconds: &gracePeriod,
-				Containers:                    []corev1.Container{brokerContainer(broker)},
+				Containers:                    []corev1.Container{brokerContainer(broker, ports)},
 				Volumes: []corev1.Volume{
 					{
 						Name: configVolumeName,

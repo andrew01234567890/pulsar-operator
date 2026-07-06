@@ -35,8 +35,9 @@ import (
 	"github.com/andrew01234567890/pulsar-operator/internal/builder"
 )
 
-func int32Ptr(v int32) *int32 { return &v }
-func boolPtr(v bool) *bool    { return &v }
+// int32Ptr is shared with the other cluster-package tests
+// (bookkeeper_build_test.go); boolPtr and hasOwnerRef are broker-local.
+func boolPtr(v bool) *bool { return &v }
 
 func hasOwnerRef(refs []metav1.OwnerReference, ownerUID types.UID) bool {
 	for _, ref := range refs {
@@ -101,8 +102,8 @@ var _ = Describe("Broker Controller", func() {
 			container := sts.Spec.Template.Spec.Containers[0]
 			Expect(container.Image).To(Equal(defaultBrokerImage))
 			Expect(container.Ports).To(ConsistOf(
-				corev1.ContainerPort{Name: "pulsar", ContainerPort: 6650, Protocol: corev1.ProtocolTCP},
-				corev1.ContainerPort{Name: "http", ContainerPort: 8080, Protocol: corev1.ProtocolTCP},
+				corev1.ContainerPort{Name: brokerPortName, ContainerPort: 6650, Protocol: corev1.ProtocolTCP},
+				corev1.ContainerPort{Name: httpPortName, ContainerPort: 8080, Protocol: corev1.ProtocolTCP},
 			))
 			Expect(container.ReadinessProbe.HTTPGet.Path).To(Equal("/admin/v2/brokers/health"))
 			Expect(container.ReadinessProbe.HTTPGet.Port.IntValue()).To(Equal(8080))
@@ -144,13 +145,32 @@ var _ = Describe("Broker Controller", func() {
 			By("status: not Ready until the StatefulSet reports full readiness")
 			Expect(broker.Status.ObservedGeneration).To(Equal(broker.Generation))
 			Expect(broker.Status.ReadyReplicas).To(Equal(int32(0)))
-			cond := apimeta.FindStatusCondition(broker.Status.Conditions, brokerReadyConditionType)
+			cond := apimeta.FindStatusCondition(broker.Status.Conditions, conditionTypeReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 
-			By("status: Ready once the StatefulSet reports readyReplicas == desired replicas")
+			By("status: still NotReady mid-rollout when ready but not all pods are updated (revision skew)")
+			sts.Status.ObservedGeneration = sts.Generation
 			sts.Status.Replicas = 2
 			sts.Status.ReadyReplicas = 2
+			sts.Status.UpdatedReplicas = 1 // one pod still on the previous revision
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, broker)).To(Succeed())
+			cond = apimeta.FindStatusCondition(broker.Status.Conditions, conditionTypeReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(reasonProgressing))
+
+			By("status: Ready once the rollout is fully observed, updated, and ready")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, sts)).To(Succeed())
+			sts.Status.ObservedGeneration = sts.Generation
+			sts.Status.Replicas = 2
+			sts.Status.ReadyReplicas = 2
+			sts.Status.UpdatedReplicas = 2
 			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
 
 			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
@@ -158,10 +178,11 @@ var _ = Describe("Broker Controller", func() {
 
 			Expect(k8sClient.Get(ctx, typeNamespacedName, broker)).To(Succeed())
 			Expect(broker.Status.ReadyReplicas).To(Equal(int32(2)))
-			cond = apimeta.FindStatusCondition(broker.Status.Conditions, brokerReadyConditionType)
+			cond = apimeta.FindStatusCondition(broker.Status.Conditions, conditionTypeReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
-			Expect(cond.Reason).To(Equal(reasonReplicasReady))
+			Expect(cond.Reason).To(Equal(reasonAllReady))
+			Expect(cond.ObservedGeneration).To(Equal(broker.Generation))
 		})
 	})
 

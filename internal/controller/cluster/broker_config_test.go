@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -279,8 +280,9 @@ func TestDesiredBrokerStatefulSetSpec_DrainWiring(t *testing.T) {
 	}
 	mergedConfig := mergedBrokerConfig(broker)
 	rendered := renderConfig(broker)
+	ports := resolveBrokerPorts(mergedConfig)
 
-	spec := desiredBrokerStatefulSetSpec(broker, broker.Name, map[string]string{"k": "v"}, map[string]string{"k": "v"}, mergedConfig, rendered)
+	spec := desiredBrokerStatefulSetSpec(broker, broker.Name, map[string]string{"k": "v"}, map[string]string{"k": "v"}, mergedConfig, rendered, ports)
 
 	wantGrace := 30 + preStopDrainSeconds
 	if spec.Template.Spec.TerminationGracePeriodSeconds == nil || *spec.Template.Spec.TerminationGracePeriodSeconds != wantGrace {
@@ -302,23 +304,74 @@ func TestDesiredBrokerStatefulSetSpec_DrainWiring(t *testing.T) {
 }
 
 func TestBrokerReadyCondition(t *testing.T) {
+	// stsAt builds a StatefulSet whose spec generation is `generation` and
+	// whose observed status is the given (observedGen, updated, ready) triple,
+	// so each case can model a precise point in a rollout.
+	stsAt := func(generation, observedGen, updated, ready int32) *appsv1.StatefulSet {
+		return &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Generation: int64(generation)},
+			Status: appsv1.StatefulSetStatus{
+				ObservedGeneration: int64(observedGen),
+				UpdatedReplicas:    updated,
+				ReadyReplicas:      ready,
+			},
+		}
+	}
+
 	tests := []struct {
-		name          string
-		readyReplicas int32
-		desired       int32
-		wantStatus    metav1.ConditionStatus
-		wantReason    string
+		name       string
+		sts        *appsv1.StatefulSet
+		desired    int32
+		wantStatus metav1.ConditionStatus
+		wantReason string
 	}{
-		{name: "matches desired", readyReplicas: 3, desired: 3, wantStatus: metav1.ConditionTrue, wantReason: reasonReplicasReady},
-		{name: "below desired", readyReplicas: 2, desired: 3, wantStatus: metav1.ConditionFalse, wantReason: reasonReplicasNotReady},
-		{name: "zero desired and zero ready is still ready", readyReplicas: 0, desired: 0, wantStatus: metav1.ConditionTrue, wantReason: reasonReplicasReady},
+		{
+			name:       "fully rolled out and ready",
+			sts:        stsAt(2, 2, 3, 3),
+			desired:    3,
+			wantStatus: metav1.ConditionTrue,
+			wantReason: reasonAllReady,
+		},
+		{
+			name:       "ready count met but rollout not observed yet",
+			sts:        stsAt(2, 1, 3, 3),
+			desired:    3,
+			wantStatus: metav1.ConditionFalse,
+			wantReason: reasonProgressing,
+		},
+		{
+			// Revision skew: every pod is Ready but not every pod is on the
+			// new revision. Ready=True here would wrongly declare a rolling
+			// restart complete while old-revision pods still serve.
+			name:       "all ready but not all updated (revision skew)",
+			sts:        stsAt(2, 2, 2, 3),
+			desired:    3,
+			wantStatus: metav1.ConditionFalse,
+			wantReason: reasonProgressing,
+		},
+		{
+			name:       "fewer replicas ready than desired",
+			sts:        stsAt(2, 2, 3, 2),
+			desired:    3,
+			wantStatus: metav1.ConditionFalse,
+			wantReason: reasonProgressing,
+		},
+		{
+			// Broker is mandatory: zero replicas must not read as healthy.
+			name:       "zero desired is NotReady",
+			sts:        stsAt(1, 1, 0, 0),
+			desired:    0,
+			wantStatus: metav1.ConditionFalse,
+			wantReason: reasonNoReplicas,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cond := brokerReadyCondition(tt.readyReplicas, tt.desired)
-			if cond.Type != brokerReadyConditionType {
-				t.Errorf("Type = %q, want %q", cond.Type, brokerReadyConditionType)
+			const observedGeneration int64 = 7
+			cond := brokerReadyCondition(tt.sts, tt.desired, observedGeneration)
+			if cond.Type != conditionTypeReady {
+				t.Errorf("Type = %q, want %q", cond.Type, conditionTypeReady)
 			}
 			if cond.Status != tt.wantStatus {
 				t.Errorf("Status = %q, want %q", cond.Status, tt.wantStatus)
@@ -326,7 +379,120 @@ func TestBrokerReadyCondition(t *testing.T) {
 			if cond.Reason != tt.wantReason {
 				t.Errorf("Reason = %q, want %q", cond.Reason, tt.wantReason)
 			}
+			if cond.ObservedGeneration != observedGeneration {
+				t.Errorf("ObservedGeneration = %d, want %d (needed by the umbrella reconciler's staleness check)", cond.ObservedGeneration, observedGeneration)
+			}
 		})
+	}
+}
+
+func TestBrokerContainer_ImageOverride(t *testing.T) {
+	const override = "example.com/pulsar:custom-tag"
+	broker := &clusterv1alpha1.Broker{Spec: clusterv1alpha1.BrokerSpec{Image: override}}
+
+	got := brokerContainer(broker, resolveBrokerPorts(mergedBrokerConfig(broker)))
+	if got.Image != override {
+		t.Errorf("container.Image = %q, want spec.Image override %q", got.Image, override)
+	}
+
+	fallback := brokerContainer(&clusterv1alpha1.Broker{}, resolveBrokerPorts(nil))
+	if fallback.Image != defaultBrokerImage {
+		t.Errorf("container.Image = %q, want default %q when spec.Image is empty", fallback.Image, defaultBrokerImage)
+	}
+}
+
+// TestBrokerConfigChecksumChangesWithConfig proves the pod-template checksum
+// annotation is a function of the rendered config: a spec.config change must
+// change the checksum, which is what forces the rolling restart.
+func TestBrokerConfigChecksumChangesWithConfig(t *testing.T) {
+	base := &clusterv1alpha1.Broker{}
+	changed := &clusterv1alpha1.Broker{
+		Spec: clusterv1alpha1.BrokerSpec{
+			Config: map[string]string{"managedLedgerDefaultAckQuorum": "3"},
+		},
+	}
+
+	baseSum := brokerPodAnnotations(renderConfig(base))[builder.ConfigChecksumAnnotation]
+	changedSum := brokerPodAnnotations(renderConfig(changed))[builder.ConfigChecksumAnnotation]
+
+	if baseSum == "" || changedSum == "" {
+		t.Fatalf("checksum annotations must be non-empty: base=%q changed=%q", baseSum, changedSum)
+	}
+	if baseSum == changedSum {
+		t.Errorf("checksum did not change when spec.config changed: %q", baseSum)
+	}
+}
+
+func TestResolveBrokerPorts(t *testing.T) {
+	tests := []struct {
+		name       string
+		config     map[string]string
+		wantBinary int32
+		wantHTTP   int32
+	}{
+		{
+			name:       "operator defaults",
+			config:     defaultBrokerConfig(clusterv1alpha1.BrokerSpec{}),
+			wantBinary: defaultBrokerServicePort,
+			wantHTTP:   defaultWebServicePort,
+		},
+		{
+			name:       "spec.config override threads through",
+			config:     map[string]string{confKeyBrokerServicePort: "16650", confKeyWebServicePort: "18080"},
+			wantBinary: 16650,
+			wantHTTP:   18080,
+		},
+		{
+			name:       "malformed value falls back to default",
+			config:     map[string]string{confKeyBrokerServicePort: "not-a-port", confKeyWebServicePort: "70000"},
+			wantBinary: defaultBrokerServicePort,
+			wantHTTP:   defaultWebServicePort,
+		},
+		{
+			name:       "nil config falls back to defaults",
+			config:     nil,
+			wantBinary: defaultBrokerServicePort,
+			wantHTTP:   defaultWebServicePort,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveBrokerPorts(tt.config)
+			if got.binary != tt.wantBinary || got.http != tt.wantHTTP {
+				t.Errorf("resolveBrokerPorts(%v) = {binary:%d http:%d}, want {binary:%d http:%d}", tt.config, got.binary, got.http, tt.wantBinary, tt.wantHTTP)
+			}
+		})
+	}
+}
+
+// TestBrokerContainerPortsTrackConfig guards against the container/probe ports
+// desyncing from a spec.config port override: both the ContainerPorts and the
+// probe target port must reflect the resolved config, not a hardcoded literal.
+func TestBrokerContainerPortsTrackConfig(t *testing.T) {
+	broker := &clusterv1alpha1.Broker{
+		Spec: clusterv1alpha1.BrokerSpec{
+			Config: map[string]string{confKeyBrokerServicePort: "16650", confKeyWebServicePort: "18080"},
+		},
+	}
+	ports := resolveBrokerPorts(mergedBrokerConfig(broker))
+	c := brokerContainer(broker, ports)
+
+	gotPorts := map[string]int32{}
+	for _, p := range c.Ports {
+		gotPorts[p.Name] = p.ContainerPort
+	}
+	if gotPorts[brokerPortName] != 16650 {
+		t.Errorf("binary ContainerPort = %d, want 16650", gotPorts[brokerPortName])
+	}
+	if gotPorts[httpPortName] != 18080 {
+		t.Errorf("http ContainerPort = %d, want 18080", gotPorts[httpPortName])
+	}
+	if got := c.ReadinessProbe.HTTPGet.Port.IntValue(); got != 18080 {
+		t.Errorf("readiness probe port = %d, want 18080 (must track webServicePort)", got)
+	}
+	if got := c.LivenessProbe.HTTPGet.Port.IntValue(); got != 18080 {
+		t.Errorf("liveness probe port = %d, want 18080 (must track webServicePort)", got)
 	}
 }
 
