@@ -44,19 +44,23 @@ type BrokerAutoscalerSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	Max *int32 `json:"max,omitempty"`
 
-	// lowerCpuThreshold triggers a scale-down when every broker's load is below it.
+	// lowerCpuThreshold triggers a scale-down when every broker's load is below
+	// it. Expressed as a whole-number percent in the range 0-100 (e.g. 30 means
+	// 30% CPU); autoscaler controllers divide by 100.
 	// +optional
-	// +kubebuilder:default=0.3
+	// +kubebuilder:default=30
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=1
-	LowerCpuThreshold *float64 `json:"lowerCpuThreshold,omitempty"`
+	// +kubebuilder:validation:Maximum=100
+	LowerCpuThreshold *int32 `json:"lowerCpuThreshold,omitempty"`
 
-	// higherCpuThreshold triggers a scale-up when every broker's load is at or above it.
+	// higherCpuThreshold triggers a scale-up when every broker's load is at or
+	// above it. Expressed as a whole-number percent in the range 0-100 (e.g. 80
+	// means 80% CPU); autoscaler controllers divide by 100.
 	// +optional
-	// +kubebuilder:default=0.8
+	// +kubebuilder:default=80
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=1
-	HigherCpuThreshold *float64 `json:"higherCpuThreshold,omitempty"`
+	// +kubebuilder:validation:Maximum=100
+	HigherCpuThreshold *int32 `json:"higherCpuThreshold,omitempty"`
 
 	// scaleUpBy is the number of brokers to add on each scale-up.
 	// +optional

@@ -100,21 +100,24 @@ type BookKeeperAutoscalerSpec struct {
 	ScaleUpMaxLimit *int32 `json:"scaleUpMaxLimit,omitempty"`
 
 	// diskUsageToleranceHwm is the high watermark; a writable bookie at or above
-	// this disk usage triggers a pre-emptive scale-up.
+	// this disk usage triggers a pre-emptive scale-up. Expressed as a
+	// whole-number percent in the range 0-100 (e.g. 92 means 92% disk used);
+	// autoscaler controllers divide by 100.
 	// +optional
-	// +kubebuilder:default=0.92
+	// +kubebuilder:default=92
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=1
-	DiskUsageToleranceHwm *float64 `json:"diskUsageToleranceHwm,omitempty"`
+	// +kubebuilder:validation:Maximum=100
+	DiskUsageToleranceHwm *int32 `json:"diskUsageToleranceHwm,omitempty"`
 
 	// diskUsageToleranceLwm is the low watermark; every writable bookie must be
 	// below this, with zero under-replicated ledgers cluster-wide, before a
-	// scale-down is considered.
+	// scale-down is considered. Expressed as a whole-number percent in the range
+	// 0-100 (e.g. 75 means 75% disk used); autoscaler controllers divide by 100.
 	// +optional
-	// +kubebuilder:default=0.75
+	// +kubebuilder:default=75
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=1
-	DiskUsageToleranceLwm *float64 `json:"diskUsageToleranceLwm,omitempty"`
+	// +kubebuilder:validation:Maximum=100
+	DiskUsageToleranceLwm *int32 `json:"diskUsageToleranceLwm,omitempty"`
 
 	// stabilizationWindowSeconds gates scaling decisions until all bookie pods
 	// have been continuously Ready for this long, preventing flapping.

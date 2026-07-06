@@ -179,8 +179,9 @@ spec:
                     default: 3
                     description: |-
                       replicas is the number of server pods. Must be odd for quorum correctness;
-                      enforced by a future validating webhook.
+                      oddness is enforced by a future validating webhook.
                     format: int32
+                    minimum: 1
                     type: integer
                   storageClassName:
                     description: |-

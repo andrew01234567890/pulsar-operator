@@ -79,19 +79,25 @@ spec:
                     description: enabled turns on the broker autoscaler.
                     type: boolean
                   higherCpuThreshold:
-                    default: 0.8
-                    description: higherCpuThreshold triggers a scale-up when every
-                      broker's load is at or above it.
-                    maximum: 1
+                    default: 80
+                    description: |-
+                      higherCpuThreshold triggers a scale-up when every broker's load is at or
+                      above it. Expressed as a whole-number percent in the range 0-100 (e.g. 80
+                      means 80% CPU); autoscaler controllers divide by 100.
+                    format: int32
+                    maximum: 100
                     minimum: 0
-                    type: number
+                    type: integer
                   lowerCpuThreshold:
-                    default: 0.3
-                    description: lowerCpuThreshold triggers a scale-down when every
-                      broker's load is below it.
-                    maximum: 1
+                    default: 30
+                    description: |-
+                      lowerCpuThreshold triggers a scale-down when every broker's load is below
+                      it. Expressed as a whole-number percent in the range 0-100 (e.g. 30 means
+                      30% CPU); autoscaler controllers divide by 100.
+                    format: int32
+                    maximum: 100
                     minimum: 0
-                    type: number
+                    type: integer
                   max:
                     description: max is the maximum number of brokers. The autoscaler
                       never scales above this.

@@ -238,12 +238,12 @@ func (in *BookKeeperAutoscalerSpec) DeepCopyInto(out *BookKeeperAutoscalerSpec) 
 	}
 	if in.DiskUsageToleranceHwm != nil {
 		in, out := &in.DiskUsageToleranceHwm, &out.DiskUsageToleranceHwm
-		*out = new(float64)
+		*out = new(int32)
 		**out = **in
 	}
 	if in.DiskUsageToleranceLwm != nil {
 		in, out := &in.DiskUsageToleranceLwm, &out.DiskUsageToleranceLwm
-		*out = new(float64)
+		*out = new(int32)
 		**out = **in
 	}
 	if in.StabilizationWindowSeconds != nil {
@@ -476,12 +476,12 @@ func (in *BrokerAutoscalerSpec) DeepCopyInto(out *BrokerAutoscalerSpec) {
 	}
 	if in.LowerCpuThreshold != nil {
 		in, out := &in.LowerCpuThreshold, &out.LowerCpuThreshold
-		*out = new(float64)
+		*out = new(int32)
 		**out = **in
 	}
 	if in.HigherCpuThreshold != nil {
 		in, out := &in.HigherCpuThreshold, &out.HigherCpuThreshold
-		*out = new(float64)
+		*out = new(int32)
 		**out = **in
 	}
 	if in.ScaleUpBy != nil {
@@ -728,6 +728,11 @@ func (in *GlobalSpec) DeepCopyInto(out *GlobalSpec) {
 		in, out := &in.Affinity, &out.Affinity
 		*out = new(corev1.Affinity)
 		(*in).DeepCopyInto(*out)
+	}
+	if in.ZoneSpread != nil {
+		in, out := &in.ZoneSpread, &out.ZoneSpread
+		*out = new(bool)
+		**out = **in
 	}
 	if in.StorageClassName != nil {
 		in, out := &in.StorageClassName, &out.StorageClassName

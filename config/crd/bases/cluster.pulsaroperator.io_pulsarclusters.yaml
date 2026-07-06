@@ -107,22 +107,27 @@ spec:
                     description: autoscaler configures the disk-watermark-driven autoscaler.
                     properties:
                       diskUsageToleranceHwm:
-                        default: 0.92
+                        default: 92
                         description: |-
                           diskUsageToleranceHwm is the high watermark; a writable bookie at or above
-                          this disk usage triggers a pre-emptive scale-up.
-                        maximum: 1
+                          this disk usage triggers a pre-emptive scale-up. Expressed as a
+                          whole-number percent in the range 0-100 (e.g. 92 means 92% disk used);
+                          autoscaler controllers divide by 100.
+                        format: int32
+                        maximum: 100
                         minimum: 0
-                        type: number
+                        type: integer
                       diskUsageToleranceLwm:
-                        default: 0.75
+                        default: 75
                         description: |-
                           diskUsageToleranceLwm is the low watermark; every writable bookie must be
                           below this, with zero under-replicated ledgers cluster-wide, before a
-                          scale-down is considered.
-                        maximum: 1
+                          scale-down is considered. Expressed as a whole-number percent in the range
+                          0-100 (e.g. 75 means 75% disk used); autoscaler controllers divide by 100.
+                        format: int32
+                        maximum: 100
                         minimum: 0
-                        type: number
+                        type: integer
                       enabled:
                         default: false
                         description: enabled turns on the bookie disk-watermark autoscaler
@@ -318,19 +323,25 @@ spec:
                         description: enabled turns on the broker autoscaler.
                         type: boolean
                       higherCpuThreshold:
-                        default: 0.8
-                        description: higherCpuThreshold triggers a scale-up when every
-                          broker's load is at or above it.
-                        maximum: 1
+                        default: 80
+                        description: |-
+                          higherCpuThreshold triggers a scale-up when every broker's load is at or
+                          above it. Expressed as a whole-number percent in the range 0-100 (e.g. 80
+                          means 80% CPU); autoscaler controllers divide by 100.
+                        format: int32
+                        maximum: 100
                         minimum: 0
-                        type: number
+                        type: integer
                       lowerCpuThreshold:
-                        default: 0.3
-                        description: lowerCpuThreshold triggers a scale-down when
-                          every broker's load is below it.
-                        maximum: 1
+                        default: 30
+                        description: |-
+                          lowerCpuThreshold triggers a scale-down when every broker's load is below
+                          it. Expressed as a whole-number percent in the range 0-100 (e.g. 30 means
+                          30% CPU); autoscaler controllers divide by 100.
+                        format: int32
+                        maximum: 100
                         minimum: 0
-                        type: number
+                        type: integer
                       max:
                         description: max is the maximum number of brokers. The autoscaler
                           never scales above this.
@@ -1688,8 +1699,9 @@ spec:
                         default: 3
                         description: |-
                           replicas is the number of server pods. Must be odd for quorum correctness;
-                          enforced by a future validating webhook.
+                          oddness is enforced by a future validating webhook.
                         format: int32
+                        minimum: 1
                         type: integer
                       storageClassName:
                         description: |-

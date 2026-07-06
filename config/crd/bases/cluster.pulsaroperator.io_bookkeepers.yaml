@@ -69,22 +69,27 @@ spec:
                 description: autoscaler configures the disk-watermark-driven autoscaler.
                 properties:
                   diskUsageToleranceHwm:
-                    default: 0.92
+                    default: 92
                     description: |-
                       diskUsageToleranceHwm is the high watermark; a writable bookie at or above
-                      this disk usage triggers a pre-emptive scale-up.
-                    maximum: 1
+                      this disk usage triggers a pre-emptive scale-up. Expressed as a
+                      whole-number percent in the range 0-100 (e.g. 92 means 92% disk used);
+                      autoscaler controllers divide by 100.
+                    format: int32
+                    maximum: 100
                     minimum: 0
-                    type: number
+                    type: integer
                   diskUsageToleranceLwm:
-                    default: 0.75
+                    default: 75
                     description: |-
                       diskUsageToleranceLwm is the low watermark; every writable bookie must be
                       below this, with zero under-replicated ledgers cluster-wide, before a
-                      scale-down is considered.
-                    maximum: 1
+                      scale-down is considered. Expressed as a whole-number percent in the range
+                      0-100 (e.g. 75 means 75% disk used); autoscaler controllers divide by 100.
+                    format: int32
+                    maximum: 100
                     minimum: 0
-                    type: number
+                    type: integer
                   enabled:
                     default: false
                     description: enabled turns on the bookie disk-watermark autoscaler

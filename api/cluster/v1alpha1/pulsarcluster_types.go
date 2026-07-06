@@ -47,7 +47,7 @@ type GlobalSpec struct {
 	// zones for every component, so multi-AZ HA works out of the box.
 	// +optional
 	// +kubebuilder:default=true
-	ZoneSpread bool `json:"zoneSpread,omitempty"`
+	ZoneSpread *bool `json:"zoneSpread,omitempty"`
 
 	// storageClassName is the default StorageClass for every component's PVCs,
 	// unless overridden per-component.

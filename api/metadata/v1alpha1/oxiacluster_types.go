@@ -48,9 +48,10 @@ type OxiaCoordinatorSpec struct {
 // schemas, cursors) and has no native snapshot/export tooling.
 type OxiaServerSpec struct {
 	// replicas is the number of server pods. Must be odd for quorum correctness;
-	// enforced by a future validating webhook.
+	// oddness is enforced by a future validating webhook.
 	// +optional
 	// +kubebuilder:default=3
+	// +kubebuilder:validation:Minimum=1
 	Replicas *int32 `json:"replicas,omitempty"`
 
 	// image overrides the server container image. Falls back to
