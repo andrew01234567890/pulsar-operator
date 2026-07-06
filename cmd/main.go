@@ -34,6 +34,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	clusterv1alpha1 "github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1"
+	metadatav1alpha1 "github.com/andrew01234567890/pulsar-operator/api/metadata/v1alpha1"
+	clustercontroller "github.com/andrew01234567890/pulsar-operator/internal/controller/cluster"
+	metadatacontroller "github.com/andrew01234567890/pulsar-operator/internal/controller/metadata"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -45,6 +50,8 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
+	utilruntime.Must(clusterv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(metadatav1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -174,6 +181,55 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&clustercontroller.PulsarClusterReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "cluster-pulsarcluster")
+		os.Exit(1)
+	}
+	if err := (&clustercontroller.BrokerReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "cluster-broker")
+		os.Exit(1)
+	}
+	if err := (&clustercontroller.BookKeeperReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "cluster-bookkeeper")
+		os.Exit(1)
+	}
+	if err := (&clustercontroller.ProxyReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "cluster-proxy")
+		os.Exit(1)
+	}
+	if err := (&clustercontroller.AutoRecoveryReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "cluster-autorecovery")
+		os.Exit(1)
+	}
+	if err := (&clustercontroller.FunctionsWorkerReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "cluster-functionsworker")
+		os.Exit(1)
+	}
+	if err := (&metadatacontroller.OxiaClusterReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "metadata-oxiacluster")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
