@@ -36,6 +36,7 @@ var _ = Describe("PulsarCluster Controller", func() {
 		namespace   *corev1.Namespace
 		reconciler  *PulsarClusterReconciler
 		clusterName string
+		req         reconcile.Request
 	)
 
 	BeforeEach(func() {
@@ -49,6 +50,9 @@ var _ = Describe("PulsarCluster Controller", func() {
 			Scheme: k8sClient.Scheme(),
 		}
 		clusterName = "test-cluster"
+		req = reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: clusterName, Namespace: namespace.Name},
+		}
 	})
 
 	AfterEach(func() {
@@ -79,10 +83,6 @@ var _ = Describe("PulsarCluster Controller", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
-
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: clusterName, Namespace: namespace.Name},
-		}
 
 		By("reconciling the PulsarCluster")
 		_, err := reconciler.Reconcile(ctx, req)
@@ -125,14 +125,12 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(pulsarCluster.Status.ProxyPhase).To(BeEmpty())
 		Expect(pulsarCluster.Status.ObservedGeneration).To(Equal(pulsarCluster.Generation))
 
-		By("marking every configured child Ready")
-		broker.Status.Conditions = []metav1.Condition{readyCondition("AllPodsReady", "all broker pods ready")}
+		By("marking every configured child Ready for its current generation")
+		broker.Status.Conditions = []metav1.Condition{readyConditionForGeneration(broker.Generation, "all broker pods ready")}
 		Expect(k8sClient.Status().Update(ctx, broker)).To(Succeed())
-
-		bookKeeper.Status.Conditions = []metav1.Condition{readyCondition("AllPodsReady", "all bookie pods ready")}
+		bookKeeper.Status.Conditions = []metav1.Condition{readyConditionForGeneration(bookKeeper.Generation, "all bookie pods ready")}
 		Expect(k8sClient.Status().Update(ctx, bookKeeper)).To(Succeed())
-
-		oxia.Status.Conditions = []metav1.Condition{readyCondition("AllPodsReady", "all oxia pods ready")}
+		oxia.Status.Conditions = []metav1.Condition{readyConditionForGeneration(oxia.Generation, "all oxia pods ready")}
 		Expect(k8sClient.Status().Update(ctx, oxia)).To(Succeed())
 
 		By("re-reconciling and observing the aggregated Ready=True condition")
@@ -149,7 +147,7 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(pulsarCluster.Status.OxiaPhase).To(Equal(phaseReady))
 	})
 
-	It("does not create any child CRs and reports NoComponentsConfigured when no sub-specs are set", func() {
+	It("always provisions a default OxiaCluster even when no sub-specs are configured", func() {
 		pulsarCluster := &clusterv1alpha1.PulsarCluster{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      clusterName,
@@ -158,32 +156,124 @@ var _ = Describe("PulsarCluster Controller", func() {
 		}
 		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
 
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: clusterName, Namespace: namespace.Name},
-		}
 		_, err := reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 
+		By("creating the mandatory OxiaCluster child")
+		oxia := &metadatav1alpha1.OxiaCluster{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-oxia", Namespace: namespace.Name}, oxia)).To(Succeed())
+		Expect(metav1.IsControlledBy(oxia, pulsarCluster)).To(BeTrue())
+
+		By("not creating optional Pulsar components")
 		broker := &clusterv1alpha1.Broker{}
 		err = k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 
+		By("reporting Ready=False on the still-unready Oxia store, not NoComponentsConfigured")
 		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
 		readyCond := apimeta.FindStatusCondition(pulsarCluster.Status.Conditions, conditionTypeReady)
 		Expect(readyCond).NotTo(BeNil())
 		Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
-		Expect(readyCond.Reason).To(Equal(reasonNoComponentsConfigured))
+		Expect(readyCond.Reason).To(Equal(reasonComponentNotReady))
+		Expect(pulsarCluster.Status.OxiaPhase).To(Equal(phaseNotReady))
+	})
+
+	It("prunes a child CR when its sub-spec is removed from the PulsarCluster", func() {
+		pulsarCluster := &clusterv1alpha1.PulsarCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: namespace.Name,
+			},
+			Spec: clusterv1alpha1.PulsarClusterSpec{
+				Broker: &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(1))},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
+
+		By("reconciling with the broker configured")
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		broker := &clusterv1alpha1.Broker{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
+
+		By("removing the broker sub-spec")
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		pulsarCluster.Spec.Broker = nil
+		Expect(k8sClient.Update(ctx, pulsarCluster)).To(Succeed())
+
+		By("reconciling again")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("deleting the now-undesired Broker child")
+		err = k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+		By("clearing the broker phase from status")
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		Expect(pulsarCluster.Status.BrokerPhase).To(BeEmpty())
+	})
+
+	It("does not aggregate a stale child Ready condition after the child's spec changes", func() {
+		pulsarCluster := &clusterv1alpha1.PulsarCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: namespace.Name,
+			},
+			Spec: clusterv1alpha1.PulsarClusterSpec{
+				Broker: &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(1))},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
+
+		By("reconciling and marking both broker and the mandatory oxia Ready")
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		broker := &clusterv1alpha1.Broker{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
+		broker.Status.Conditions = []metav1.Condition{readyConditionForGeneration(broker.Generation, "all broker pods ready")}
+		Expect(k8sClient.Status().Update(ctx, broker)).To(Succeed())
+
+		oxia := &metadatav1alpha1.OxiaCluster{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-oxia", Namespace: namespace.Name}, oxia)).To(Succeed())
+		oxia.Status.Conditions = []metav1.Condition{readyConditionForGeneration(oxia.Generation, "all oxia pods ready")}
+		Expect(k8sClient.Status().Update(ctx, oxia)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		Expect(apimeta.IsStatusConditionTrue(pulsarCluster.Status.Conditions, conditionTypeReady)).To(BeTrue())
+
+		By("bumping the broker's desired spec so its child generation advances past its Ready status")
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		pulsarCluster.Spec.Broker.Replicas = ptr(int32(5))
+		Expect(k8sClient.Update(ctx, pulsarCluster)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("reporting the broker as progressing rather than trusting its stale Ready condition")
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		readyCond := apimeta.FindStatusCondition(pulsarCluster.Status.Conditions, conditionTypeReady)
+		Expect(readyCond).NotTo(BeNil())
+		Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(readyCond.Message).To(ContainSubstring(reasonComponentProgressing))
+		Expect(pulsarCluster.Status.BrokerPhase).To(Equal(phaseNotReady))
 	})
 })
 
-// readyCondition builds a Ready=True metav1.Condition for stamping onto a
-// child's status in tests.
-func readyCondition(reason, message string) metav1.Condition {
+// readyConditionForGeneration builds a Ready=True metav1.Condition observed
+// against the given generation, for stamping onto a child's status in tests.
+func readyConditionForGeneration(generation int64, message string) metav1.Condition {
 	return metav1.Condition{
 		Type:               conditionTypeReady,
 		Status:             metav1.ConditionTrue,
-		Reason:             reason,
+		Reason:             testReasonAllPodsReady,
 		Message:            message,
+		ObservedGeneration: generation,
 		LastTransitionTime: metav1.Now(),
 	}
 }

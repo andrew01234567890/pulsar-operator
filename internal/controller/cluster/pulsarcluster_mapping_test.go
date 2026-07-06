@@ -29,11 +29,13 @@ import (
 func ptr[T any](v T) *T { return &v }
 
 const (
-	testClusterImage     = "cluster/pulsar:5.0.0"
-	testAltImage         = "cluster/image:1"
-	testReasonRollingOut = "RollingOut"
-	testComponentBroker  = "broker"
-	testComponentProxy   = "proxy"
+	testClusterImage       = "cluster/pulsar:5.0.0"
+	testAltImage           = "cluster/image:1"
+	testReasonRollingOut   = "RollingOut"
+	testReasonAllPodsReady = "AllPodsReady"
+	testComponentBroker    = "broker"
+	testComponentProxy     = "proxy"
+	testPulsarVersion      = "5.0.0-M1"
 )
 
 func TestChildName(t *testing.T) {
@@ -57,6 +59,42 @@ func TestEffectiveImage(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := effectiveImage(tc.componentImage, tc.clusterImage); got != tc.want {
 				t.Errorf("effectiveImage(%q, %q) = %q, want %q", tc.componentImage, tc.clusterImage, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClusterDefaultImage(t *testing.T) {
+	cases := []struct {
+		name string
+		spec clusterv1alpha1.PulsarClusterSpec
+		want string
+	}{
+		{
+			name: "explicit spec.image wins over version",
+			spec: clusterv1alpha1.PulsarClusterSpec{Image: testClusterImage, PulsarVersion: testPulsarVersion},
+			want: testClusterImage,
+		},
+		{
+			name: "version builds a default apachepulsar image",
+			spec: clusterv1alpha1.PulsarClusterSpec{PulsarVersion: testPulsarVersion},
+			want: "apachepulsar/pulsar:" + testPulsarVersion,
+		},
+		{
+			name: "version with a different tag",
+			spec: clusterv1alpha1.PulsarClusterSpec{PulsarVersion: "5.1.0"},
+			want: "apachepulsar/pulsar:5.1.0",
+		},
+		{
+			name: "no image and no version yields empty",
+			spec: clusterv1alpha1.PulsarClusterSpec{},
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clusterDefaultImage(tc.spec); got != tc.want {
+				t.Errorf("clusterDefaultImage() = %q, want %q", got, tc.want)
 			}
 		})
 	}
@@ -89,6 +127,14 @@ func TestBuildBrokerSpec(t *testing.T) {
 				Broker: &clusterv1alpha1.BrokerSpec{Image: "broker/pulsar:override"},
 			},
 			wantImage: "broker/pulsar:override",
+		},
+		{
+			name: "no image set defaults from pulsarVersion",
+			spec: clusterv1alpha1.PulsarClusterSpec{
+				PulsarVersion: testPulsarVersion,
+				Broker:        &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(3))},
+			},
+			wantImage: "apachepulsar/pulsar:" + testPulsarVersion,
 		},
 	}
 	for _, tc := range cases {
@@ -236,41 +282,28 @@ func assertStorageClass(t *testing.T, field string, vol *clusterv1alpha1.VolumeS
 	}
 }
 
-func TestShouldCreateOxia(t *testing.T) {
-	oxiaSpec := &metadatav1alpha1.OxiaClusterSpec{}
-
+func TestOxiaSelected(t *testing.T) {
 	cases := []struct {
 		name string
 		spec clusterv1alpha1.PulsarClusterSpec
 		want bool
 	}{
-		{"no oxia sub-spec", clusterv1alpha1.PulsarClusterSpec{}, false},
+		{"no metadataStore selector defaults to oxia", clusterv1alpha1.PulsarClusterSpec{}, true},
 		{
-			"oxia sub-spec with no metadataStore selector",
-			clusterv1alpha1.PulsarClusterSpec{Oxia: oxiaSpec},
+			"empty metadataStore type defaults to oxia",
+			clusterv1alpha1.PulsarClusterSpec{MetadataStore: &clusterv1alpha1.MetadataStoreSpec{}},
 			true,
 		},
 		{
-			"oxia sub-spec with explicit oxia metadataStore selector",
-			clusterv1alpha1.PulsarClusterSpec{
-				Oxia:          oxiaSpec,
-				MetadataStore: &clusterv1alpha1.MetadataStoreSpec{Type: "oxia"},
-			},
+			"explicit oxia metadataStore selector",
+			clusterv1alpha1.PulsarClusterSpec{MetadataStore: &clusterv1alpha1.MetadataStoreSpec{Type: "oxia"}},
 			true,
-		},
-		{
-			"oxia sub-spec but metadataStore selects a different implementation",
-			clusterv1alpha1.PulsarClusterSpec{
-				Oxia:          oxiaSpec,
-				MetadataStore: &clusterv1alpha1.MetadataStoreSpec{Type: "zookeeper"},
-			},
-			false,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldCreateOxia(tc.spec); got != tc.want {
-				t.Errorf("shouldCreateOxia() = %v, want %v", got, tc.want)
+			if got := oxiaSelected(tc.spec); got != tc.want {
+				t.Errorf("oxiaSelected() = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -307,54 +340,88 @@ func TestBuildOxiaSpec(t *testing.T) {
 		t.Errorf("Server.StorageClassName = %q, want %q (explicit value preserved)", *got.Server.StorageClassName, explicitSC)
 	}
 
-	// Nil sub-spec must yield nil, not panic.
-	if buildOxiaSpec(clusterv1alpha1.PulsarClusterSpec{}) != nil {
-		t.Error("buildOxiaSpec() with nil Oxia = non-nil, want nil")
+	// Oxia is mandatory: an omitted spec.oxia must still yield a non-nil
+	// default OxiaClusterSpec (empty sub-specs so CRD defaults apply), never
+	// nil, so the metadata store is always provisioned.
+	def := buildOxiaSpec(clusterv1alpha1.PulsarClusterSpec{})
+	if def == nil {
+		t.Fatal("buildOxiaSpec() with nil Oxia = nil, want a default OxiaClusterSpec")
+	}
+	if def.Coordinator != nil || def.Server != nil {
+		t.Errorf("default OxiaClusterSpec should leave sub-specs nil for CRD defaults, got %+v", def)
 	}
 }
 
 func TestReportFromConditions(t *testing.T) {
 	cases := []struct {
 		name       string
+		generation int64
 		conditions []metav1.Condition
 		wantReady  bool
 		wantReason string
 	}{
 		{
-			name: "ready true",
+			name:       "ready true",
+			generation: 3,
 			conditions: []metav1.Condition{
-				{Type: conditionTypeReady, Status: metav1.ConditionTrue, Reason: "AllPodsReady"},
+				{Type: conditionTypeReady, Status: metav1.ConditionTrue, Reason: testReasonAllPodsReady, ObservedGeneration: 3},
 			},
 			wantReady:  true,
-			wantReason: "AllPodsReady",
+			wantReason: testReasonAllPodsReady,
 		},
 		{
-			name: "ready false",
+			name:       "ready false",
+			generation: 3,
 			conditions: []metav1.Condition{
-				{Type: conditionTypeReady, Status: metav1.ConditionFalse, Reason: testReasonRollingOut},
+				{Type: conditionTypeReady, Status: metav1.ConditionFalse, Reason: testReasonRollingOut, ObservedGeneration: 3},
 			},
 			wantReady:  false,
 			wantReason: testReasonRollingOut,
 		},
 		{
 			name:       "no conditions reported yet",
+			generation: 1,
 			conditions: nil,
 			wantReady:  false,
 			wantReason: reasonComponentStatusMissing,
 		},
 		{
-			name: "ready condition absent among other conditions",
+			name:       "ready condition absent among other conditions",
+			generation: 1,
 			conditions: []metav1.Condition{
 				{Type: "SomethingElse", Status: metav1.ConditionTrue, Reason: "Whatever"},
 			},
 			wantReady:  false,
 			wantReason: reasonComponentStatusMissing,
 		},
+		{
+			// Regression test: a Ready=True condition observed against an older
+			// generation reflects the pre-update spec, so it must not count the
+			// child as Ready for the current generation.
+			name:       "stale ready condition is treated as progressing",
+			generation: 5,
+			conditions: []metav1.Condition{
+				{Type: conditionTypeReady, Status: metav1.ConditionTrue, Reason: testReasonAllPodsReady, ObservedGeneration: 4},
+			},
+			wantReady:  false,
+			wantReason: reasonComponentProgressing,
+		},
+		{
+			// A condition with no ObservedGeneration (0) predates generation
+			// tracking and is trusted at face value rather than flagged stale.
+			name:       "zero observed generation is not treated as stale",
+			generation: 5,
+			conditions: []metav1.Condition{
+				{Type: conditionTypeReady, Status: metav1.ConditionTrue, Reason: testReasonAllPodsReady},
+			},
+			wantReady:  true,
+			wantReason: testReasonAllPodsReady,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := reportFromConditions(testComponentBroker, tc.conditions)
+			got := reportFromConditions(testComponentBroker, tc.generation, tc.conditions)
 			if !got.present {
 				t.Fatal("present = false, want true")
 			}

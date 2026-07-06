@@ -52,10 +52,18 @@ const (
 	reasonAllComponentsReady     = "AllComponentsReady"
 	reasonComponentNotReady      = "ComponentNotReady"
 	reasonComponentStatusMissing = "ComponentStatusMissing"
+	reasonComponentProgressing   = "ComponentProgressing"
 	reasonNoComponentsConfigured = "NoComponentsConfigured"
 
 	phaseReady    = "Ready"
 	phaseNotReady = "NotReady"
+
+	// defaultImageRepository is the Pulsar image repo used to build a default
+	// component image from spec.pulsarVersion when no explicit image is set.
+	defaultImageRepository = "apachepulsar/pulsar"
+
+	// metadataStoreOxia is the (currently only) supported metadata store.
+	metadataStoreOxia = "oxia"
 )
 
 // +kubebuilder:rbac:groups=cluster.pulsaroperator.io,resources=pulsarclusters,verbs=get;list;watch;create;update;patch;delete
@@ -75,9 +83,9 @@ const (
 // +kubebuilder:rbac:groups=metadata.pulsaroperator.io,resources=oxiaclusters/status,verbs=get;update;patch
 
 // Reconcile decomposes a PulsarCluster into its per-component child CRs,
-// creates or updates each one (owned by the PulsarCluster so they are
-// garbage-collected with it), and aggregates their reported readiness back
-// onto PulsarCluster.Status.
+// creates or updates the desired ones (owned by the PulsarCluster so they are
+// garbage-collected with it), prunes children whose sub-spec was removed, and
+// aggregates their reported readiness back onto PulsarCluster.Status.
 func (r *PulsarClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -148,14 +156,14 @@ func (r *PulsarClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 func (r *PulsarClusterReconciler) reconcileBroker(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, error) {
 	const name = "broker"
-	if cluster.Spec.Broker == nil {
-		return componentReport{name: name}, nil
-	}
-
-	desired := buildBrokerSpec(cluster.Spec)
 	child := &clusterv1alpha1.Broker{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(cluster.Name, name), Namespace: cluster.Namespace},
 	}
+	if cluster.Spec.Broker == nil {
+		return pruneChild(ctx, r, name, child)
+	}
+
+	desired := buildBrokerSpec(cluster.Spec)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
 		return nil
@@ -163,19 +171,19 @@ func (r *PulsarClusterReconciler) reconcileBroker(ctx context.Context, cluster *
 		return componentReport{}, fmt.Errorf("broker: %w", err)
 	}
 
-	return reportFromConditions(name, child.Status.Conditions), nil
+	return reportFromConditions(name, child.Generation, child.Status.Conditions), nil
 }
 
 func (r *PulsarClusterReconciler) reconcileBookKeeper(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, error) {
 	const name = "bookkeeper"
-	if cluster.Spec.BookKeeper == nil {
-		return componentReport{name: name}, nil
-	}
-
-	desired := buildBookKeeperSpec(cluster.Spec)
 	child := &clusterv1alpha1.BookKeeper{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(cluster.Name, name), Namespace: cluster.Namespace},
 	}
+	if cluster.Spec.BookKeeper == nil {
+		return pruneChild(ctx, r, name, child)
+	}
+
+	desired := buildBookKeeperSpec(cluster.Spec)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
 		return nil
@@ -183,19 +191,19 @@ func (r *PulsarClusterReconciler) reconcileBookKeeper(ctx context.Context, clust
 		return componentReport{}, fmt.Errorf("bookkeeper: %w", err)
 	}
 
-	return reportFromConditions(name, child.Status.Conditions), nil
+	return reportFromConditions(name, child.Generation, child.Status.Conditions), nil
 }
 
 func (r *PulsarClusterReconciler) reconcileProxy(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, error) {
 	const name = "proxy"
-	if cluster.Spec.Proxy == nil {
-		return componentReport{name: name}, nil
-	}
-
-	desired := buildProxySpec(cluster.Spec)
 	child := &clusterv1alpha1.Proxy{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(cluster.Name, name), Namespace: cluster.Namespace},
 	}
+	if cluster.Spec.Proxy == nil {
+		return pruneChild(ctx, r, name, child)
+	}
+
+	desired := buildProxySpec(cluster.Spec)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
 		return nil
@@ -203,19 +211,19 @@ func (r *PulsarClusterReconciler) reconcileProxy(ctx context.Context, cluster *c
 		return componentReport{}, fmt.Errorf("proxy: %w", err)
 	}
 
-	return reportFromConditions(name, child.Status.Conditions), nil
+	return reportFromConditions(name, child.Generation, child.Status.Conditions), nil
 }
 
 func (r *PulsarClusterReconciler) reconcileAutoRecovery(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, error) {
 	const name = "autorecovery"
-	if cluster.Spec.AutoRecovery == nil {
-		return componentReport{name: name}, nil
-	}
-
-	desired := buildAutoRecoverySpec(cluster.Spec)
 	child := &clusterv1alpha1.AutoRecovery{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(cluster.Name, name), Namespace: cluster.Namespace},
 	}
+	if cluster.Spec.AutoRecovery == nil {
+		return pruneChild(ctx, r, name, child)
+	}
+
+	desired := buildAutoRecoverySpec(cluster.Spec)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
 		return nil
@@ -223,19 +231,19 @@ func (r *PulsarClusterReconciler) reconcileAutoRecovery(ctx context.Context, clu
 		return componentReport{}, fmt.Errorf("autorecovery: %w", err)
 	}
 
-	return reportFromConditions(name, child.Status.Conditions), nil
+	return reportFromConditions(name, child.Generation, child.Status.Conditions), nil
 }
 
 func (r *PulsarClusterReconciler) reconcileFunctionsWorker(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, error) {
 	const name = "functionsworker"
-	if cluster.Spec.FunctionsWorker == nil {
-		return componentReport{name: name}, nil
-	}
-
-	desired := buildFunctionsWorkerSpec(cluster.Spec)
 	child := &clusterv1alpha1.FunctionsWorker{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(cluster.Name, name), Namespace: cluster.Namespace},
 	}
+	if cluster.Spec.FunctionsWorker == nil {
+		return pruneChild(ctx, r, name, child)
+	}
+
+	desired := buildFunctionsWorkerSpec(cluster.Spec)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
 		return nil
@@ -243,19 +251,24 @@ func (r *PulsarClusterReconciler) reconcileFunctionsWorker(ctx context.Context, 
 		return componentReport{}, fmt.Errorf("functionsworker: %w", err)
 	}
 
-	return reportFromConditions(name, child.Status.Conditions), nil
+	return reportFromConditions(name, child.Generation, child.Status.Conditions), nil
 }
 
 func (r *PulsarClusterReconciler) reconcileOxia(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, error) {
 	const name = "oxia"
-	if !shouldCreateOxia(cluster.Spec) {
-		return componentReport{name: name}, nil
-	}
-
-	desired := buildOxiaSpec(cluster.Spec)
 	child := &metadatav1alpha1.OxiaCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(cluster.Name, name), Namespace: cluster.Namespace},
 	}
+	// Oxia is the mandatory metadata store: brokers and bookies have nowhere
+	// to store metadata without it, so the child is always provisioned while
+	// oxia is the selected store (a default OxiaClusterSpec is used when the
+	// user omits spec.oxia). It is only pruned if a future non-Oxia store is
+	// ever selected.
+	if !oxiaSelected(cluster.Spec) {
+		return pruneChild(ctx, r, name, child)
+	}
+
+	desired := buildOxiaSpec(cluster.Spec)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
 		return nil
@@ -263,7 +276,7 @@ func (r *PulsarClusterReconciler) reconcileOxia(ctx context.Context, cluster *cl
 		return componentReport{}, fmt.Errorf("oxia: %w", err)
 	}
 
-	return reportFromConditions(name, child.Status.Conditions), nil
+	return reportFromConditions(name, child.Generation, child.Status.Conditions), nil
 }
 
 // createOrUpdateChild creates or updates a child object, setting cluster as
@@ -283,9 +296,33 @@ func (r *PulsarClusterReconciler) createOrUpdateChild(
 	return err
 }
 
+// pruneChild deletes a no-longer-desired child (identified by its deterministic
+// name) and reports it as absent. Owner-reference garbage collection only fires
+// on parent deletion, so removing a sub-spec must actively delete its child or
+// the orphaned workload keeps running. A missing child is treated as success.
+func pruneChild(ctx context.Context, r *PulsarClusterReconciler, name string, child client.Object) (componentReport, error) {
+	if err := r.Delete(ctx, child); client.IgnoreNotFound(err) != nil {
+		return componentReport{}, fmt.Errorf("%s: pruning: %w", name, err)
+	}
+	return componentReport{name: name}, nil
+}
+
 // childName deterministically names a child CR after its owning PulsarCluster.
 func childName(clusterName, suffix string) string {
 	return clusterName + "-" + suffix
+}
+
+// clusterDefaultImage is the cluster-wide default image a component inherits
+// when it sets no image of its own: an explicit spec.image wins, otherwise one
+// is built from spec.pulsarVersion (which pins the deployed Pulsar tag).
+func clusterDefaultImage(spec clusterv1alpha1.PulsarClusterSpec) string {
+	if spec.Image != "" {
+		return spec.Image
+	}
+	if spec.PulsarVersion != "" {
+		return defaultImageRepository + ":" + spec.PulsarVersion
+	}
+	return ""
 }
 
 // effectiveImage resolves a component's image against the cluster-wide
@@ -314,7 +351,7 @@ func buildBrokerSpec(spec clusterv1alpha1.PulsarClusterSpec) *clusterv1alpha1.Br
 	if out == nil {
 		return out
 	}
-	out.Image = effectiveImage(out.Image, spec.Image)
+	out.Image = effectiveImage(out.Image, clusterDefaultImage(spec))
 	return out
 }
 
@@ -327,7 +364,7 @@ func buildBookKeeperSpec(spec clusterv1alpha1.PulsarClusterSpec) *clusterv1alpha
 	if out == nil {
 		return out
 	}
-	out.Image = effectiveImage(out.Image, spec.Image)
+	out.Image = effectiveImage(out.Image, clusterDefaultImage(spec))
 
 	if sc := globalStorageClassName(spec); sc != nil && out.Volumes != nil {
 		for _, vol := range []*clusterv1alpha1.VolumeSpec{out.Volumes.Journal, out.Volumes.Ledgers, out.Volumes.Index} {
@@ -346,7 +383,7 @@ func buildProxySpec(spec clusterv1alpha1.PulsarClusterSpec) *clusterv1alpha1.Pro
 	if out == nil {
 		return out
 	}
-	out.Image = effectiveImage(out.Image, spec.Image)
+	out.Image = effectiveImage(out.Image, clusterDefaultImage(spec))
 	return out
 }
 
@@ -357,7 +394,7 @@ func buildAutoRecoverySpec(spec clusterv1alpha1.PulsarClusterSpec) *clusterv1alp
 	if out == nil {
 		return out
 	}
-	out.Image = effectiveImage(out.Image, spec.Image)
+	out.Image = effectiveImage(out.Image, clusterDefaultImage(spec))
 	return out
 }
 
@@ -368,36 +405,35 @@ func buildFunctionsWorkerSpec(spec clusterv1alpha1.PulsarClusterSpec) *clusterv1
 	if out == nil {
 		return out
 	}
-	out.Image = effectiveImage(out.Image, spec.Image)
+	out.Image = effectiveImage(out.Image, clusterDefaultImage(spec))
 	return out
 }
 
-// shouldCreateOxia decides whether the umbrella reconciler should stamp out
-// the metadata.OxiaCluster child: spec.oxia must be configured, and
-// spec.metadataStore, when set, must not select a non-Oxia implementation.
-func shouldCreateOxia(spec clusterv1alpha1.PulsarClusterSpec) bool {
-	if spec.Oxia == nil {
-		return false
+// oxiaSelected reports whether Oxia is the cluster's metadata store. The
+// metadataStore type is an Oxia-only enum that defaults to "oxia", so this is
+// true unless a future implementation explicitly selects a different store.
+func oxiaSelected(spec clusterv1alpha1.PulsarClusterSpec) bool {
+	if spec.MetadataStore == nil || spec.MetadataStore.Type == "" {
+		return true
 	}
-	if spec.MetadataStore != nil && spec.MetadataStore.Type != "" && spec.MetadataStore.Type != "oxia" {
-		return false
-	}
-	return true
+	return spec.MetadataStore.Type == metadataStoreOxia
 }
 
-// buildOxiaSpec copies PulsarCluster.spec.oxia into the child OxiaCluster
-// spec, applying the cluster-wide image and global storage class defaults.
+// buildOxiaSpec derives the child OxiaCluster spec, applying the cluster-wide
+// image and global storage class defaults. When spec.oxia is omitted a default
+// (empty) OxiaClusterSpec is used so CRD defaults (coordinator 2, server 3)
+// provision a working metadata store. It never returns nil.
 func buildOxiaSpec(spec clusterv1alpha1.PulsarClusterSpec) *metadatav1alpha1.OxiaClusterSpec {
 	out := spec.Oxia.DeepCopy()
 	if out == nil {
-		return out
+		out = &metadatav1alpha1.OxiaClusterSpec{}
 	}
 
 	if out.Coordinator != nil {
-		out.Coordinator.Image = effectiveImage(out.Coordinator.Image, spec.Image)
+		out.Coordinator.Image = effectiveImage(out.Coordinator.Image, clusterDefaultImage(spec))
 	}
 	if out.Server != nil {
-		out.Server.Image = effectiveImage(out.Server.Image, spec.Image)
+		out.Server.Image = effectiveImage(out.Server.Image, clusterDefaultImage(spec))
 		if sc := globalStorageClassName(spec); sc != nil && out.Server.StorageClassName == nil {
 			out.Server.StorageClassName = sc
 		}
@@ -417,23 +453,36 @@ type componentReport struct {
 }
 
 // reportFromConditions builds a componentReport for a present child from its
-// observed status conditions.
-func reportFromConditions(name string, conditions []metav1.Condition) componentReport {
-	if cond := apimeta.FindStatusCondition(conditions, conditionTypeReady); cond != nil {
+// observed status conditions and current generation. A child is only counted
+// Ready when its Ready condition is True *and* not stale: a Ready condition
+// whose ObservedGeneration trails the child's current generation reflects the
+// pre-update spec, so it is treated as still progressing.
+func reportFromConditions(name string, generation int64, conditions []metav1.Condition) componentReport {
+	cond := apimeta.FindStatusCondition(conditions, conditionTypeReady)
+	if cond == nil {
 		return componentReport{
 			name:    name,
 			present: true,
-			ready:   cond.Status == metav1.ConditionTrue,
-			reason:  cond.Reason,
-			message: cond.Message,
+			ready:   false,
+			reason:  reasonComponentStatusMissing,
+			message: fmt.Sprintf("child %s has not reported a Ready condition yet", name),
+		}
+	}
+	if cond.ObservedGeneration != 0 && cond.ObservedGeneration < generation {
+		return componentReport{
+			name:    name,
+			present: true,
+			ready:   false,
+			reason:  reasonComponentProgressing,
+			message: fmt.Sprintf("child %s Ready condition is stale (observed generation %d < %d)", name, cond.ObservedGeneration, generation),
 		}
 	}
 	return componentReport{
 		name:    name,
 		present: true,
-		ready:   false,
-		reason:  reasonComponentStatusMissing,
-		message: fmt.Sprintf("child %s has not reported a Ready condition yet", name),
+		ready:   cond.Status == metav1.ConditionTrue,
+		reason:  cond.Reason,
+		message: cond.Message,
 	}
 }
 
