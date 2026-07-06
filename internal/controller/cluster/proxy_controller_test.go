@@ -104,12 +104,12 @@ var _ = Describe("Proxy Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-pdb", Namespace: resourceNamespace}, pdb)).To(Succeed())
 
 			// envtest runs no StatefulSet controller, so the StatefulSet never
-			// actually gets Ready pods: the Proxy must honestly report NotReady
-			// rather than lying about readiness.
+			// observes its generation or gets Ready pods: the Proxy must
+			// honestly report Progressing rather than lying about readiness.
 			cond := apimeta.FindStatusCondition(proxy.Status.Conditions, readyConditionType)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-			Expect(cond.Reason).To(Equal(reasonReplicasNotReady))
+			Expect(cond.Reason).To(Equal(reasonProgressing))
 		})
 
 		It("is idempotent across repeated reconciles", func() {
@@ -212,6 +212,80 @@ var _ = Describe("Proxy Controller", func() {
 		})
 	})
 
+	Context("rollout-aware readiness", func() {
+		const resourceName = "proxy-rollout"
+		key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+		two := int32(2)
+
+		BeforeEach(func() {
+			Expect(k8sClient.Create(ctx, &clusterv1alpha1.Proxy{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+				Spec:       clusterv1alpha1.ProxySpec{Replicas: &two},
+			})).To(Succeed())
+		})
+
+		AfterEach(func() {
+			Expect(k8sClient.Delete(ctx, &clusterv1alpha1.Proxy{ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace}})).To(Succeed())
+		})
+
+		// Regression: readiness must track the rollout, not just readyReplicas.
+		// envtest has no StatefulSet controller, so the test drives the
+		// StatefulSet's Status by hand to simulate each rollout phase.
+		It("reports Ready only once the rollout has fully converged", func() {
+			reconcileProxy(resourceName)
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
+
+			By("simulating a fully converged rollout")
+			setStatefulSetRolloutStatus(sts, sts.Generation, two, two, two)
+			proxy := reconcileProxy(resourceName)
+			cond := apimeta.FindStatusCondition(proxy.Status.Conditions, readyConditionType)
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(reasonReplicasReady))
+
+			By("simulating revision skew: fewer updated replicas than desired")
+			Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
+			setStatefulSetRolloutStatus(sts, sts.Generation, 1, two, two)
+			proxy = reconcileProxy(resourceName)
+			cond = apimeta.FindStatusCondition(proxy.Status.Conditions, readyConditionType)
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(reasonProgressing))
+
+			By("simulating a stale observedGeneration: controller has not yet acted")
+			Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
+			setStatefulSetRolloutStatus(sts, sts.Generation-1, two, two, two)
+			proxy = reconcileProxy(resourceName)
+			cond = apimeta.FindStatusCondition(proxy.Status.Conditions, readyConditionType)
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(reasonProgressing))
+		})
+	})
+
+	Context("a Proxy scaled to zero replicas", func() {
+		const resourceName = "proxy-zero"
+		zero := int32(0)
+
+		BeforeEach(func() {
+			Expect(k8sClient.Create(ctx, &clusterv1alpha1.Proxy{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+				Spec:       clusterv1alpha1.ProxySpec{Replicas: &zero},
+			})).To(Succeed())
+		})
+
+		AfterEach(func() {
+			Expect(k8sClient.Delete(ctx, &clusterv1alpha1.Proxy{ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace}})).To(Succeed())
+		})
+
+		It("reports Ready with a ScaledToZero reason rather than a serving-looking ReplicasReady", func() {
+			proxy := reconcileProxy(resourceName)
+			cond := apimeta.FindStatusCondition(proxy.Status.Conditions, readyConditionType)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(reasonScaledToZero))
+		})
+	})
+
 	Context("when the Proxy is not found", func() {
 		It("returns without error", func() {
 			controllerReconciler := &ProxyReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
@@ -222,6 +296,17 @@ var _ = Describe("Proxy Controller", func() {
 		})
 	})
 })
+
+// setStatefulSetRolloutStatus writes rollout fields onto a StatefulSet's
+// status subresource, standing in for the StatefulSet controller that envtest
+// does not run, so tests can drive each phase of a rolling update.
+func setStatefulSetRolloutStatus(sts *appsv1.StatefulSet, observedGeneration int64, updated, ready, replicas int32) {
+	sts.Status.ObservedGeneration = observedGeneration
+	sts.Status.UpdatedReplicas = updated
+	sts.Status.ReadyReplicas = ready
+	sts.Status.Replicas = replicas
+	ExpectWithOffset(1, k8sClient.Status().Update(context.Background(), sts)).To(Succeed())
+}
 
 func TestProxyReplicas(t *testing.T) {
 	one := int32(1)
@@ -317,23 +402,93 @@ func TestProxyContainerAndServicePorts(t *testing.T) {
 	}
 }
 
-func TestProxyReadyCondition(t *testing.T) {
-	t.Run("ready equals desired", func(t *testing.T) {
-		cond := proxyReadyCondition(3, 2, 2)
-		if cond.Status != metav1.ConditionTrue || cond.Reason != reasonReplicasReady {
-			t.Errorf("proxyReadyCondition(3, 2, 2) = %+v, want ConditionTrue/ReplicasReady", cond)
-		}
-		if cond.ObservedGeneration != 3 {
-			t.Errorf("ObservedGeneration = %d, want 3", cond.ObservedGeneration)
-		}
-	})
+// TestWorkloadReadyCondition covers the shared rollout-aware readiness helper
+// used by the Proxy, AutoRecovery, and FunctionsWorker reconcilers. The
+// revision-skew cases (updatedReplicas below desired, or observedGeneration
+// lagging generation) are the regression guard: a stale, fully-ready-looking
+// status during a rolling restart must not report Ready.
+func TestWorkloadReadyCondition(t *testing.T) {
+	tests := []struct {
+		name       string
+		desired    int32
+		rollout    rolloutStatus
+		wantStatus metav1.ConditionStatus
+		wantReason string
+	}{
+		{
+			name:       "fully converged",
+			desired:    2,
+			rollout:    rolloutStatus{generation: 3, observedGeneration: 3, updatedReplicas: 2, readyReplicas: 2},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: reasonReplicasReady,
+		},
+		{
+			name:       "revision skew: fewer updated than desired",
+			desired:    2,
+			rollout:    rolloutStatus{generation: 4, observedGeneration: 4, updatedReplicas: 1, readyReplicas: 2},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: reasonProgressing,
+		},
+		{
+			name:       "stale observedGeneration",
+			desired:    2,
+			rollout:    rolloutStatus{generation: 5, observedGeneration: 4, updatedReplicas: 2, readyReplicas: 2},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: reasonProgressing,
+		},
+		{
+			name:       "not enough ready",
+			desired:    3,
+			rollout:    rolloutStatus{generation: 1, observedGeneration: 1, updatedReplicas: 3, readyReplicas: 1},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: reasonProgressing,
+		},
+		{
+			name:       "freshly created, nothing observed yet",
+			desired:    1,
+			rollout:    rolloutStatus{generation: 1, observedGeneration: 0, updatedReplicas: 0, readyReplicas: 0},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: reasonProgressing,
+		},
+		{
+			name:       "scaled to zero",
+			desired:    0,
+			rollout:    rolloutStatus{generation: 2, observedGeneration: 2, updatedReplicas: 0, readyReplicas: 0},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: reasonScaledToZero,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := workloadReadyCondition(7, tt.desired, tt.rollout, "proxy")
+			if cond.Status != tt.wantStatus || cond.Reason != tt.wantReason {
+				t.Errorf("workloadReadyCondition(...) = %s/%s, want %s/%s", cond.Status, cond.Reason, tt.wantStatus, tt.wantReason)
+			}
+			if cond.ObservedGeneration != 7 {
+				t.Errorf("ObservedGeneration = %d, want 7", cond.ObservedGeneration)
+			}
+		})
+	}
+}
 
-	t.Run("ready below desired", func(t *testing.T) {
-		cond := proxyReadyCondition(1, 3, 1)
-		if cond.Status != metav1.ConditionFalse || cond.Reason != reasonReplicasNotReady {
-			t.Errorf("proxyReadyCondition(1, 3, 1) = %+v, want ConditionFalse/ReplicasNotReady", cond)
-		}
-	})
+func TestStatefulSetAndDeploymentRollout(t *testing.T) {
+	sts := &appsv1.StatefulSet{}
+	sts.Generation = 3
+	sts.Status.ObservedGeneration = 2
+	sts.Status.UpdatedReplicas = 1
+	sts.Status.ReadyReplicas = 4
+	if got := statefulSetRollout(sts); got != (rolloutStatus{generation: 3, observedGeneration: 2, updatedReplicas: 1, readyReplicas: 4}) {
+		t.Errorf("statefulSetRollout() = %+v", got)
+	}
+
+	deploy := &appsv1.Deployment{}
+	deploy.Generation = 9
+	deploy.Status.ObservedGeneration = 9
+	deploy.Status.UpdatedReplicas = 2
+	deploy.Status.ReadyReplicas = 2
+	if got := deploymentRollout(deploy); got != (rolloutStatus{generation: 9, observedGeneration: 9, updatedReplicas: 2, readyReplicas: 2}) {
+		t.Errorf("deploymentRollout() = %+v", got)
+	}
 }
 
 func TestProxyImage(t *testing.T) {

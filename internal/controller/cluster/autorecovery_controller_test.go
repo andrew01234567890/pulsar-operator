@@ -109,7 +109,7 @@ var _ = Describe("AutoRecovery Controller", func() {
 			Expect(*deploy.Spec.Replicas).To(Equal(int32(2)))
 			Expect(deploy.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(deploy.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"bin/bookkeeper"}))
-			Expect(deploy.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"autorecovery"}))
+			Expect(deploy.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{autoRecoverySubcommand}))
 			Expect(deploy.Spec.Template.Spec.Containers[0].LivenessProbe).NotTo(BeNil())
 			Expect(deploy.Spec.Template.Spec.Containers[0].ReadinessProbe).NotTo(BeNil())
 			Expect(deploy.Spec.Template.Annotations).To(HaveKey(builder.ConfigChecksumAnnotation))
@@ -120,12 +120,62 @@ var _ = Describe("AutoRecovery Controller", func() {
 			// metadataServiceUri must never be hardcoded to an Oxia-specific default.
 			Expect(cm.Data[autoRecoveryConfigFileName]).To(ContainSubstring("metadataServiceUri=\n"))
 
-			// envtest runs no Deployment controller, so it never actually gets
-			// Ready pods: AutoRecovery must honestly report NotReady.
+			// envtest runs no Deployment controller, so it never observes its
+			// generation or gets Ready pods: AutoRecovery must honestly report
+			// Progressing.
 			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, readyConditionType)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-			Expect(cond.Reason).To(Equal(reasonReplicasNotReady))
+			Expect(cond.Reason).To(Equal(reasonProgressing))
+		})
+
+		// Regression: dedicated AutoRecovery readiness must track the
+		// Deployment rollout, not just readyReplicas, so a config/image change
+		// doesn't flash Ready before the rolling restart converges.
+		It("reports Ready only once the Deployment rollout has converged, and Progressing on revision skew", func() {
+			reconcileAutoRecovery(resourceName)
+
+			deploy := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, key, deploy)).To(Succeed())
+
+			By("simulating a fully converged rollout")
+			setDeploymentRolloutStatus(deploy, deploy.Generation, two, two, two)
+			autoRecovery := reconcileAutoRecovery(resourceName)
+			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, readyConditionType)
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(reasonReplicasReady))
+
+			By("simulating revision skew: fewer updated replicas than desired")
+			Expect(k8sClient.Get(ctx, key, deploy)).To(Succeed())
+			setDeploymentRolloutStatus(deploy, deploy.Generation, 1, two, two)
+			autoRecovery = reconcileAutoRecovery(resourceName)
+			cond = apimeta.FindStatusCondition(autoRecovery.Status.Conditions, readyConditionType)
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(reasonProgressing))
+		})
+	})
+
+	Context("a dedicated-mode AutoRecovery scaled to zero replicas", func() {
+		const resourceName = "autorecovery-zero"
+		zero := int32(0)
+
+		BeforeEach(func() {
+			Expect(k8sClient.Create(ctx, &clusterv1alpha1.AutoRecovery{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+				Spec:       clusterv1alpha1.AutoRecoverySpec{Mode: autoRecoveryModeDedicated, Replicas: &zero},
+			})).To(Succeed())
+		})
+
+		AfterEach(func() {
+			Expect(k8sClient.Delete(ctx, &clusterv1alpha1.AutoRecovery{ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace}})).To(Succeed())
+		})
+
+		It("reports Ready with a ScaledToZero reason", func() {
+			autoRecovery := reconcileAutoRecovery(resourceName)
+			cond := apimeta.FindStatusCondition(autoRecovery.Status.Conditions, readyConditionType)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(reasonScaledToZero))
 		})
 	})
 
@@ -233,22 +283,6 @@ func TestAutoRecoveryMergedConfigUserOverrideWins(t *testing.T) {
 	}
 }
 
-func TestAutoRecoveryReadyCondition(t *testing.T) {
-	t.Run("ready equals desired", func(t *testing.T) {
-		cond := autoRecoveryReadyCondition(4, 1, 1)
-		if cond.Status != metav1.ConditionTrue || cond.Reason != reasonReplicasReady {
-			t.Errorf("autoRecoveryReadyCondition(4, 1, 1) = %+v, want ConditionTrue/ReplicasReady", cond)
-		}
-	})
-
-	t.Run("ready below desired", func(t *testing.T) {
-		cond := autoRecoveryReadyCondition(1, 2, 0)
-		if cond.Status != metav1.ConditionFalse || cond.Reason != reasonReplicasNotReady {
-			t.Errorf("autoRecoveryReadyCondition(1, 2, 0) = %+v, want ConditionFalse/ReplicasNotReady", cond)
-		}
-	})
-}
-
 func TestAutoRecoveryImage(t *testing.T) {
 	if got := autoRecoveryImage(""); got != autoRecoveryDefaultImage {
 		t.Errorf("autoRecoveryImage(\"\") = %q, want default %q", got, autoRecoveryDefaultImage)
@@ -256,4 +290,15 @@ func TestAutoRecoveryImage(t *testing.T) {
 	if got := autoRecoveryImage(testCustomImage); got != testCustomImage {
 		t.Errorf("autoRecoveryImage(custom) = %q, want %q", got, testCustomImage)
 	}
+}
+
+// setDeploymentRolloutStatus writes rollout fields onto a Deployment's status
+// subresource, standing in for the Deployment controller that envtest does not
+// run, so tests can drive each phase of a rolling update.
+func setDeploymentRolloutStatus(deploy *appsv1.Deployment, observedGeneration int64, updated, ready, replicas int32) {
+	deploy.Status.ObservedGeneration = observedGeneration
+	deploy.Status.UpdatedReplicas = updated
+	deploy.Status.ReadyReplicas = ready
+	deploy.Status.Replicas = replicas
+	ExpectWithOffset(1, k8sClient.Status().Update(context.Background(), deploy)).To(Succeed())
 }

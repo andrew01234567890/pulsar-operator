@@ -125,7 +125,56 @@ var _ = Describe("FunctionsWorker Controller", func() {
 			cond := apimeta.FindStatusCondition(fw.Status.Conditions, readyConditionType)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-			Expect(cond.Reason).To(Equal(reasonReplicasNotReady))
+			Expect(cond.Reason).To(Equal(reasonProgressing))
+		})
+
+		// Regression: standalone readiness must track the StatefulSet rollout,
+		// not just readyReplicas, so a config/image change doesn't flash Ready
+		// before the rolling restart converges.
+		It("reports Ready only once the rollout has converged, and Progressing on revision skew", func() {
+			reconcileFunctionsWorker(resourceName)
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
+
+			By("simulating a fully converged rollout")
+			setStatefulSetRolloutStatus(sts, sts.Generation, 1, 1, 1)
+			fw := reconcileFunctionsWorker(resourceName)
+			cond := apimeta.FindStatusCondition(fw.Status.Conditions, readyConditionType)
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(reasonReplicasReady))
+
+			By("simulating a stale observedGeneration during a template change")
+			Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
+			setStatefulSetRolloutStatus(sts, sts.Generation-1, 1, 1, 1)
+			fw = reconcileFunctionsWorker(resourceName)
+			cond = apimeta.FindStatusCondition(fw.Status.Conditions, readyConditionType)
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(reasonProgressing))
+		})
+	})
+
+	Context("a standalone-mode FunctionsWorker scaled to zero replicas", func() {
+		const resourceName = "functionsworker-zero"
+		zero := int32(0)
+
+		BeforeEach(func() {
+			Expect(k8sClient.Create(ctx, &clusterv1alpha1.FunctionsWorker{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+				Spec:       clusterv1alpha1.FunctionsWorkerSpec{Mode: functionsWorkerModeStandalone, Replicas: &zero},
+			})).To(Succeed())
+		})
+
+		AfterEach(func() {
+			Expect(k8sClient.Delete(ctx, &clusterv1alpha1.FunctionsWorker{ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace}})).To(Succeed())
+		})
+
+		It("reports Ready with a ScaledToZero reason", func() {
+			fw := reconcileFunctionsWorker(resourceName)
+			cond := apimeta.FindStatusCondition(fw.Status.Conditions, readyConditionType)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(reasonScaledToZero))
 		})
 	})
 
@@ -266,22 +315,6 @@ func TestFunctionsWorkerMergedConfigLeavesBrokerURLsBlank(t *testing.T) {
 			t.Errorf("%s = %q (present=%v), want blank (must not invent broker/metadata-store naming)", key, v, ok)
 		}
 	}
-}
-
-func TestFunctionsWorkerReadyCondition(t *testing.T) {
-	t.Run("ready equals desired", func(t *testing.T) {
-		cond := functionsWorkerReadyCondition(2, 1, 1)
-		if cond.Status != metav1.ConditionTrue || cond.Reason != reasonReplicasReady {
-			t.Errorf("functionsWorkerReadyCondition(2, 1, 1) = %+v, want ConditionTrue/ReplicasReady", cond)
-		}
-	})
-
-	t.Run("ready below desired", func(t *testing.T) {
-		cond := functionsWorkerReadyCondition(1, 3, 2)
-		if cond.Status != metav1.ConditionFalse || cond.Reason != reasonReplicasNotReady {
-			t.Errorf("functionsWorkerReadyCondition(1, 3, 2) = %+v, want ConditionFalse/ReplicasNotReady", cond)
-		}
-	})
 }
 
 func TestFunctionsWorkerImage(t *testing.T) {

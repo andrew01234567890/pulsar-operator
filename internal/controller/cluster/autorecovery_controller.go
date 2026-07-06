@@ -41,6 +41,11 @@ import (
 const (
 	autoRecoveryComponent = "autorecovery"
 
+	// autoRecoverySubcommand is the bin/bookkeeper subcommand that runs the
+	// Auditor + ReplicationWorker daemon. It happens to equal the component
+	// name but is a distinct concept (a CLI arg, not a label value).
+	autoRecoverySubcommand = "autorecovery"
+
 	autoRecoveryModeEmbedded  = "embedded"
 	autoRecoveryModeDedicated = "dedicated"
 
@@ -138,7 +143,7 @@ func (r *AutoRecoveryReconciler) reconcileDedicated(ctx context.Context, autoRec
 	autoRecovery.Status.Replicas = deploy.Status.Replicas
 	autoRecovery.Status.ReadyReplicas = deploy.Status.ReadyReplicas
 
-	return autoRecoveryReadyCondition(autoRecovery.Generation, desiredReplicas, deploy.Status.ReadyReplicas), nil
+	return workloadReadyCondition(autoRecovery.Generation, desiredReplicas, deploymentRollout(deploy), autoRecoveryComponent), nil
 }
 
 // reconcileEmbedded deletes any dedicated Deployment/ConfigMap left over from
@@ -199,7 +204,7 @@ func (r *AutoRecoveryReconciler) reconcileDeployment(
 					Name:    autoRecoveryComponent,
 					Image:   autoRecoveryImage(autoRecovery.Spec.Image),
 					Command: []string{"bin/bookkeeper"},
-					Args:    []string{"autorecovery"},
+					Args:    []string{autoRecoverySubcommand},
 					Ports: []corev1.ContainerPort{
 						{Name: portNameHTTP, ContainerPort: autoRecoveryHTTPPort},
 					},
@@ -295,27 +300,6 @@ func autoRecoveryProbe() *corev1.Probe {
 		PeriodSeconds:       10,
 		TimeoutSeconds:      5,
 		FailureThreshold:    3,
-	}
-}
-
-// autoRecoveryReadyCondition reports Ready true exactly when every desired
-// dedicated-mode replica is ready.
-func autoRecoveryReadyCondition(generation int64, desired, ready int32) metav1.Condition {
-	if ready == desired {
-		return metav1.Condition{
-			Type:               readyConditionType,
-			Status:             metav1.ConditionTrue,
-			Reason:             reasonReplicasReady,
-			ObservedGeneration: generation,
-			Message:            fmt.Sprintf("%d/%d autorecovery replicas ready", ready, desired),
-		}
-	}
-	return metav1.Condition{
-		Type:               readyConditionType,
-		Status:             metav1.ConditionFalse,
-		Reason:             reasonReplicasNotReady,
-		ObservedGeneration: generation,
-		Message:            fmt.Sprintf("%d/%d autorecovery replicas ready", ready, desired),
 	}
 }
 

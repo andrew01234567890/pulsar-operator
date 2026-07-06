@@ -41,6 +41,10 @@ import (
 const (
 	functionsWorkerComponent = "functionsworker"
 
+	// functionsWorkerNoun is the human-readable component name used in status
+	// messages, distinct from the label-safe functionsWorkerComponent.
+	functionsWorkerNoun = "functions worker"
+
 	functionsWorkerModeColocated  = "colocated"
 	functionsWorkerModeStandalone = "standalone"
 
@@ -152,7 +156,7 @@ func (r *FunctionsWorkerReconciler) reconcileStandalone(ctx context.Context, fw 
 	fw.Status.Replicas = sts.Status.Replicas
 	fw.Status.ReadyReplicas = sts.Status.ReadyReplicas
 
-	return functionsWorkerReadyCondition(fw.Generation, desiredReplicas, sts.Status.ReadyReplicas), nil
+	return workloadReadyCondition(fw.Generation, desiredReplicas, statefulSetRollout(sts), functionsWorkerNoun), nil
 }
 
 // reconcileColocated deletes any standalone-mode resources left over from a
@@ -365,27 +369,6 @@ func functionsWorkerProbe() *corev1.Probe {
 		PeriodSeconds:       10,
 		TimeoutSeconds:      5,
 		FailureThreshold:    3,
-	}
-}
-
-// functionsWorkerReadyCondition reports Ready true exactly when every
-// desired standalone-mode replica is ready.
-func functionsWorkerReadyCondition(generation int64, desired, ready int32) metav1.Condition {
-	if ready == desired {
-		return metav1.Condition{
-			Type:               readyConditionType,
-			Status:             metav1.ConditionTrue,
-			Reason:             reasonReplicasReady,
-			ObservedGeneration: generation,
-			Message:            fmt.Sprintf("%d/%d functions worker replicas ready", ready, desired),
-		}
-	}
-	return metav1.Condition{
-		Type:               readyConditionType,
-		Status:             metav1.ConditionFalse,
-		Reason:             reasonReplicasNotReady,
-		ObservedGeneration: generation,
-		Message:            fmt.Sprintf("%d/%d functions worker replicas ready", ready, desired),
 	}
 }
 

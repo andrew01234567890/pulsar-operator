@@ -40,13 +40,9 @@ import (
 
 // Constants shared by the Proxy, AutoRecovery, and FunctionsWorker
 // reconcilers (and their tests), collected here to satisfy goconst rather
-// than repeating the same literal across all three.
+// than repeating the same literal across all three. The Ready-condition
+// reasons and the rollout-readiness helper live in readiness.go.
 const (
-	readyConditionType = "Ready"
-
-	reasonReplicasReady    = "ReplicasReady"
-	reasonReplicasNotReady = "ReplicasNotReady"
-
 	portNameHTTP = "http"
 
 	cmdBinPulsar = "bin/pulsar"
@@ -140,7 +136,7 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	proxy.Status.Replicas = sts.Status.Replicas
 	proxy.Status.ReadyReplicas = sts.Status.ReadyReplicas
 	proxy.Status.ObservedGeneration = proxy.Generation
-	apimeta.SetStatusCondition(&proxy.Status.Conditions, proxyReadyCondition(proxy.Generation, desiredReplicas, sts.Status.ReadyReplicas))
+	apimeta.SetStatusCondition(&proxy.Status.Conditions, workloadReadyCondition(proxy.Generation, desiredReplicas, statefulSetRollout(sts), proxyComponent))
 
 	if err := r.Status().Update(ctx, proxy); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating Proxy status: %w", err)
@@ -362,27 +358,6 @@ func proxyVolumeMounts(tls *clusterv1alpha1.ProxyTlsConfig) []corev1.VolumeMount
 		})
 	}
 	return mounts
-}
-
-// proxyReadyCondition reports Ready true exactly when every desired replica
-// is ready, matching Proxy's simple stateless readiness contract.
-func proxyReadyCondition(generation int64, desired, ready int32) metav1.Condition {
-	if ready == desired {
-		return metav1.Condition{
-			Type:               readyConditionType,
-			Status:             metav1.ConditionTrue,
-			Reason:             reasonReplicasReady,
-			ObservedGeneration: generation,
-			Message:            fmt.Sprintf("%d/%d proxy replicas ready", ready, desired),
-		}
-	}
-	return metav1.Condition{
-		Type:               readyConditionType,
-		Status:             metav1.ConditionFalse,
-		Reason:             reasonReplicasNotReady,
-		ObservedGeneration: generation,
-		Message:            fmt.Sprintf("%d/%d proxy replicas ready", ready, desired),
-	}
 }
 
 // SetupWithManager sets up the controller with the Manager.
