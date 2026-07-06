@@ -2,6 +2,8 @@ name: E2E Tests
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions: {}
@@ -10,7 +12,7 @@ jobs:
   test-e2e:
     permissions:
       contents: read
-    name: Run on Ubuntu
+    name: test-e2e
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
