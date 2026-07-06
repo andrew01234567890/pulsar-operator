@@ -1,0 +1,10 @@
+## Append samples of your project ##
+resources:
+- cluster_v1alpha1_pulsarcluster.yaml
+- cluster_v1alpha1_broker.yaml
+- cluster_v1alpha1_bookkeeper.yaml
+- cluster_v1alpha1_proxy.yaml
+- cluster_v1alpha1_autorecovery.yaml
+- cluster_v1alpha1_functionsworker.yaml
+- metadata_v1alpha1_oxiacluster.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
