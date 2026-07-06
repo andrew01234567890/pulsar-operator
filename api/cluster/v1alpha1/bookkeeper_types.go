@@ -167,7 +167,13 @@ type BookKeeperSpec struct {
 	// +optional
 	Image string `json:"image,omitempty"`
 
-	// config sets bookkeeper.conf key/value overrides layered on top of operator defaults.
+	// config sets bookkeeper.conf key/value overrides layered on top of operator
+	// defaults. Structural/wiring keys the operator owns —
+	// journalDirectories, ledgerDirectories, indexDirectories, bookiePort,
+	// httpServerEnabled, and httpServerPort — are re-asserted by the operator to
+	// keep the rendered config in sync with the generated Service, probes, and
+	// volume mounts, so overrides of those specific keys are ignored. Every
+	// other key is applied as given.
 	// +optional
 	Config map[string]string `json:"config,omitempty"`
 

@@ -21,13 +21,18 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	clusterv1alpha1 "github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1"
+	"github.com/andrew01234567890/pulsar-operator/internal/builder"
 )
 
 var _ = Describe("BookKeeper Controller", func() {
@@ -49,19 +54,24 @@ var _ = Describe("BookKeeper Controller", func() {
 			By("creating the custom resource for the Kind BookKeeper")
 			err := k8sClient.Get(ctx, typeNamespacedName, bookkeeper)
 			if err != nil && errors.IsNotFound(err) {
+				replicas := int32(3)
 				resource := &clusterv1alpha1.BookKeeper{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      resourceName,
 						Namespace: resourceNamespace,
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: clusterv1alpha1.BookKeeperSpec{
+						Replicas: &replicas,
+						Config: map[string]string{
+							"metadataServiceUri": "metadata-store:oxia://oxia-server:6648/bookkeeper",
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
 			resource := &clusterv1alpha1.BookKeeper{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
@@ -69,19 +79,165 @@ var _ = Describe("BookKeeper Controller", func() {
 			By("Cleanup the specific resource instance BookKeeper")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
+
+		It("should reconcile a bookie StatefulSet, headless Service, ConfigMap, and PodDisruptionBudget", func() {
 			controllerReconciler := &BookKeeperReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
 			}
 
+			By("Reconciling the created resource")
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, bookkeeper)).To(Succeed())
+			owner := bookkeeper
+
+			By("creating a StatefulSet with three disk-role volumeClaimTemplates")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, sts)).To(Succeed())
+
+			Expect(sts.Spec.VolumeClaimTemplates).To(HaveLen(3))
+			claimNames := make([]string, 0, len(sts.Spec.VolumeClaimTemplates))
+			for _, vct := range sts.Spec.VolumeClaimTemplates {
+				claimNames = append(claimNames, vct.Name)
+			}
+			Expect(claimNames).To(ConsistOf(volumeNameJournal, volumeNameLedgers, volumeNameIndex))
+
+			Expect(sts.Spec.ServiceName).To(Equal(resourceName))
+			Expect(*sts.Spec.Replicas).To(Equal(int32(3)))
+			Expect(sts.Spec.PodManagementPolicy).To(Equal(appsv1.ParallelPodManagement))
+
+			By("setting a config-checksum annotation on the pod template")
+			checksum, ok := sts.Spec.Template.Annotations[builder.ConfigChecksumAnnotation]
+			Expect(ok).To(BeTrue())
+			Expect(checksum).NotTo(BeEmpty())
+
+			By("owning the StatefulSet so it is garbage-collected with the BookKeeper")
+			Expect(ownerRefNames(sts.OwnerReferences)).To(ContainElement(owner.Name))
+
+			By("creating a headless Service for bookie peer discovery")
+			svc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, svc)).To(Succeed())
+			Expect(svc.Spec.ClusterIP).To(Equal("None"))
+			Expect(svc.Spec.PublishNotReadyAddresses).To(BeTrue())
+			Expect(ownerRefNames(svc.OwnerReferences)).To(ContainElement(owner.Name))
+
+			By("creating a ConfigMap rendering bookkeeper.conf from operator defaults and spec.config")
+			cm := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, cm)).To(Succeed())
+			Expect(cm.Data[configMapKey]).To(ContainSubstring("metadataServiceUri=metadata-store:oxia://oxia-server:6648/bookkeeper"))
+			Expect(cm.Data[configMapKey]).To(ContainSubstring("journalDirectories=" + journalMountPath))
+			Expect(ownerRefNames(cm.OwnerReferences)).To(ContainElement(owner.Name))
+
+			By("creating a PodDisruptionBudget scoped to the bookie selector with quorum-derived maxUnavailable")
+			pdb := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, pdb)).To(Succeed())
+			Expect(pdb.Spec.Selector.MatchLabels).To(Equal(builder.SelectorLabels(resourceName, bookkeeperComponent)))
+			Expect(pdb.Spec.MaxUnavailable).NotTo(BeNil())
+			// 3 replicas - default write quorum 2 = 1 tolerable disruption.
+			Expect(*pdb.Spec.MaxUnavailable).To(Equal(intstr.FromInt32(1)))
+			Expect(ownerRefNames(pdb.OwnerReferences)).To(ContainElement(owner.Name))
+		})
+
+		It("should report Ready only once the StatefulSet is fully ready and rolled out", func() {
+			controllerReconciler := &BookKeeperReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("the StatefulSet not yet reporting ready pods")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, bookkeeper)).To(Succeed())
+			Expect(bookkeeper.Status.ReadyReplicas).To(Equal(int32(0)))
+			readyCond := findCondition(bookkeeper.Status.Conditions, conditionTypeReady)
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+
+			By("all pods ready but mid-rollout (revision split) still reporting NOT Ready")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, sts)).To(Succeed())
+			sts.Status.Replicas = 3
+			sts.Status.ReadyReplicas = 3
+			sts.Status.UpdatedReplicas = 1
+			sts.Status.CurrentRevision = testRevision1
+			sts.Status.UpdateRevision = testRevision2
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, bookkeeper)).To(Succeed())
+			Expect(bookkeeper.Status.ReadyReplicas).To(Equal(int32(3)))
+			readyCond = findCondition(bookkeeper.Status.Conditions, conditionTypeReady)
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal(reasonProgressing))
+
+			By("the rollout completing (all updated, revisions converged) flips it Ready")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, sts)).To(Succeed())
+			sts.Status.UpdatedReplicas = 3
+			sts.Status.CurrentRevision = testRevision2
+			sts.Status.UpdateRevision = testRevision2
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, bookkeeper)).To(Succeed())
+			Expect(bookkeeper.Status.ReadyReplicas).To(Equal(int32(3)))
+			Expect(bookkeeper.Status.ObservedGeneration).To(Equal(bookkeeper.Generation))
+			readyCond = findCondition(bookkeeper.Status.Conditions, conditionTypeReady)
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(readyCond.Reason).To(Equal(reasonAllReady))
+		})
+
+		// Regression: an earlier revision of this reconciler re-set
+		// StatefulSet.Spec.Selector/ServiceName/PodManagementPolicy/
+		// VolumeClaimTemplates on every reconcile. Those fields are immutable
+		// once the StatefulSet exists, so a real API server rejects any
+		// update that even re-sends the same value verbatim if the
+		// surrounding object diff logic doesn't special-case them -
+		// reconciling twice in a row must stay a no-op error-wise.
+		It("should reconcile idempotently without erroring on immutable StatefulSet fields", func() {
+			controllerReconciler := &BookKeeperReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, sts)).To(Succeed())
+			Expect(sts.Spec.ServiceName).To(Equal(resourceName))
+			Expect(sts.Spec.PodManagementPolicy).To(Equal(appsv1.ParallelPodManagement))
+			Expect(sts.Spec.VolumeClaimTemplates).To(HaveLen(3))
 		})
 	})
 })
+
+func ownerRefNames(refs []metav1.OwnerReference) []string {
+	names := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		names = append(names, ref.Name)
+	}
+	return names
+}
+
+func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == condType {
+			return &conditions[i]
+		}
+	}
+	return nil
+}
