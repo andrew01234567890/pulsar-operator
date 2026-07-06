@@ -65,13 +65,21 @@ const (
 	bookiePort      = 3181
 	bookieAdminPort = 8000
 
+	keyBookiePort         = "bookiePort"
+	keyHTTPServerEnabled  = "httpServerEnabled"
+	keyHTTPServerPort     = "httpServerPort"
 	keyJournalDirectories = "journalDirectories"
 	keyLedgerDirectories  = "ledgerDirectories"
 	keyIndexDirectories   = "indexDirectories"
 
-	defaultJournalDir = "/pulsar/data/bookkeeper/journal"
-	defaultLedgerDir  = "/pulsar/data/bookkeeper/ledgers"
-	defaultIndexDir   = "/pulsar/data/bookkeeper/index"
+	// journalMountPath, ledgerMountPath, and indexMountPath are the operator's
+	// fixed, single-directory PVC mount paths, one per disk-role
+	// volumeClaimTemplate. The rendered bookkeeper.conf *Directories keys are
+	// set TO these paths (never the reverse), so the mounts and the config can
+	// never disagree.
+	journalMountPath = "/pulsar/data/bookkeeper/journal"
+	ledgerMountPath  = "/pulsar/data/bookkeeper/ledgers"
+	indexMountPath   = "/pulsar/data/bookkeeper/index"
 
 	volumeNameConfig  = "config"
 	volumeNameJournal = "journal"
@@ -82,10 +90,11 @@ const (
 	bookieConfMountPath = "/pulsar/conf/bookkeeper.conf"
 	bookieStatePath     = "/api/v1/bookie/state"
 
-	conditionTypeReady = "Ready"
-	reasonAllReady     = "AllReplicasReady"
-	reasonProgressing  = "ReplicasNotReady"
-	reasonNoReplicas   = "NoReplicasDesired"
+	// conditionTypeReady ("Ready") is declared once for this package in
+	// pulsarcluster_controller.go; the bookie reasons below reuse it.
+	reasonAllReady    = "AllReplicasReady"
+	reasonProgressing = "Progressing"
+	reasonNoReplicas  = "NoReplicasDesired"
 )
 
 // defaultJournalSize, defaultLedgerSize, and defaultIndexSize mirror
@@ -125,7 +134,7 @@ func (r *BookKeeperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	merged, rendered := mergeConfig(bk.Spec)
+	_, rendered := mergeConfig(bk.Spec)
 	image := resolveImage(bk.Spec)
 
 	if err := r.reconcileConfigMap(ctx, bk, rendered); err != nil {
@@ -143,7 +152,7 @@ func (r *BookKeeperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	sts, err := r.reconcileStatefulSet(ctx, bk, image, merged, rendered)
+	sts, err := r.reconcileStatefulSet(ctx, bk, image, rendered)
 	if err != nil {
 		log.Error(err, "Failed to reconcile StatefulSet")
 		return ctrl.Result{}, err
@@ -203,8 +212,8 @@ func (r *BookKeeperReconciler) reconcilePodDisruptionBudget(ctx context.Context,
 // BookKeeperSpec pending a defaulting/validation webhook), so touching them
 // here would make every reconcile after the first fail against a real API
 // server.
-func (r *BookKeeperReconciler) reconcileStatefulSet(ctx context.Context, bk *clusterv1alpha1.BookKeeper, image string, merged map[string]string, rendered string) (*appsv1.StatefulSet, error) {
-	desired := desiredStatefulSet(bk, image, merged, rendered)
+func (r *BookKeeperReconciler) reconcileStatefulSet(ctx context.Context, bk *clusterv1alpha1.BookKeeper, image string, rendered string) (*appsv1.StatefulSet, error) {
+	desired := desiredStatefulSet(bk, image, rendered)
 
 	existing := &appsv1.StatefulSet{}
 	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
@@ -247,33 +256,46 @@ func (r *BookKeeperReconciler) updateStatus(ctx context.Context, key types.Names
 	latest.Status.Replicas = sts.Status.Replicas
 	latest.Status.ReadyReplicas = sts.Status.ReadyReplicas
 	latest.Status.ObservedGeneration = latest.Generation
-	apimeta.SetStatusCondition(&latest.Status.Conditions, computeReadyCondition(latest.Generation, desiredReplicas, sts.Status.ReadyReplicas))
+	apimeta.SetStatusCondition(&latest.Status.Conditions, computeReadyCondition(latest.Generation, desiredReplicas, rolloutStateOf(sts)))
 
 	return r.Status().Update(ctx, latest)
 }
 
-// mergeConfig layers BookKeeper.spec.config over the operator's bookie
-// defaults and renders the result as bookkeeper.conf content. metadataServiceUri
-// is deliberately absent from the defaults: it must come entirely from
-// spec.config so this reconciler never bakes in a particular metadata store
-// (Oxia, ZooKeeper, ...).
+// mergeConfig renders bookkeeper.conf by layering the operator-managed keys
+// (see operatorManagedConfig) on top of the user's spec.config, so a user
+// override of a structural/wiring key can never desync the rendered config
+// from the generated Service, probes, or volume mounts. metadataServiceUri is
+// deliberately never defaulted here: it comes entirely from spec.config so this
+// reconciler never bakes in a particular metadata store (Oxia, ZooKeeper, ...).
 func mergeConfig(spec clusterv1alpha1.BookKeeperSpec) (merged map[string]string, rendered string) {
-	merged = config.Merge(defaultBookKeeperConfig(), spec.Config)
+	merged = config.Merge(spec.Config, operatorManagedConfig())
 	rendered = config.RenderProperties(merged)
 	return merged, rendered
 }
 
-func defaultBookKeeperConfig() map[string]string {
+// operatorManagedConfig returns the bookkeeper.conf keys the operator owns and
+// re-asserts on top of any user-supplied spec.config. These keys wire the
+// rendered config to the generated Kubernetes objects and MUST stay in sync
+// with them, so they are NOT user-overridable:
+//   - journalDirectories/ledgerDirectories/indexDirectories each name exactly
+//     one directory, equal to that disk role's volumeClaimTemplate mount path;
+//     a comma-separated, multi-dir, or empty override would break the 1:1
+//     dir↔mount mapping.
+//   - bookiePort matches the bookie container port, the liveness TCP probe, and
+//     the headless Service port/targetPort.
+//   - httpServerEnabled is forced on (the operator needs the bookie admin API
+//     for readiness now and autoscaling later); httpServerPort matches the
+//     readiness HTTP probe port.
+//
+// Every other bookkeeper.conf key stays freely user-overridable via spec.config.
+func operatorManagedConfig() map[string]string {
 	return map[string]string{
-		"bookiePort": strconv.Itoa(bookiePort),
-		// Pulsar ships httpServerEnabled=false; the operator turns it on
-		// because the readiness/liveness probes below depend on the bookie
-		// admin API.
-		"httpServerEnabled":   "true",
-		"httpServerPort":      strconv.Itoa(bookieAdminPort),
-		keyJournalDirectories: defaultJournalDir,
-		keyLedgerDirectories:  defaultLedgerDir,
-		keyIndexDirectories:   defaultIndexDir,
+		keyBookiePort:         strconv.Itoa(bookiePort),
+		keyHTTPServerEnabled:  "true",
+		keyHTTPServerPort:     strconv.Itoa(bookieAdminPort),
+		keyJournalDirectories: journalMountPath,
+		keyLedgerDirectories:  ledgerMountPath,
+		keyIndexDirectories:   indexMountPath,
 	}
 }
 
@@ -331,7 +353,7 @@ func desiredPDB(bk *clusterv1alpha1.BookKeeper) *policyv1.PodDisruptionBudget {
 	return builder.PodDisruptionBudget(bk.Name, bk.Namespace, builder.Labels(bk.Name, bookkeeperComponent), builder.SelectorLabels(bk.Name, bookkeeperComponent), maxUnavailable)
 }
 
-func desiredStatefulSet(bk *clusterv1alpha1.BookKeeper, image string, merged map[string]string, rendered string) *appsv1.StatefulSet {
+func desiredStatefulSet(bk *clusterv1alpha1.BookKeeper, image string, rendered string) *appsv1.StatefulSet {
 	replicas := resolveReplicas(bk.Spec)
 	labels := builder.Labels(bk.Name, bookkeeperComponent)
 	selector := builder.SelectorLabels(bk.Name, bookkeeperComponent)
@@ -347,7 +369,7 @@ func desiredStatefulSet(bk *clusterv1alpha1.BookKeeper, image string, merged map
 			ServiceName:          bk.Name,
 			PodManagementPolicy:  resolvePodManagementPolicy(bk.Spec),
 			Selector:             &metav1.LabelSelector{MatchLabels: selector},
-			Template:             buildPodTemplate(bk, image, merged, rendered),
+			Template:             buildPodTemplate(bk, image, rendered),
 			VolumeClaimTemplates: buildVolumeClaimTemplates(bk.Spec, labels),
 			// persistentVolumeClaimRetentionPolicy is deliberately left unset
 			// (defaults to Retain/Retain): the operator does not own PVC
@@ -357,14 +379,14 @@ func desiredStatefulSet(bk *clusterv1alpha1.BookKeeper, image string, merged map
 	}
 }
 
-func buildPodTemplate(bk *clusterv1alpha1.BookKeeper, image string, merged map[string]string, rendered string) corev1.PodTemplateSpec {
+func buildPodTemplate(bk *clusterv1alpha1.BookKeeper, image string, rendered string) corev1.PodTemplateSpec {
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels:      builder.Labels(bk.Name, bookkeeperComponent),
 			Annotations: builder.WithConfigChecksum(nil, rendered),
 		},
 		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{buildBookieContainer(image, merged)},
+			Containers: []corev1.Container{buildBookieContainer(image)},
 			Volumes: []corev1.Volume{
 				{
 					Name: volumeNameConfig,
@@ -379,7 +401,11 @@ func buildPodTemplate(bk *clusterv1alpha1.BookKeeper, image string, merged map[s
 	}
 }
 
-func buildBookieContainer(image string, merged map[string]string) corev1.Container {
+// buildBookieContainer wires the container ports, probes, and disk mounts to
+// the same operator-owned ports and mount paths that operatorManagedConfig
+// writes into bookkeeper.conf, so the running bookie and its rendered config
+// can never point at different ports or directories.
+func buildBookieContainer(image string) corev1.Container {
 	return corev1.Container{
 		Name:    bookieContainerName,
 		Image:   image,
@@ -390,9 +416,9 @@ func buildBookieContainer(image string, merged map[string]string) corev1.Contain
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: volumeNameConfig, MountPath: bookieConfMountPath, SubPath: configMapKey, ReadOnly: true},
-			{Name: volumeNameJournal, MountPath: merged[keyJournalDirectories]},
-			{Name: volumeNameLedgers, MountPath: merged[keyLedgerDirectories]},
-			{Name: volumeNameIndex, MountPath: merged[keyIndexDirectories]},
+			{Name: volumeNameJournal, MountPath: journalMountPath},
+			{Name: volumeNameLedgers, MountPath: ledgerMountPath},
+			{Name: volumeNameIndex, MountPath: indexMountPath},
 		},
 		// Liveness only checks that the process accepts bookie-port TCP
 		// connections, so a stuck admin HTTP server can't itself trigger a
@@ -462,37 +488,59 @@ func volumeClaimTemplate(name string, vol *clusterv1alpha1.VolumeSpec, defaultSi
 	}
 }
 
-// computeReadyCondition treats zero desired replicas as not-Ready rather than
-// vacuously Ready (0 == 0): otherwise a freshly created StatefulSet, whose
-// status is still all zeros before the controller has observed any pods,
-// would read as Ready on the very first reconcile.
-func computeReadyCondition(generation int64, desiredReplicas, readyReplicas int32) metav1.Condition {
+// rolloutState is the subset of StatefulSet.Status the Ready condition depends
+// on: enough to tell "all pods ready" apart from "all pods ready but half of
+// them still on the previous revision mid-rolling-restart".
+type rolloutState struct {
+	readyReplicas   int32
+	updatedReplicas int32
+	currentRevision string
+	updateRevision  string
+}
+
+func rolloutStateOf(sts *appsv1.StatefulSet) rolloutState {
+	return rolloutState{
+		readyReplicas:   sts.Status.ReadyReplicas,
+		updatedReplicas: sts.Status.UpdatedReplicas,
+		currentRevision: sts.Status.CurrentRevision,
+		updateRevision:  sts.Status.UpdateRevision,
+	}
+}
+
+// computeReadyCondition reports Ready only when the StatefulSet has fully
+// converged on the desired revision: every replica ready, every replica
+// updated to the latest revision, and no revision split. Requiring
+// updatedReplicas==desired and currentRevision==updateRevision (not just
+// readyReplicas==desired) means a config-checksum-driven rolling restart
+// reports Progressing until the last old-revision pod is replaced, instead of
+// flashing Ready while stale pods still run. Zero desired replicas is treated
+// as not-Ready rather than vacuously Ready, so a freshly created StatefulSet
+// (status still all zeros) never reads as Ready on its first reconcile.
+func computeReadyCondition(generation int64, desiredReplicas int32, state rolloutState) metav1.Condition {
+	cond := metav1.Condition{
+		Type:               conditionTypeReady,
+		ObservedGeneration: generation,
+	}
+
+	rolledOut := state.updatedReplicas == desiredReplicas && state.currentRevision == state.updateRevision
+
 	switch {
 	case desiredReplicas == 0:
-		return metav1.Condition{
-			Type:               conditionTypeReady,
-			Status:             metav1.ConditionFalse,
-			ObservedGeneration: generation,
-			Reason:             reasonNoReplicas,
-			Message:            "BookKeeper has zero desired replicas",
-		}
-	case readyReplicas == desiredReplicas:
-		return metav1.Condition{
-			Type:               conditionTypeReady,
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: generation,
-			Reason:             reasonAllReady,
-			Message:            fmt.Sprintf("%d/%d bookie replicas ready", readyReplicas, desiredReplicas),
-		}
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = reasonNoReplicas
+		cond.Message = "BookKeeper has zero desired replicas"
+	case state.readyReplicas == desiredReplicas && rolledOut:
+		cond.Status = metav1.ConditionTrue
+		cond.Reason = reasonAllReady
+		cond.Message = fmt.Sprintf("%d/%d bookie replicas ready on revision %q", state.readyReplicas, desiredReplicas, state.updateRevision)
 	default:
-		return metav1.Condition{
-			Type:               conditionTypeReady,
-			Status:             metav1.ConditionFalse,
-			ObservedGeneration: generation,
-			Reason:             reasonProgressing,
-			Message:            fmt.Sprintf("%d/%d bookie replicas ready", readyReplicas, desiredReplicas),
-		}
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = reasonProgressing
+		cond.Message = fmt.Sprintf("rollout in progress: %d/%d ready, %d/%d updated to revision %q",
+			state.readyReplicas, desiredReplicas, state.updatedReplicas, desiredReplicas, state.updateRevision)
 	}
+
+	return cond
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -17,6 +17,7 @@ limitations under the License.
 package cluster
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -29,45 +30,91 @@ import (
 	"github.com/andrew01234567890/pulsar-operator/internal/builder"
 )
 
-const testCustomJournalDir = "/custom/journal"
+const (
+	keyMetadataServiceURI = "metadataServiceUri"
+
+	testNamespaceDefault = "default"
+	testStorageClass     = "fast-ssd"
+	testRevision1        = "rev-1"
+	testRevision2        = "rev-2"
+	testBookieName       = "test-bk"
+)
 
 func int32Ptr(v int32) *int32 { return &v }
 
 func TestMergeConfig_OperatorDefaults(t *testing.T) {
 	merged, rendered := mergeConfig(clusterv1alpha1.BookKeeperSpec{})
 
-	for _, key := range []string{keyJournalDirectories, keyLedgerDirectories, keyIndexDirectories, "bookiePort", "httpServerEnabled", "httpServerPort"} {
+	for _, key := range []string{keyJournalDirectories, keyLedgerDirectories, keyIndexDirectories, keyBookiePort, keyHTTPServerEnabled, keyHTTPServerPort} {
 		if _, ok := merged[key]; !ok {
 			t.Errorf("mergeConfig() defaults missing key %q, got %v", key, merged)
 		}
 	}
 
-	if _, ok := merged["metadataServiceUri"]; ok {
-		t.Errorf("mergeConfig() must not hardcode metadataServiceUri, got %q", merged["metadataServiceUri"])
+	if _, ok := merged[keyMetadataServiceURI]; ok {
+		t.Errorf("mergeConfig() must not hardcode metadataServiceUri, got %q", merged[keyMetadataServiceURI])
 	}
-	if strings.Contains(rendered, "metadataServiceUri") {
+	if strings.Contains(rendered, keyMetadataServiceURI) {
 		t.Errorf("rendered config must not mention metadataServiceUri unless the user set it, got %q", rendered)
 	}
 }
 
-func TestMergeConfig_UserOverridesWin(t *testing.T) {
+func TestMergeConfig_UserOverridesWinForNonManagedKeys(t *testing.T) {
 	spec := clusterv1alpha1.BookKeeperSpec{
 		Config: map[string]string{
-			"metadataServiceUri":  "metadata-store:oxia://my-oxia:6648/bookkeeper",
-			keyJournalDirectories: testCustomJournalDir,
+			keyMetadataServiceURI: "metadata-store:oxia://my-oxia:6648/bookkeeper",
+			"journalMaxBackups":   "5",
 		},
 	}
 
 	merged, rendered := mergeConfig(spec)
 
-	if got := merged["metadataServiceUri"]; got != "metadata-store:oxia://my-oxia:6648/bookkeeper" {
+	if got := merged[keyMetadataServiceURI]; got != "metadata-store:oxia://my-oxia:6648/bookkeeper" {
 		t.Errorf("merged[metadataServiceUri] = %q, want user override", got)
 	}
-	if got := merged[keyJournalDirectories]; got != testCustomJournalDir {
-		t.Errorf("merged[%s] = %q, want user override to win over operator default", keyJournalDirectories, got)
+	if got := merged["journalMaxBackups"]; got != "5" {
+		t.Errorf("merged[journalMaxBackups] = %q, want user override to be applied", got)
 	}
-	if !strings.Contains(rendered, "journalDirectories="+testCustomJournalDir) {
-		t.Errorf("rendered config does not reflect overridden journalDirectories: %q", rendered)
+	if !strings.Contains(rendered, "journalMaxBackups=5") {
+		t.Errorf("rendered config does not reflect overridden journalMaxBackups: %q", rendered)
+	}
+}
+
+// TestMergeConfig_OperatorManagedKeysAreNotUserOverridable proves the root fix:
+// a user override of any structural/wiring key is discarded in favor of the
+// operator's value, so the rendered config can never desync from the generated
+// Service/probes/mounts. Non-managed keys still pass through.
+func TestMergeConfig_OperatorManagedKeysAreNotUserOverridable(t *testing.T) {
+	spec := clusterv1alpha1.BookKeeperSpec{
+		Config: map[string]string{
+			keyBookiePort:         "9999",
+			keyHTTPServerPort:     "1234",
+			keyHTTPServerEnabled:  "false",
+			keyJournalDirectories: "/tmp/a,/tmp/b",
+			keyLedgerDirectories:  "",
+			keyIndexDirectories:   "/somewhere/else",
+			"customKey":           "userValue",
+		},
+	}
+
+	merged, _ := mergeConfig(spec)
+
+	managed := map[string]string{
+		keyBookiePort:         "3181",
+		keyHTTPServerPort:     "8000",
+		keyHTTPServerEnabled:  "true",
+		keyJournalDirectories: journalMountPath,
+		keyLedgerDirectories:  ledgerMountPath,
+		keyIndexDirectories:   indexMountPath,
+	}
+	for key, want := range managed {
+		if got := merged[key]; got != want {
+			t.Errorf("merged[%s] = %q, want operator-managed value %q (user override must be discarded)", key, got, want)
+		}
+	}
+
+	if got := merged["customKey"]; got != "userValue" {
+		t.Errorf("merged[customKey] = %q, want non-managed user value to pass through", got)
 	}
 }
 
@@ -144,6 +191,33 @@ func TestResolvePodManagementPolicy(t *testing.T) {
 	}
 }
 
+func TestResolveWriteQuorum(t *testing.T) {
+	tests := []struct {
+		name string
+		spec clusterv1alpha1.BookKeeperSpec
+		want int32
+	}{
+		{name: "unset ensemble falls back to default", spec: clusterv1alpha1.BookKeeperSpec{}, want: defaultWriteQuorum},
+		{
+			name: "explicit writeQuorum wins",
+			spec: clusterv1alpha1.BookKeeperSpec{Ensemble: &clusterv1alpha1.BookKeeperEnsembleSpec{WriteQuorum: int32Ptr(3)}},
+			want: 3,
+		},
+		{
+			name: "ensemble present but writeQuorum nil falls back to default",
+			spec: clusterv1alpha1.BookKeeperSpec{Ensemble: &clusterv1alpha1.BookKeeperEnsembleSpec{EnsembleSize: int32Ptr(4)}},
+			want: defaultWriteQuorum,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveWriteQuorum(tt.spec); got != tt.want {
+				t.Errorf("resolveWriteQuorum(%+v) = %d, want %d", tt.spec, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolvePDBMaxUnavailable(t *testing.T) {
 	tests := []struct {
 		name               string
@@ -163,6 +237,24 @@ func TestResolvePDBMaxUnavailable(t *testing.T) {
 				t.Errorf("resolvePDBMaxUnavailable(%d, %d) = %v, want %v", tt.replicas, tt.writeQuorum, got, want)
 			}
 		})
+	}
+}
+
+// TestDesiredPDB_MaxUnavailable pins the quorum-derived maxUnavailable for the
+// default (unset) spec: 4 default replicas minus the default write quorum of 2
+// leaves a bookie loss budget of 2.
+func TestDesiredPDB_MaxUnavailable(t *testing.T) {
+	bk := &clusterv1alpha1.BookKeeper{
+		ObjectMeta: metav1.ObjectMeta{Name: testBookieName, Namespace: testNamespaceDefault},
+	}
+
+	pdb := desiredPDB(bk)
+
+	if pdb.Spec.MaxUnavailable == nil {
+		t.Fatalf("desiredPDB().Spec.MaxUnavailable = nil, want set")
+	}
+	if got := *pdb.Spec.MaxUnavailable; got != intstr.FromInt32(2) {
+		t.Errorf("desiredPDB() maxUnavailable = %v, want 2 (defaultReplicas 4 - defaultWriteQuorum 2)", got)
 	}
 }
 
@@ -196,7 +288,7 @@ func TestBuildVolumeClaimTemplates(t *testing.T) {
 	})
 
 	t.Run("spec overrides size and storage class per disk role", func(t *testing.T) {
-		sc := "fast-ssd"
+		sc := testStorageClass
 		size := resource.MustParse("200Gi")
 		spec := clusterv1alpha1.BookKeeperSpec{
 			Volumes: &clusterv1alpha1.BookKeeperVolumes{
@@ -226,45 +318,109 @@ func TestBuildVolumeClaimTemplates(t *testing.T) {
 	})
 }
 
-func TestBuildBookieContainer_VolumeMountsMatchRenderedDirectories(t *testing.T) {
-	spec := clusterv1alpha1.BookKeeperSpec{
-		Config: map[string]string{keyJournalDirectories: testCustomJournalDir},
-	}
-	merged, _ := mergeConfig(spec)
-
-	container := buildBookieContainer(defaultBookieImage, merged)
+func TestBuildBookieContainer_VolumeMountsUseOperatorMountPaths(t *testing.T) {
+	container := buildBookieContainer(defaultBookieImage)
 
 	mounts := map[string]string{}
 	for _, m := range container.VolumeMounts {
 		mounts[m.Name] = m.MountPath
 	}
 
-	if mounts[volumeNameJournal] != testCustomJournalDir {
-		t.Errorf("journal volumeMount path = %q, want %q (must track the rendered journalDirectories value)", mounts[volumeNameJournal], testCustomJournalDir)
+	want := map[string]string{
+		volumeNameJournal: journalMountPath,
+		volumeNameLedgers: ledgerMountPath,
+		volumeNameIndex:   indexMountPath,
 	}
-	if mounts[volumeNameLedgers] != defaultLedgerDir {
-		t.Errorf("ledgers volumeMount path = %q, want %q", mounts[volumeNameLedgers], defaultLedgerDir)
+	for name, wantPath := range want {
+		if mounts[name] != wantPath {
+			t.Errorf("%s volumeMount path = %q, want operator mount path %q", name, mounts[name], wantPath)
+		}
 	}
-	if mounts[volumeNameIndex] != defaultIndexDir {
-		t.Errorf("index volumeMount path = %q, want %q", mounts[volumeNameIndex], defaultIndexDir)
+}
+
+// TestOperatorManagedKeysKeepServiceProbesMountsInSync is the wiring-desync
+// regression: even when the user tries to override bookiePort/httpServerPort/
+// ledgerDirectories in spec.config, the generated headless Service ports,
+// container probes, and volume mounts follow the operator-managed values that
+// the rendered bookkeeper.conf also carries — the two can never disagree.
+func TestOperatorManagedKeysKeepServiceProbesMountsInSync(t *testing.T) {
+	spec := clusterv1alpha1.BookKeeperSpec{
+		Config: map[string]string{
+			keyBookiePort:        "9999",
+			keyHTTPServerPort:    "1234",
+			keyLedgerDirectories: "/tmp/x,/tmp/y",
+		},
 	}
+	bk := &clusterv1alpha1.BookKeeper{
+		ObjectMeta: metav1.ObjectMeta{Name: testBookieName, Namespace: testNamespaceDefault},
+		Spec:       spec,
+	}
+	merged, _ := mergeConfig(spec)
+
+	wantBookiePort := merged[keyBookiePort]
+	wantHTTPPort := merged[keyHTTPServerPort]
+	wantLedgerDir := merged[keyLedgerDirectories]
+
+	svc := desiredHeadlessService(bk)
+	svcPorts := map[string]corev1.ServicePort{}
+	for _, p := range svc.Spec.Ports {
+		svcPorts[p.Name] = p
+	}
+	if got := strconv.Itoa(int(svcPorts[bookieContainerName].Port)); got != wantBookiePort {
+		t.Errorf("headless Service bookie port = %s, want config value %s", got, wantBookiePort)
+	}
+	if svcPorts[bookieContainerName].TargetPort != intstr.FromInt32(bookiePort) {
+		t.Errorf("headless Service bookie targetPort = %v, want %d", svcPorts[bookieContainerName].TargetPort, bookiePort)
+	}
+	if got := strconv.Itoa(int(svcPorts["http"].Port)); got != wantHTTPPort {
+		t.Errorf("headless Service http port = %s, want config value %s", got, wantHTTPPort)
+	}
+
+	container := buildBookieContainer(defaultBookieImage)
+
+	if got := container.LivenessProbe.TCPSocket.Port; got != intstr.FromInt32(bookiePort) {
+		t.Errorf("liveness TCP probe port = %v, want bookie port %d", got, bookiePort)
+	}
+	if got := strconv.Itoa(container.LivenessProbe.TCPSocket.Port.IntValue()); got != wantBookiePort {
+		t.Errorf("liveness TCP probe port = %s, want config value %s", got, wantBookiePort)
+	}
+	if got := container.ReadinessProbe.HTTPGet.Port; got != intstr.FromInt32(bookieAdminPort) {
+		t.Errorf("readiness HTTP probe port = %v, want admin port %d", got, bookieAdminPort)
+	}
+	if got := strconv.Itoa(container.ReadinessProbe.HTTPGet.Port.IntValue()); got != wantHTTPPort {
+		t.Errorf("readiness HTTP probe port = %s, want config value %s", got, wantHTTPPort)
+	}
+
+	mounts := map[string]string{}
+	for _, m := range container.VolumeMounts {
+		mounts[m.Name] = m.MountPath
+	}
+	if mounts[volumeNameLedgers] != wantLedgerDir {
+		t.Errorf("ledgers volumeMount = %q, want config value %q (mount must not follow the user's multi-dir override)", mounts[volumeNameLedgers], wantLedgerDir)
+	}
+}
+
+// rolledOut is a rolloutState with every pod ready, every pod updated, and no
+// revision split — the only shape that should read as Ready.
+func rolledOut(ready, updated int32) rolloutState {
+	return rolloutState{readyReplicas: ready, updatedReplicas: updated, currentRevision: testRevision1, updateRevision: testRevision1}
 }
 
 func TestComputeReadyCondition(t *testing.T) {
 	tests := []struct {
-		name            string
-		desiredReplicas int32
-		readyReplicas   int32
-		wantStatus      metav1.ConditionStatus
-		wantReason      string
+		name       string
+		desired    int32
+		state      rolloutState
+		wantStatus metav1.ConditionStatus
+		wantReason string
 	}{
-		{name: "all replicas ready", desiredReplicas: 4, readyReplicas: 4, wantStatus: metav1.ConditionTrue, wantReason: reasonAllReady},
-		{name: "partially ready", desiredReplicas: 4, readyReplicas: 2, wantStatus: metav1.ConditionFalse, wantReason: reasonProgressing},
-		{name: "none ready yet", desiredReplicas: 4, readyReplicas: 0, wantStatus: metav1.ConditionFalse, wantReason: reasonProgressing},
+		{name: "all ready and fully rolled out", desired: 4, state: rolledOut(4, 4), wantStatus: metav1.ConditionTrue, wantReason: reasonAllReady},
+		{name: "partially ready", desired: 4, state: rolledOut(2, 4), wantStatus: metav1.ConditionFalse, wantReason: reasonProgressing},
+		{name: "none ready yet", desired: 4, state: rolledOut(0, 0), wantStatus: metav1.ConditionFalse, wantReason: reasonProgressing},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cond := computeReadyCondition(1, tt.desiredReplicas, tt.readyReplicas)
+			cond := computeReadyCondition(1, tt.desired, tt.state)
 			if cond.Status != tt.wantStatus {
 				t.Errorf("computeReadyCondition(...).Status = %v, want %v", cond.Status, tt.wantStatus)
 			}
@@ -278,28 +434,58 @@ func TestComputeReadyCondition(t *testing.T) {
 	}
 }
 
+// TestComputeReadyCondition_RolloutAware asserts that a StatefulSet whose pods
+// are all Ready but not all on the latest revision (mid config-checksum rolling
+// restart) reports NOT Ready, so status can't flash Ready while stale pods run.
+func TestComputeReadyCondition_RolloutAware(t *testing.T) {
+	tests := []struct {
+		name  string
+		state rolloutState
+	}{
+		{
+			name:  "revision split: all ready but current != update revision",
+			state: rolloutState{readyReplicas: 4, updatedReplicas: 4, currentRevision: testRevision1, updateRevision: testRevision2},
+		},
+		{
+			name:  "not all pods updated to the latest revision yet",
+			state: rolloutState{readyReplicas: 4, updatedReplicas: 2, currentRevision: testRevision2, updateRevision: testRevision2},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := computeReadyCondition(1, 4, tt.state)
+			if cond.Status != metav1.ConditionFalse {
+				t.Errorf("computeReadyCondition(...).Status = %v, want False (rollout not complete)", cond.Status)
+			}
+			if cond.Reason != reasonProgressing {
+				t.Errorf("computeReadyCondition(...).Reason = %q, want %q", cond.Reason, reasonProgressing)
+			}
+		})
+	}
+}
+
 // TestComputeReadyCondition_ZeroDesiredIsNotVacuouslyReady guards against a
 // freshly created StatefulSet (whose Status is all zeros before any pod
 // exists) reading as Ready on the very first reconcile just because
 // 0 == 0.
 func TestComputeReadyCondition_ZeroDesiredIsNotVacuouslyReady(t *testing.T) {
-	cond := computeReadyCondition(1, 0, 0)
+	cond := computeReadyCondition(1, 0, rolloutState{})
 	if cond.Status != metav1.ConditionFalse {
-		t.Errorf("computeReadyCondition(1, 0, 0).Status = %v, want %v (zero desired replicas must not read as trivially Ready)", cond.Status, metav1.ConditionFalse)
+		t.Errorf("computeReadyCondition(1, 0, {}).Status = %v, want %v (zero desired replicas must not read as trivially Ready)", cond.Status, metav1.ConditionFalse)
 	}
 	if cond.Reason != reasonNoReplicas {
-		t.Errorf("computeReadyCondition(1, 0, 0).Reason = %q, want %q", cond.Reason, reasonNoReplicas)
+		t.Errorf("computeReadyCondition(1, 0, {}).Reason = %q, want %q", cond.Reason, reasonNoReplicas)
 	}
 }
 
 func TestDesiredStatefulSet_HasThreeVolumeClaimTemplatesAndChecksumAnnotation(t *testing.T) {
 	bk := &clusterv1alpha1.BookKeeper{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-bk", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: testBookieName, Namespace: testNamespaceDefault},
 		Spec:       clusterv1alpha1.BookKeeperSpec{Replicas: int32Ptr(3)},
 	}
-	merged, rendered := mergeConfig(bk.Spec)
+	_, rendered := mergeConfig(bk.Spec)
 
-	sts := desiredStatefulSet(bk, defaultBookieImage, merged, rendered)
+	sts := desiredStatefulSet(bk, defaultBookieImage, rendered)
 
 	if len(sts.Spec.VolumeClaimTemplates) != 3 {
 		t.Fatalf("got %d volumeClaimTemplates, want 3", len(sts.Spec.VolumeClaimTemplates))

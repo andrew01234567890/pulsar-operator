@@ -26,6 +26,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -128,17 +129,20 @@ var _ = Describe("BookKeeper Controller", func() {
 			cm := &corev1.ConfigMap{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, cm)).To(Succeed())
 			Expect(cm.Data[configMapKey]).To(ContainSubstring("metadataServiceUri=metadata-store:oxia://oxia-server:6648/bookkeeper"))
-			Expect(cm.Data[configMapKey]).To(ContainSubstring("journalDirectories=" + defaultJournalDir))
+			Expect(cm.Data[configMapKey]).To(ContainSubstring("journalDirectories=" + journalMountPath))
 			Expect(ownerRefNames(cm.OwnerReferences)).To(ContainElement(owner.Name))
 
-			By("creating a PodDisruptionBudget scoped to the bookie selector")
+			By("creating a PodDisruptionBudget scoped to the bookie selector with quorum-derived maxUnavailable")
 			pdb := &policyv1.PodDisruptionBudget{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, pdb)).To(Succeed())
 			Expect(pdb.Spec.Selector.MatchLabels).To(Equal(builder.SelectorLabels(resourceName, bookkeeperComponent)))
+			Expect(pdb.Spec.MaxUnavailable).NotTo(BeNil())
+			// 3 replicas - default write quorum 2 = 1 tolerable disruption.
+			Expect(*pdb.Spec.MaxUnavailable).To(Equal(intstr.FromInt32(1)))
 			Expect(ownerRefNames(pdb.OwnerReferences)).To(ContainElement(owner.Name))
 		})
 
-		It("should report Ready once the StatefulSet's ready replicas match desired replicas", func() {
+		It("should report Ready only once the StatefulSet is fully ready and rolled out", func() {
 			controllerReconciler := &BookKeeperReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
@@ -154,11 +158,31 @@ var _ = Describe("BookKeeper Controller", func() {
 			Expect(readyCond).NotTo(BeNil())
 			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
 
-			By("simulating the StatefulSet becoming fully ready")
+			By("all pods ready but mid-rollout (revision split) still reporting NOT Ready")
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, sts)).To(Succeed())
 			sts.Status.Replicas = 3
 			sts.Status.ReadyReplicas = 3
+			sts.Status.UpdatedReplicas = 1
+			sts.Status.CurrentRevision = testRevision1
+			sts.Status.UpdateRevision = testRevision2
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, bookkeeper)).To(Succeed())
+			Expect(bookkeeper.Status.ReadyReplicas).To(Equal(int32(3)))
+			readyCond = findCondition(bookkeeper.Status.Conditions, conditionTypeReady)
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal(reasonProgressing))
+
+			By("the rollout completing (all updated, revisions converged) flips it Ready")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, sts)).To(Succeed())
+			sts.Status.UpdatedReplicas = 3
+			sts.Status.CurrentRevision = testRevision2
+			sts.Status.UpdateRevision = testRevision2
 			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
 
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
