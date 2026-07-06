@@ -1,0 +1,25 @@
+apiVersion: metadata.pulsaroperator.io/v1alpha1
+kind: OxiaCluster
+metadata:
+  labels:
+    app.kubernetes.io/name: pulsar-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: oxiacluster-sample
+spec:
+  coordinator:
+    replicas: 2
+  server:
+    replicas: 3
+    storageSize: 8Gi
+    dbCacheSizeMb: 512
+    walSyncData: true
+  namespaces:
+    - name: default
+      initialShardCount: 3
+      replicationFactor: 3
+    - name: broker
+      initialShardCount: 3
+      replicationFactor: 3
+    - name: bookkeeper
+      initialShardCount: 3
+      replicationFactor: 3

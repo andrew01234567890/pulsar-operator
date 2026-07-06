@@ -1,11 +1,134 @@
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  labels:
-    app.kubernetes.io/name: pulsar-operator
-    app.kubernetes.io/managed-by: kustomize
   name: manager-role
 rules:
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list", "watch"]
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - persistentvolumeclaims
+  - serviceaccounts
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cluster.pulsaroperator.io
+  resources:
+  - autorecoveries
+  - bookkeepers
+  - brokers
+  - functionsworkers
+  - proxies
+  - pulsarclusters
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cluster.pulsaroperator.io
+  resources:
+  - autorecoveries/finalizers
+  - bookkeepers/finalizers
+  - brokers/finalizers
+  - functionsworkers/finalizers
+  - proxies/finalizers
+  - pulsarclusters/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - cluster.pulsaroperator.io
+  resources:
+  - autorecoveries/status
+  - bookkeepers/status
+  - brokers/status
+  - functionsworkers/status
+  - proxies/status
+  - pulsarclusters/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - metadata.pulsaroperator.io
+  resources:
+  - oxiaclusters
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - metadata.pulsaroperator.io
+  resources:
+  - oxiaclusters/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - metadata.pulsaroperator.io
+  resources:
+  - oxiaclusters/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - rolebindings
+  - roles
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
