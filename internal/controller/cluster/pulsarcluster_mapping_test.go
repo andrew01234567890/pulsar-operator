@@ -248,11 +248,28 @@ func TestBuildBookKeeperSpec(t *testing.T) {
 				BookKeeper: &clusterv1alpha1.BookKeeperSpec{},
 			},
 		},
+		{
+			// Regression: buildBookKeeperSpec must return nil (not a
+			// zero-value *BookKeeperSpec) when the sub-spec itself is unset,
+			// so reconcileBookKeeper's `cluster.Spec.BookKeeper == nil` check
+			// upstream is what actually decides whether to prune the child,
+			// not an incidentally-empty desired spec.
+			name: "unconfigured BookKeeper sub-spec returns nil",
+			spec: clusterv1alpha1.PulsarClusterSpec{
+				Global: &clusterv1alpha1.GlobalSpec{StorageClassName: &globalSC},
+			},
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := buildBookKeeperSpec(tc.spec)
+			if tc.spec.BookKeeper == nil {
+				if got != nil {
+					t.Fatalf("buildBookKeeperSpec() = %+v, want nil for an unconfigured sub-spec", got)
+				}
+				return
+			}
 			if got.Volumes == nil {
 				if tc.wantJournalSC != nil || tc.wantLedgersSC != nil || tc.wantIndexSC != nil {
 					t.Fatal("Volumes = nil, want configured storage classes")
@@ -502,7 +519,7 @@ func TestAggregateReadyCondition(t *testing.T) {
 			name: "all configured components ready",
 			reports: []componentReport{
 				{name: testComponentBroker, present: true, ready: true},
-				{name: "bookkeeper", present: true, ready: true},
+				{name: bookkeeperComponent, present: true, ready: true},
 				{name: testComponentProxy, present: false},
 			},
 			wantStatus: metav1.ConditionTrue,
@@ -512,11 +529,24 @@ func TestAggregateReadyCondition(t *testing.T) {
 			name: "one configured component not ready blocks readiness",
 			reports: []componentReport{
 				{name: testComponentBroker, present: true, ready: true},
-				{name: "bookkeeper", present: true, ready: false, reason: testReasonRollingOut},
+				{name: bookkeeperComponent, present: true, ready: false, reason: testReasonRollingOut},
 			},
 			wantStatus:  metav1.ConditionFalse,
 			wantReason:  reasonComponentNotReady,
 			wantMessage: "bookkeeper (RollingOut)",
+		},
+		{
+			// Regression: a not-ready component with no reason set (e.g. a
+			// componentReport built by hand rather than via
+			// reportFromConditions) must still render a readable message
+			// instead of "bookkeeper ()".
+			name: "not-ready component with no reason falls back to a generic message",
+			reports: []componentReport{
+				{name: bookkeeperComponent, present: true, ready: false},
+			},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  reasonComponentNotReady,
+			wantMessage: "bookkeeper (not Ready)",
 		},
 		{
 			name: "multiple configured components not ready are all named",
