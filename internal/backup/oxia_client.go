@@ -85,6 +85,15 @@ func (a *syncClientAdapter) Put(ctx context.Context, key string, value []byte) e
 }
 
 func (a *syncClientAdapter) RangeScanAll(ctx context.Context) <-chan ScanResult {
+	// The empty min/max bounds are load-bearing: Oxia's server treats an
+	// empty bound as "unset" (unbounded), not as "keys < empty-string"
+	// (nothing) - kvstore.Pebble.RangeScan only sets the Pebble
+	// LowerBound/UpperBound when the string is non-empty - so this is a
+	// genuine full-keyspace scan that fans out across every shard (no
+	// PartitionKey => clientImpl.RangeScan iterates shardManager.GetAll()).
+	// If that ever changed, every export would silently produce an empty
+	// manifest; TestExportFullScanAgainstRealOxia (build tag `integration`)
+	// guards it against a real Oxia.
 	upstream := a.client.RangeScan(ctx, "", "")
 	out := make(chan ScanResult)
 	go func() {
