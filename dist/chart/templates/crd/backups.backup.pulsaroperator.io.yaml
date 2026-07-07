@@ -1,0 +1,283 @@
+{{- if .Values.crd.enabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    {{- if .Values.crd.keep }}
+    "helm.sh/resource-policy": keep
+    {{- end }}
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: backups.backup.pulsaroperator.io
+spec:
+  group: backup.pulsaroperator.io
+  names:
+    kind: Backup
+    listKind: BackupList
+    plural: backups
+    singular: backup
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.clusterRef.name
+      name: Cluster
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Backup is the Schema for the backups API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of Backup
+            properties:
+              clusterRef:
+                description: clusterRef names the PulsarCluster, in the same namespace,
+                  to back up.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              components:
+                description: components selects which cluster state this Backup captures.
+                properties:
+                  bookkeeperVolumes:
+                    default: false
+                    description: |-
+                      bookkeeperVolumes additionally snapshots BookKeeper's persistent
+                      volumes. Not yet implemented; reserved for a future release.
+                    type: boolean
+                  oxiaMetadata:
+                    default: true
+                    description: oxiaMetadata captures the Oxia metadata store's keyspace.
+                    type: boolean
+                  oxiaVolumes:
+                    default: false
+                    description: |-
+                      oxiaVolumes additionally snapshots Oxia's persistent volumes.
+                      Not yet implemented; reserved for a future release.
+                    type: boolean
+                type: object
+              consistency:
+                default: crash
+                description: |-
+                  consistency selects the point-in-time guarantee for the captured
+                  state. "crash" (default) captures a crash-consistent snapshot with no
+                  coordination with Pulsar components. "application" additionally
+                  quiesces/coordinates with the cluster for an application-consistent
+                  capture.
+                enum:
+                - crash
+                - application
+                type: string
+              destination:
+                description: destination is the object-store target the backup artifact
+                  is written to.
+                properties:
+                  bucket:
+                    description: |-
+                      bucket is the object-storage bucket/container backup artifacts are
+                      written into. Not used for the filesystem driver.
+                    type: string
+                  credentialsSecretRef:
+                    description: |-
+                      credentialsSecretRef references the Secret holding the destination
+                      driver's object-storage credentials.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  driver:
+                    description: driver selects the object-storage backend.
+                    enum:
+                    - aws-s3
+                    - google-cloud-storage
+                    - azureblob
+                    - filesystem
+                    type: string
+                  endpoint:
+                    description: |-
+                      endpoint overrides the object-storage service endpoint, for
+                      S3-compatible stores that aren't AWS.
+                    type: string
+                  prefix:
+                    description: |-
+                      prefix is a key/path prefix under the bucket (or filesystem root) that
+                      namespaces this resource's backup artifacts, so multiple Backup or
+                      BackupSchedule resources can share one bucket without collision.
+                    type: string
+                  region:
+                    description: region is the object-storage region. Not used for
+                      the filesystem driver.
+                    type: string
+                required:
+                - driver
+                type: object
+                x-kubernetes-validations:
+                - message: bucket is required for object-store destination drivers
+                    (aws-s3, google-cloud-storage, azureblob)
+                  rule: self.driver == 'filesystem' || size(self.bucket) > 0
+              includeEphemeral:
+                default: false
+                description: |-
+                  includeEphemeral additionally captures ephemeral/transient state (e.g.
+                  in-flight cursors) that is normally excluded because consumers
+                  reconstruct it after a restore.
+                type: boolean
+            required:
+            - clusterRef
+            - destination
+            type: object
+          status:
+            description: status defines the observed state of Backup
+            properties:
+              artifactURI:
+                description: |-
+                  artifactURI is the fully-qualified location of the written backup
+                  artifact within destination.
+                type: string
+              capturedInstanceId:
+                description: |-
+                  capturedInstanceId is the BookKeeper cluster instanceId observed at
+                  capture time, recorded so a later Restore can verify cookie lineage
+                  against the target cluster before replaying ledger metadata into it.
+                type: string
+              completionTime:
+                description: completionTime is when the backup capture finished, successfully
+                  or not.
+                format: date-time
+                type: string
+              conditions:
+                description: conditions represent the current state of the Backup
+                  resource.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: observedGeneration is the most recent generation observed
+                  by the controller.
+                format: int64
+                type: integer
+              oxiaKeysCaptured:
+                description: oxiaKeysCaptured is the number of Oxia keys captured
+                  in the artifact.
+                format: int64
+                type: integer
+              phase:
+                description: phase is the observed lifecycle phase of the Backup.
+                enum:
+                - Pending
+                - Running
+                - Completed
+                - Failed
+                type: string
+              sizeBytes:
+                description: sizeBytes is the size of the written backup artifact,
+                  in bytes.
+                format: int64
+                type: integer
+              startTime:
+                description: startTime is when the backup capture began.
+                format: date-time
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+{{- end }}

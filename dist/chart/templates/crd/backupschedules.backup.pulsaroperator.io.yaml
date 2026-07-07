@@ -1,0 +1,363 @@
+{{- if .Values.crd.enabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    {{- if .Values.crd.keep }}
+    "helm.sh/resource-policy": keep
+    {{- end }}
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: backupschedules.backup.pulsaroperator.io
+spec:
+  group: backup.pulsaroperator.io
+  names:
+    kind: BackupSchedule
+    listKind: BackupScheduleList
+    plural: backupschedules
+    singular: backupschedule
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.schedule
+      name: Schedule
+      type: string
+    - jsonPath: .spec.suspend
+      name: Suspend
+      type: boolean
+    - jsonPath: .status.lastScheduleTime
+      name: Last Schedule
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: BackupSchedule is the Schema for the backupschedules API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of BackupSchedule
+            properties:
+              backupTemplate:
+                description: |-
+                  backupTemplate is the Backup spec stamped into each Backup this
+                  schedule creates, mirroring CronJob's jobTemplate pattern. clusterRef
+                  is part of the template (as it is part of BackupSpec), so it only
+                  needs to be set once here rather than duplicated at the schedule level.
+                properties:
+                  clusterRef:
+                    description: clusterRef names the PulsarCluster, in the same namespace,
+                      to back up.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  components:
+                    description: components selects which cluster state this Backup
+                      captures.
+                    properties:
+                      bookkeeperVolumes:
+                        default: false
+                        description: |-
+                          bookkeeperVolumes additionally snapshots BookKeeper's persistent
+                          volumes. Not yet implemented; reserved for a future release.
+                        type: boolean
+                      oxiaMetadata:
+                        default: true
+                        description: oxiaMetadata captures the Oxia metadata store's
+                          keyspace.
+                        type: boolean
+                      oxiaVolumes:
+                        default: false
+                        description: |-
+                          oxiaVolumes additionally snapshots Oxia's persistent volumes.
+                          Not yet implemented; reserved for a future release.
+                        type: boolean
+                    type: object
+                  consistency:
+                    default: crash
+                    description: |-
+                      consistency selects the point-in-time guarantee for the captured
+                      state. "crash" (default) captures a crash-consistent snapshot with no
+                      coordination with Pulsar components. "application" additionally
+                      quiesces/coordinates with the cluster for an application-consistent
+                      capture.
+                    enum:
+                    - crash
+                    - application
+                    type: string
+                  destination:
+                    description: destination is the object-store target the backup
+                      artifact is written to.
+                    properties:
+                      bucket:
+                        description: |-
+                          bucket is the object-storage bucket/container backup artifacts are
+                          written into. Not used for the filesystem driver.
+                        type: string
+                      credentialsSecretRef:
+                        description: |-
+                          credentialsSecretRef references the Secret holding the destination
+                          driver's object-storage credentials.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      driver:
+                        description: driver selects the object-storage backend.
+                        enum:
+                        - aws-s3
+                        - google-cloud-storage
+                        - azureblob
+                        - filesystem
+                        type: string
+                      endpoint:
+                        description: |-
+                          endpoint overrides the object-storage service endpoint, for
+                          S3-compatible stores that aren't AWS.
+                        type: string
+                      prefix:
+                        description: |-
+                          prefix is a key/path prefix under the bucket (or filesystem root) that
+                          namespaces this resource's backup artifacts, so multiple Backup or
+                          BackupSchedule resources can share one bucket without collision.
+                        type: string
+                      region:
+                        description: region is the object-storage region. Not used
+                          for the filesystem driver.
+                        type: string
+                    required:
+                    - driver
+                    type: object
+                    x-kubernetes-validations:
+                    - message: bucket is required for object-store destination drivers
+                        (aws-s3, google-cloud-storage, azureblob)
+                      rule: self.driver == 'filesystem' || size(self.bucket) > 0
+                  includeEphemeral:
+                    default: false
+                    description: |-
+                      includeEphemeral additionally captures ephemeral/transient state (e.g.
+                      in-flight cursors) that is normally excluded because consumers
+                      reconstruct it after a restore.
+                    type: boolean
+                required:
+                - clusterRef
+                - destination
+                type: object
+              retention:
+                default: {}
+                description: |-
+                  retention controls how many completed Backups this schedule retains.
+                  The +kubebuilder:default={} on the field itself makes the apiserver
+                  materialize an empty retention object when the submitted bytes omit it
+                  entirely (as a raw `kubectl apply` does), which is what then lets
+                  structural-schema defaulting recurse into the nested
+                  successfulBackupsHistoryLimit default. Without it, an omitted retention
+                  block is stored null and no nested defaults fire.
+                properties:
+                  maxAge:
+                    description: |-
+                      maxAge additionally bounds retention by age: Backups older than
+                      maxAge are eligible for cleanup regardless of
+                      successfulBackupsHistoryLimit.
+                    type: string
+                  successfulBackupsHistoryLimit:
+                    default: 3
+                    description: |-
+                      successfulBackupsHistoryLimit caps the number of completed Backups
+                      retained; older ones beyond the limit are eligible for cleanup.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
+              schedule:
+                description: |-
+                  schedule is the cron expression on which this BackupSchedule stamps
+                  out a new Backup. Full parsing happens in the reconciler; this is
+                  only checked for a non-empty, rough cron-like shape.
+                type: string
+                x-kubernetes-validations:
+                - message: schedule must be a non-empty cron expression (5+ space-separated
+                    fields, or an @-prefixed macro like @daily)
+                  rule: self.size() > 0 && (self.startsWith('@') || self.split(' ').size()
+                    >= 5)
+              suspend:
+                default: false
+                description: suspend pauses stamping out new Backups without affecting
+                  existing ones.
+                type: boolean
+            required:
+            - backupTemplate
+            - schedule
+            type: object
+          status:
+            description: status defines the observed state of BackupSchedule
+            properties:
+              active:
+                description: |-
+                  active references the Backups currently in flight (not yet Completed
+                  or Failed) for this schedule.
+                items:
+                  description: ObjectReference contains enough information to let
+                    you inspect or modify the referred object.
+                  properties:
+                    apiVersion:
+                      description: API version of the referent.
+                      type: string
+                    fieldPath:
+                      description: |-
+                        If referring to a piece of an object instead of an entire object, this string
+                        should contain a valid JSON/Go field access statement, such as desiredState.manifest.containers[2].
+                        For example, if the object reference is to a container within a pod, this would take on a value like:
+                        "spec.containers{name}" (where "name" refers to the name of the container that triggered
+                        the event) or if no container name is specified "spec.containers[2]" (container with
+                        index 2 in this pod). This syntax is chosen only to have some well-defined way of
+                        referencing a part of an object.
+                      type: string
+                    kind:
+                      description: |-
+                        Kind of the referent.
+                        More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+                      type: string
+                    name:
+                      description: |-
+                        Name of the referent.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                    namespace:
+                      description: |-
+                        Namespace of the referent.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
+                      type: string
+                    resourceVersion:
+                      description: |-
+                        Specific resourceVersion to which this reference is made, if any.
+                        More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#concurrency-control-and-consistency
+                      type: string
+                    uid:
+                      description: |-
+                        UID of the referent.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
+              conditions:
+                description: conditions represent the current state of the BackupSchedule
+                  resource.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastScheduleTime:
+                description: lastScheduleTime is the last time a Backup was successfully
+                  stamped out.
+                format: date-time
+                type: string
+              lastSuccessfulTime:
+                description: |-
+                  lastSuccessfulTime is the completion time of the most recent Backup
+                  that reached phase Completed.
+                format: date-time
+                type: string
+              observedGeneration:
+                description: observedGeneration is the most recent generation observed
+                  by the controller.
+                format: int64
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+{{- end }}
