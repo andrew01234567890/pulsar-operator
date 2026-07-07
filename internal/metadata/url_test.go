@@ -33,7 +33,7 @@ func TestMetadataStoreURL(t *testing.T) {
 		{
 			name:          "default namespace",
 			serviceName:   testServiceName,
-			oxiaNamespace: "default",
+			oxiaNamespace: DefaultNamespace,
 			want:          "oxia://myoxia-oxia:6648/default",
 		},
 		{
@@ -45,7 +45,7 @@ func TestMetadataStoreURL(t *testing.T) {
 		{
 			name:          "namespace-qualified service name",
 			serviceName:   "myoxia-oxia.pulsar-ns.svc.cluster.local",
-			oxiaNamespace: "default",
+			oxiaNamespace: DefaultNamespace,
 			want:          "oxia://myoxia-oxia.pulsar-ns.svc.cluster.local:6648/default",
 		},
 	}
@@ -93,7 +93,7 @@ func TestMetadataStoreURLUsesPublicServiceName(t *testing.T) {
 	// broker/bookkeeper wiring at the wrong Service.
 	svc := PublicServiceName("myoxia")
 	want := "oxia://myoxia-oxia:6648/default"
-	if got := MetadataStoreURL(svc, "default"); got != want {
-		t.Errorf("MetadataStoreURL(PublicServiceName(%q), \"default\") = %q, want %q", "myoxia", got, want)
+	if got := MetadataStoreURL(svc, DefaultNamespace); got != want {
+		t.Errorf("MetadataStoreURL(PublicServiceName(%q), %q) = %q, want %q", "myoxia", DefaultNamespace, got, want)
 	}
 }

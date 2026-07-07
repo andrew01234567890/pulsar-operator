@@ -17,6 +17,13 @@ const ServerPort = 6648
 // namespace split Pulsar uses across its own metadata tree.
 const BookkeeperNamespace = "bookkeeper"
 
+// DefaultNamespace is the fixed Oxia namespace Pulsar's own primary cluster
+// metadata (broker/proxy metadataStoreUrl and configurationMetadataStoreUrl,
+// and the FunctionsWorker's configurationMetadataStoreUrl) always addresses -
+// Oxia's own standard "default" namespace, the same one its client libraries
+// default to.
+const DefaultNamespace = "default"
+
 // PublicServiceName returns the name of the Service that fronts the
 // OxiaCluster named oxiaClusterName for client traffic (the Service backed
 // by oxia-server pods, reachable on ServerPort).
