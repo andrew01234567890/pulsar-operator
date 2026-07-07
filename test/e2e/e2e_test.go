@@ -288,6 +288,11 @@ var _ = Describe("Manager", Ordered, func() {
 	// Describe, so it runs after this BeforeAll's controller-manager deploy
 	// and before this AfterAll's undeploy.
 	pulsarClusterReconciliationSpecs()
+
+	// functionsWorkerReconciliationSpecs (test/e2e/pulsarcluster_functionsworker_test.go)
+	// registers a sibling Context covering a colocated FunctionsWorker, for
+	// the same ordering reason as pulsarClusterReconciliationSpecs above.
+	functionsWorkerReconciliationSpecs()
 })
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.
