@@ -230,6 +230,53 @@ var _ = Describe("PulsarCluster autoscaler replica ownership", func() {
 		Expect(cond.Reason).To(Equal(tierBroker.upgradeReason()))
 	})
 
+	It("rolls a genuine pulsarVersion bump through while preserving the autoscaler's current bookie replica count", func() {
+		By("creating a PulsarCluster with the bookie autoscaler enabled")
+		pulsarCluster := &clusterv1alpha1.PulsarCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: namespace.Name},
+			Spec: clusterv1alpha1.PulsarClusterSpec{
+				PulsarVersion: "5.0.0-M1",
+				BookKeeper: &clusterv1alpha1.BookKeeperSpec{
+					Replicas:   ptr(int32(3)),
+					Autoscaler: &clusterv1alpha1.BookKeeperAutoscalerSpec{Enabled: true},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
+
+		By("reconciling once: Oxia (mandatory) and BookKeeper are both created")
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getBookKeeper().Spec.Image).To(Equal("apachepulsar/pulsar:5.0.0-M1"))
+
+		By("settling Oxia so BookKeeper's upstream gate is clear and a genuine roll applies immediately")
+		oxia := getOxia()
+		markReady(oxia, &oxia.Status.Conditions, oxia.Generation)
+
+		By("simulating the bookie autoscaler scaling the child up, out of band")
+		bk := getBookKeeper()
+		bk.Spec.Replicas = ptr(int32(7))
+		Expect(k8sClient.Update(ctx, bk)).To(Succeed())
+
+		By("bumping spec.pulsarVersion on the PulsarCluster - a genuine roll")
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		pulsarCluster.Spec.PulsarVersion = "5.0.1"
+		Expect(k8sClient.Update(ctx, pulsarCluster)).To(Succeed())
+
+		By("reconciling: the image rolls to the new version, but replicas is NOT reset - a mid-upgrade reset would silently decommission live bookies")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		rolled := getBookKeeper()
+		Expect(rolled.Spec.Image).To(Equal("apachepulsar/pulsar:5.0.1"))
+		Expect(rolled.Spec.Replicas).To(HaveValue(Equal(int32(7))),
+			"the roll must preserve the autoscaler's current replica count, not reset it to the PulsarCluster's static value")
+
+		cond := upgrading()
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond.Reason).To(Equal(tierBookKeeper.upgradeReason()))
+	})
+
 	It("still corrects broker and bookie replica drift when their autoscalers are disabled (regression)", func() {
 		By("creating a PulsarCluster with both autoscalers OFF (the default)")
 		pulsarCluster := &clusterv1alpha1.PulsarCluster{
