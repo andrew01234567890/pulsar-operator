@@ -17,6 +17,16 @@ const ServerPort = 6648
 // namespace split Pulsar uses across its own metadata tree.
 const BookkeeperNamespace = "bookkeeper"
 
+// BrokerNamespace is the Oxia namespace provisioned alongside
+// BookkeeperNamespace and DefaultNamespace (see
+// config/samples/metadata_v1alpha1_oxiacluster.yaml) for broker-specific
+// metadata. It is reserved namespace-provisioning surface today; components
+// currently address broker/proxy metadata through DefaultNamespace instead
+// (see withBrokerProxyMetadataDefaults). Listed here so callers that must
+// enumerate every namespace the operator provisions - e.g. internal/backup's
+// full-keyspace export - don't have to hardcode the name separately.
+const BrokerNamespace = "broker"
+
 // DefaultNamespace is the fixed Oxia namespace Pulsar's own primary cluster
 // metadata (broker/proxy metadataStoreUrl and configurationMetadataStoreUrl,
 // and the FunctionsWorker's configurationMetadataStoreUrl) always addresses -
