@@ -58,7 +58,10 @@ type GlobalSpec struct {
 // OffloadSpec configures tiered-storage offload of closed ledgers to object
 // storage. This is cost/retention tiering, not backup: offloaded objects are
 // orphaned if metadata is lost, and are deleted when their topic is deleted.
-// Requires the apachepulsar/pulsar-all image (offloader jars).
+// Requires an offloader-capable image (the offloader jars ship in
+// apachepulsar/pulsar-all, not the slim apachepulsar/pulsar image); see the
+// XValidation rule on PulsarClusterSpec, which requires spec.image or
+// spec.broker.image to be set explicitly whenever offload is enabled.
 // +kubebuilder:validation:XValidation:rule="self.driver == 'filesystem' || size(self.bucket) > 0",message="bucket is required for object-store offload drivers (aws-s3, google-cloud-storage, azureblob)"
 type OffloadSpec struct {
 	// driver selects the tiered-storage backend.
@@ -96,6 +99,8 @@ type OffloadSpec struct {
 // PulsarCluster is the single user-facing umbrella resource; the reconciler
 // decomposes it into per-component child resources (Broker, BookKeeper,
 // Proxy, AutoRecovery, FunctionsWorker, and metadata.OxiaCluster).
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.offload) || size(self.image) > 0 || (has(self.broker) && size(self.broker.image) > 0)",message="offload requires spec.image or spec.broker.image to be set explicitly: the offloader jars ship only in apachepulsar/pulsar-all, and apachepulsar/pulsar-all:<pulsarVersion> is not guaranteed to be published (e.g. milestone releases like 5.0.0-M1), so the operator will not synthesize it automatically - set spec.image or spec.broker.image to an offloader-capable image yourself"
 type PulsarClusterSpec struct {
 	// pulsarVersion pins the exact Pulsar image tag deployed across components.
 	// +optional

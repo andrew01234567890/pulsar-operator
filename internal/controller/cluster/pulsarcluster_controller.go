@@ -454,29 +454,25 @@ func globalStorageClassName(spec clusterv1alpha1.PulsarClusterSpec) *string {
 
 // buildBrokerSpec copies PulsarCluster.spec.broker into the child Broker
 // spec, applying the cluster-wide image default. When spec.offload is set,
-// it also swaps in the apachepulsar/pulsar-all image (which bundles the
-// tiered-storage offloader jars the slim default image lacks) unless the
-// user set an explicit image of their own - either on the Broker sub-spec or
-// cluster-wide - which is left untouched since it may already be pulsar-all
-// or a custom build with offloaders baked in. It also wires
-// spec.offload.credentialsSecretRef into the broker so the offloader driver
-// can authenticate: as env vars for AWS/Azure (read as literal values), or as
-// a mounted key file for GCS (whose credential is a path to a JSON key file).
+// the PulsarClusterSpec XValidation rule has already required an explicit
+// spec.image or spec.broker.image, so this function never fabricates an
+// image of its own for offload - it never synthesized apachepulsar/pulsar-all
+// tags (unlike the operator's earlier behavior) since apachepulsar/
+// pulsar-all:<pulsarVersion> is not guaranteed to be published (e.g.
+// milestone releases like 5.0.0-M1), which silently produced a broker image
+// that doesn't exist. It also wires spec.offload.credentialsSecretRef into
+// the broker so the offloader driver can authenticate: as env vars for
+// AWS/Azure (read as literal values), or as a mounted key file for GCS (whose
+// credential is a path to a JSON key file).
 func buildBrokerSpec(spec clusterv1alpha1.PulsarClusterSpec) *clusterv1alpha1.BrokerSpec {
 	out := spec.Broker.DeepCopy()
 	if out == nil {
 		return out
 	}
 
-	explicitImage := out.Image != "" || spec.Image != ""
 	out.Image = effectiveImage(out.Image, clusterDefaultImage(spec))
 
 	if spec.Offload != nil {
-		if !explicitImage {
-			if img := pulsarAllImage(spec.PulsarVersion); img != "" {
-				out.Image = img
-			}
-		}
 		out.Env = append(out.Env, offloadCredentialEnv(spec.Offload)...)
 		out.Volumes = append(out.Volumes, offloadCredentialVolumes(spec.Offload)...)
 		out.VolumeMounts = append(out.VolumeMounts, offloadCredentialVolumeMounts(spec.Offload)...)
