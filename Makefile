@@ -138,6 +138,10 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	"$(GOLANGCI_LINT)" config verify
 
+.PHONY: verify-image-refs
+verify-image-refs: ## Verify every sample/e2e/chainsaw/operator-default image tag resolves on its registry. Needs network access; not part of `make test`.
+	./hack/verify-image-refs.sh
+
 ##@ Build
 
 .PHONY: build

@@ -1,0 +1,29 @@
+name: Verify Image References
+
+# Independent of the required "test" and "test-e2e" checks: this job hits
+# real container registries (docker buildx imagetools inspect), which is not
+# hermetic, so a registry hiccup must never flake the core unit suite or
+# block a merge on its own transient failure - see hack/verify-image-refs.sh's
+# header comment for what this actually checks.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions: {}
+
+jobs:
+  verify-image-refs:
+    permissions:
+      contents: read
+    name: verify-image-refs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Verify every referenced image tag resolves on its registry
+        run: make verify-image-refs
