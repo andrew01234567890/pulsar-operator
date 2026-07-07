@@ -5,12 +5,13 @@ sidebar_position: 3
 # Autoscaling model
 
 :::caution WIP
-Bookie autoscaling is designed but not yet implemented (see
-[phase 4](./intro.md) of the project plan) - the bookie section below
-documents the target algorithm so operators know what to expect and can
-review the design before it ships. **Broker autoscaling is implemented**
-(`BrokerAutoscalerReconciler`); its section below describes shipped
-behavior, not a design target.
+**Broker autoscaling is implemented** (`BrokerAutoscalerReconciler`) and
+**bookie scale-up is implemented** (`BookKeeperAutoscalerReconciler`); those
+sections below describe shipped behavior, not a design target. Bookie
+**scale-down**/decommission is still designed but not yet implemented (see
+[phase 4](./intro.md) of the project plan); its section documents the target
+algorithm so operators know what to expect and can review the design before
+it ships.
 :::
 
 Unlike a generic HPA/KEDA setup, broker and bookie autoscaling are handled by
@@ -66,22 +67,32 @@ be affected. Don't oversell this as zero-downtime; it's "graceful," not
 
 ## Bookie autoscaling
 
-Bookies are polled per-tick via their admin REST API
-(`/api/v1/bookie/state`, `/bookie/info`,
-`/autorecovery/list_under_replicated_ledger`), and the decision is made with
-strict priority, checked in order:
+**Scale-up ships today**, in a dedicated `BookKeeperAutoscalerReconciler`
+(`internal/controller/cluster/bookkeeper_autoscaler_controller.go`) that
+watches `BookKeeper` alongside — but separately from — the reconciler that
+owns its StatefulSet. It is gated on `spec.autoscaler.enabled`, re-evaluates
+every `periodSeconds` (default 10s), and is skipped entirely until every
+bookie pod is `Ready` and `stabilizationWindowSeconds` has elapsed since the
+last scale.
+
+Bookies are polled per-tick via an injectable admin-REST client
+(`/api/v1/bookie/state`, `/bookie/info`; the default implementation hits the
+live bookie admin port, and tests inject a mock), and the decision is made
+with strict priority, checked in order:
 
 1. **Deficit scale-up:** if `writableBookies < minWritableBookies`
-   (computed from the largest configured ensemble size across namespaces,
-   not a hardcoded constant), scale up by the deficit immediately.
-2. **Watermark scale-up:** else, if any writable bookie's ledger-disk usage
-   is at or above the high watermark (**HWM = 0.92**), scale up pre-emptively
-   — before the cluster is forced into scenario 1.
-3. **Guarded scale-down:** only if **every** writable bookie's disk usage is
-   below the low watermark (**LWM = 0.75**) **and** there are zero
-   under-replicated ledgers cluster-wide.
+   (must be configured `>=` the BookKeeper's `ensemble.ensembleSize` — the
+   autoscaler flags the configuration and refuses to act otherwise), scale up
+   by the deficit immediately.
+2. **Watermark scale-up:** else, if any writable bookie's ledger directories
+   are *all* at or above the high watermark (**HWM, default 92%**), scale up
+   by `scaleUpBy` pre-emptively — before the cluster is forced into scenario 1.
+3. **No-op:** otherwise, do nothing.
 
-Scale-up always wins ties with scale-down.
+The target replica count is always clamped to `scaleUpMaxLimit` and never
+drops below the current replica count — this reconciler only ever scales up.
+Guarded **scale-down** (below) is a separate, not-yet-implemented state
+machine tracked by `scaleDownEnabled`, which this reconciler never consults.
 
 ### Safe bookie scale-down (default OFF)
 

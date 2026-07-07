@@ -215,9 +215,17 @@ type BookKeeperStatus struct {
 	// +optional
 	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
 
-	// writableBookies is the observed number of writable (non-read-only) bookies.
+	// writableBookies is the observed number of writable (non-read-only) bookies,
+	// as last polled by the disk-watermark autoscaler.
 	// +optional
 	WritableBookies int32 `json:"writableBookies,omitempty"`
+
+	// lastScaleTime is when the disk-watermark autoscaler last changed
+	// spec.replicas. The autoscaler's stabilization window is measured from
+	// this timestamp, not from pod age, so it gates repeated scaling events
+	// directly rather than as a side effect of pod restarts.
+	// +optional
+	LastScaleTime *metav1.Time `json:"lastScaleTime,omitempty"`
 
 	// observedGeneration is the most recent generation observed by the controller.
 	// +optional
