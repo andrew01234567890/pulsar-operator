@@ -18,6 +18,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -61,6 +62,16 @@ const (
 	// wedged import pod is tolerated before the Restore is failed outright.
 	importStuckGracePeriod = 5 * time.Minute
 )
+
+// errManifestUndecodable marks a manifest whose object was fetched
+// successfully but whose header bytes are not a decodable manifest header (a
+// genuine corruption/truncation). It is deliberately distinguished from a
+// transport/credential failure fetching the object at all: only a real
+// decode failure is a *terminal* Unknown lineage halt, whereas a transient
+// download/secret error must requeue with backoff (mirroring the
+// ReadTargetInstanceID sibling path) rather than permanently Fail an
+// otherwise-valid Restore.
+var errManifestUndecodable = errors.New("manifest header could not be decoded")
 
 // RestoreReconciler reconciles a Restore object: it verifies BookKeeper
 // cookie/instanceId lineage between the backup's manifest and the target
@@ -238,7 +249,10 @@ func (r *RestoreReconciler) checkCookieLineage(ctx context.Context, restore *bac
 
 	header, err := r.readManifestHeader(ctx, restore, srcKey)
 	if err != nil {
-		if objectstore.IsNotExist(err) {
+		switch {
+		case objectstore.IsNotExist(err):
+			// The manifest object genuinely does not exist at the resolved
+			// location - a permanent misconfiguration, so halt.
 			return lineageDecision{
 				halt:   true,
 				reason: reasonArtifactNotFound,
@@ -247,15 +261,26 @@ func (r *RestoreReconciler) checkCookieLineage(ctx context.Context, restore *bac
 					Detail: fmt.Sprintf("backup artifact %q was not found", restore.Spec.Source.ArtifactURI),
 				},
 			}, nil
+		case errors.Is(err, errManifestUndecodable):
+			// The object exists but its bytes are not a valid manifest header
+			// (corrupt/truncated). Replaying it would be unsafe and re-reading
+			// it will not fix it, so this is the one terminal Unknown halt.
+			return lineageDecision{
+				halt:   true,
+				reason: reasonManifestUnreadable,
+				check: backupv1alpha1.CookieLineageCheck{
+					Result: backupv1alpha1.CookieLineageCheckResultUnknown,
+					Detail: fmt.Sprintf("backup manifest could not be read: %s", err),
+				},
+			}, nil
+		default:
+			// A transient transport/credential failure (object-store 5xx or
+			// throttle, DNS blip, a momentary credentials-Secret Get error).
+			// Return it as a plain error so advance propagates it and Reconcile
+			// requeues with backoff - never permanently Fail an otherwise-valid
+			// Restore on a blip, matching the ReadTargetInstanceID sibling.
+			return lineageDecision{}, err
 		}
-		return lineageDecision{
-			halt:   true,
-			reason: reasonManifestUnreadable,
-			check: backupv1alpha1.CookieLineageCheck{
-				Result: backupv1alpha1.CookieLineageCheckResultUnknown,
-				Detail: fmt.Sprintf("backup manifest could not be read: %s", err),
-			},
-		}, nil
 	}
 
 	switch header.CapturedInstanceID {
@@ -301,6 +326,12 @@ func (r *RestoreReconciler) gateOnPolicy(restore *backupv1alpha1.Restore, result
 // credential fields (see that type's doc) - additive fields the Job's own
 // path never sets, so this has no effect on the Job's env/volume-based
 // credential wiring.
+//
+// Error contract (the caller relies on it to classify transient vs terminal):
+// a missing object returns an objectstore.IsNotExist error; corrupt bytes
+// return an errManifestUndecodable-wrapped error; every other failure
+// (credentials-Secret Get, store construction, download transport) returns a
+// plain error the caller requeues on.
 func (r *RestoreReconciler) readManifestHeader(ctx context.Context, restore *backupv1alpha1.Restore, key string) (backuptool.ManifestHeader, error) {
 	dest := restore.Spec.Source.Destination
 	cfg := destConfig(dest)
@@ -319,11 +350,21 @@ func (r *RestoreReconciler) readManifestHeader(ctx context.Context, restore *bac
 	}
 	rc, err := store.Download(ctx, key)
 	if err != nil {
+		// Preserve the object-store error verbatim so the caller can branch on
+		// objectstore.IsNotExist (a genuinely-absent artifact) versus any
+		// other download failure (a transient transport error that should
+		// requeue).
 		return backuptool.ManifestHeader{}, err
 	}
 	defer func() { _ = rc.Close() }()
 
-	return backuptool.ReadManifestHeader(rc)
+	header, err := backuptool.ReadManifestHeader(rc)
+	if err != nil {
+		// The bytes were fetched but don't decode: tag this as terminal so the
+		// caller distinguishes it from the transport errors above.
+		return backuptool.ManifestHeader{}, fmt.Errorf("%w: %v", errManifestUndecodable, err)
+	}
+	return header, nil
 }
 
 // applySourceCredentials resolves a destination Secret's data onto cfg's

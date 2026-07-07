@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -85,6 +86,19 @@ func fakeTargetOxiaFactory(instanceID string, found bool) func(string) backuptoo
 	}
 }
 
+// fakeTargetOxiaErrorFactory builds a factory whose target client fails its
+// RangeScanAll with scanErr, so ReadTargetInstanceID surfaces an error -
+// standing in for a target Oxia whose existing lineage cannot be read (an
+// unreachable/erroring metadata store), which must NOT be mistaken for a
+// fresh target.
+func fakeTargetOxiaErrorFactory(scanErr error) func(string) backuptool.ClientFactory {
+	return func(_ string) backuptool.ClientFactory {
+		return func(_ string) (backuptool.OxiaClient, error) {
+			return &fakeTargetOxiaClient{scanErr: scanErr}, nil
+		}
+	}
+}
+
 var _ = Describe("Restore Controller", func() {
 	const resourceNamespace = "default"
 	const restoreTargetCluster = "restore-target-1"
@@ -125,6 +139,16 @@ var _ = Describe("Restore Controller", func() {
 		return res
 	}
 
+	// reconcileExpectError drives one reconcile and returns its error, for the
+	// transient-failure paths that must requeue (a non-nil error) rather than
+	// terminally Fail.
+	reconcileExpectError := func(r *RestoreReconciler, name string) error {
+		_, err := r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: resourceNamespace},
+		})
+		return err
+	}
+
 	getRestore := func(name string) *backupv1alpha1.Restore {
 		rst := &backupv1alpha1.Restore{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: resourceNamespace}, rst)).To(Succeed())
@@ -152,6 +176,17 @@ var _ = Describe("Restore Controller", func() {
 		Expect(err).NotTo(HaveOccurred())
 		header := backuptool.ManifestHeader{SchemaVersion: backuptool.SchemaVersion, CapturedInstanceID: capturedInstanceID}
 		data, err := json.Marshal(header)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(store.Upload(ctx, key, bytes.NewReader(data))).To(Succeed())
+		return store.URI(key)
+	}
+
+	// seedRawManifest uploads arbitrary raw bytes to dest under key (bypassing
+	// the manifest encoder), returning the artifactURI - used to plant a
+	// present-but-undecodable manifest object.
+	seedRawManifest := func(dest backupv1alpha1.BackupDestination, key string, data []byte) string {
+		cfg := destConfig(dest)
+		store, err := objectstore.New(ctx, cfg)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(store.Upload(ctx, key, bytes.NewReader(data))).To(Succeed())
 		return store.URI(key)
@@ -300,6 +335,73 @@ var _ = Describe("Restore Controller", func() {
 			restore := getRestore(name)
 			Expect(restore.Status.Phase).To(Equal(backupv1alpha1.RestorePhaseFailed))
 			Expect(findRestoreCondition(restore).Reason).To(Equal(reasonArtifactNotFound))
+			Expect(importJobExists(name)).To(BeFalse())
+		})
+
+		It("requeues (never treats as fresh/passing) when the target Oxia's existing lineage cannot be read", func() {
+			// Safety property: a target whose existing instanceId can't be read
+			// must NOT be mistaken for a fresh target and Passed - the read
+			// failure must requeue, leaving no lineage verdict and no import Job.
+			const name = "restore-target-unreadable"
+			dest := filesystemDest()
+			uri := seedManifest(dest, "backup.manifest", "instance-abc-123")
+			createRestore(name, dest, uri, "")
+
+			r := newReconciler(nil, "", false)
+			r.NewOxiaClientFactory = fakeTargetOxiaErrorFactory(errors.New("target oxia unreachable"))
+
+			err := reconcileExpectError(r, name)
+			Expect(err).To(HaveOccurred())
+
+			restore := getRestore(name)
+			Expect(restore.Status.CookieLineageCheck.Result).To(BeEmpty())
+			Expect(restore.Status.Phase).NotTo(Equal(backupv1alpha1.RestorePhaseFailed))
+			Expect(restore.Status.Phase).NotTo(Equal(backupv1alpha1.RestorePhaseCompleted))
+			Expect(importJobExists(name)).To(BeFalse())
+		})
+
+		It("halts with a terminal ManifestUnreadable when the manifest object is present but its bytes cannot be decoded", func() {
+			// After the transient-vs-terminal split, an object that EXISTS but
+			// whose bytes are not a decodable manifest header is the only
+			// terminal manifest failure: re-reading it will never help, so it
+			// is a Failed/Unknown halt with no import Job.
+			const name = "restore-garbage-manifest"
+			dest := filesystemDest()
+			uri := seedRawManifest(dest, "backup.manifest", []byte("this is not a valid manifest header at all"))
+			createRestore(name, dest, uri, "")
+
+			r := newReconciler(nil, "target-instance-abc", true)
+			reconcileOnce(r, name)
+
+			restore := getRestore(name)
+			Expect(restore.Status.Phase).To(Equal(backupv1alpha1.RestorePhaseFailed))
+			Expect(restore.Status.CookieLineageCheck.Result).To(Equal(backupv1alpha1.CookieLineageCheckResultUnknown))
+			Expect(findRestoreCondition(restore).Reason).To(Equal(reasonManifestUnreadable))
+			Expect(importJobExists(name)).To(BeFalse())
+		})
+
+		It("requeues (never Fails) when the source credentials Secret is momentarily unreadable", func() {
+			// A transient credentials-Secret Get failure while peeking the
+			// manifest header must requeue, not terminally Fail an otherwise
+			// valid Restore. An aws-s3 destination forces the header read to
+			// resolve a credentials Secret first; a missing one here stands in
+			// for that transient Get failure (and never reaches a real S3 call).
+			const name = "restore-transient-secret"
+			dest := backupv1alpha1.BackupDestination{
+				Driver:               testDriverAWSS3,
+				Bucket:               testBucket,
+				CredentialsSecretRef: &corev1.LocalObjectReference{Name: "missing-restore-secret"},
+			}
+			artifactURI := objectstore.URI(destConfig(dest), "backup.manifest")
+			createRestore(name, dest, artifactURI, "")
+
+			r := newReconciler(nil, "target-instance-abc", true)
+			err := reconcileExpectError(r, name)
+			Expect(err).To(HaveOccurred())
+
+			restore := getRestore(name)
+			Expect(restore.Status.CookieLineageCheck.Result).To(BeEmpty())
+			Expect(restore.Status.Phase).NotTo(Equal(backupv1alpha1.RestorePhaseFailed))
 			Expect(importJobExists(name)).To(BeFalse())
 		})
 
