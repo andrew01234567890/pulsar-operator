@@ -546,6 +546,12 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(broker.Spec.Volumes).To(BeEmpty())
 		Expect(broker.Spec.VolumeMounts).To(BeEmpty())
 
+		By("marking Oxia Ready so the ordered-rollout gate lets the broker's update through")
+		oxia := &metadatav1alpha1.OxiaCluster{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-oxia", Namespace: namespace.Name}, oxia)).To(Succeed())
+		oxia.Status.Conditions = []metav1.Condition{readyConditionForGeneration(oxia.Generation, "all oxia pods ready")}
+		Expect(k8sClient.Status().Update(ctx, oxia)).To(Succeed())
+
 		By("removing offload leaves the broker on the base image with no offload keys")
 		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
 		pulsarCluster.Spec.Offload = nil
@@ -631,6 +637,12 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-proxy", Namespace: namespace.Name}, proxy)).To(Succeed())
 		Expect(proxy.Spec.Config).To(HaveKeyWithValue("clusterName", clusterName))
 
+		By("marking Oxia Ready so the ordered-rollout gate lets the Broker/Proxy config change through")
+		oxia := &metadatav1alpha1.OxiaCluster{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-oxia", Namespace: namespace.Name}, oxia)).To(Succeed())
+		oxia.Status.Conditions = []metav1.Condition{readyConditionForGeneration(oxia.Generation, "all oxia pods ready")}
+		Expect(k8sClient.Status().Update(ctx, oxia)).To(Succeed())
+
 		By("not overwriting a user-set clusterName on either child")
 		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
 		pulsarCluster.Spec.Broker.Config = map[string]string{"clusterName": "user-broker-cluster"}
@@ -640,8 +652,16 @@ var _ = Describe("PulsarCluster Controller", func() {
 		_, err = reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 
+		By("applying the change to the Broker first (its upstream tiers have settled)")
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
 		Expect(broker.Spec.Config).To(HaveKeyWithValue("clusterName", "user-broker-cluster"))
+
+		By("settling the Broker so the ordered gate lets the downstream Proxy change through too")
+		broker.Status.Conditions = []metav1.Condition{readyConditionForGeneration(broker.Generation, "all broker pods ready")}
+		Expect(k8sClient.Status().Update(ctx, broker)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-proxy", Namespace: namespace.Name}, proxy)).To(Succeed())
 		Expect(proxy.Spec.Config).To(HaveKeyWithValue("clusterName", "user-proxy-cluster"))

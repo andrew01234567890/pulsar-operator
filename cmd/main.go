@@ -185,8 +185,9 @@ func main() {
 	}
 
 	if err := (&clustercontroller.PulsarClusterReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("cluster-pulsarcluster"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "cluster-pulsarcluster")
 		os.Exit(1)
