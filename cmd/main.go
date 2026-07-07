@@ -27,6 +27,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -157,7 +158,9 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restConfig := ctrl.GetConfigOrDie()
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -215,6 +218,21 @@ func main() {
 		Recorder: mgr.GetEventRecorder("cluster-bookkeeper-autoscaler"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "cluster-bookkeeper-autoscaler")
+		os.Exit(1)
+	}
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		setupLog.Error(err, "Failed to create Kubernetes clientset")
+		os.Exit(1)
+	}
+	if err := (&clustercontroller.BookKeeperDecommissionReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		Recorder:   mgr.GetEventRecorder("bookkeeper-decommission-controller"),
+		RESTConfig: restConfig,
+		Clientset:  clientset,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "cluster-bookkeeper-decommission")
 		os.Exit(1)
 	}
 	if err := (&clustercontroller.ProxyReconciler{

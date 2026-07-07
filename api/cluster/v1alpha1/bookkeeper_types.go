@@ -140,6 +140,16 @@ type BookKeeperAutoscalerSpec struct {
 	// +kubebuilder:default=10
 	// +kubebuilder:validation:Minimum=1
 	PeriodSeconds *int32 `json:"periodSeconds,omitempty"`
+
+	// decommissionTimeoutSeconds bounds how long the guarded scale-down state
+	// machine waits, once a bookie is marked read-only, for re-replication to
+	// finish (zero ledgers on the target bookie and zero cluster-wide
+	// under-replicated ledgers) before auto-reverting the bookie to writable,
+	// clearing the decommission state, and raising a Warning condition.
+	// +optional
+	// +kubebuilder:default=1800
+	// +kubebuilder:validation:Minimum=60
+	DecommissionTimeoutSeconds *int32 `json:"decommissionTimeoutSeconds,omitempty"`
 }
 
 // BookKeeperAutoRackConfig configures the rack-awareness sync daemon, which
@@ -226,6 +236,15 @@ type BookKeeperStatus struct {
 	// directly rather than as a side effect of pod restarts.
 	// +optional
 	LastScaleTime *metav1.Time `json:"lastScaleTime,omitempty"`
+
+	// decommission tracks the guarded, resumable bookie scale-down state
+	// machine's progress when one is in flight (triggered automatically or via
+	// AnnotationDrainBookieOrdinal). Persisting this on status, rather than
+	// holding it only in memory, is what lets the state machine resume after
+	// an operator restart instead of starting the decommission over. Absent
+	// when no decommission is running.
+	// +optional
+	Decommission *BookKeeperDecommissionStatus `json:"decommission,omitempty"`
 
 	// observedGeneration is the most recent generation observed by the controller.
 	// +optional
