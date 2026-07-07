@@ -134,6 +134,9 @@ func TestMostRecentDueTimeTooManyMissed(t *testing.T) {
 	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	// More than maxMissedSchedules (100) minutes have elapsed.
 	now := base.Add(200 * time.Minute)
+	// The true most-recent tick at or before now - not the 101st tick after
+	// base (the bug), and not any earlier backlog tick.
+	want := base.Add(200 * time.Minute)
 
 	due, ok, tooMany := mostRecentDueTime(sched, base, now)
 	if !ok {
@@ -142,10 +145,44 @@ func TestMostRecentDueTimeTooManyMissed(t *testing.T) {
 	if !tooMany {
 		t.Errorf("expected tooMany=true when more than %d ticks are missed", maxMissedSchedules)
 	}
-	// Only the latest tick within the scanned window is returned - never the
-	// full backlog - and it must never be after now.
-	if due.After(now) {
-		t.Errorf("due %v must not be after now %v", due, now)
+	// Pin the exact tick: it must be the genuine latest (base+200m), so the
+	// caller stamps ONE Backup for it and advances lastScheduleTime past the
+	// whole backlog - no catch-up burst.
+	if !due.Equal(want) {
+		t.Errorf("due = %v, want %v (the genuine most-recent tick, not a stale backlog tick)", due, want)
+	}
+}
+
+func TestMostRecentDueTimeJumpsDirectlyToLatestForHugeBacklog(t *testing.T) {
+	// A year of missed minute-ticks: the arithmetic O(1) jump must still land
+	// exactly on now's tick without walking (or capping partway through) the
+	// ~525,600 missed ticks.
+	sched := mustParseSchedule(t, "* * * * *")
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := base.AddDate(1, 0, 0)
+
+	due, ok, tooMany := mostRecentDueTime(sched, base, now)
+	if !ok || !tooMany {
+		t.Fatalf("expected due and tooMany, got ok=%v tooMany=%v", ok, tooMany)
+	}
+	if !due.Equal(now) {
+		t.Errorf("due = %v, want %v (exact latest tick after a year-long backlog)", due, now)
+	}
+}
+
+func TestScheduleNeverFiresParsesButHasNoNextTime(t *testing.T) {
+	// February 31 never occurs: cron.ParseStandard accepts it (dom 31, month
+	// 2 are individually in range) but Next() finds no matching date within
+	// its search horizon and returns the zero time.
+	sched := mustParseSchedule(t, "0 0 31 2 *")
+	if !scheduleNeverFires(sched, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("expected February 31 schedule to never fire")
+	}
+
+	// A real schedule must NOT be flagged as never-firing.
+	daily := mustParseSchedule(t, "0 0 * * *")
+	if scheduleNeverFires(daily, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("expected daily schedule to fire")
 	}
 }
 

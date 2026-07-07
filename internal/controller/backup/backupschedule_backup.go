@@ -188,3 +188,33 @@ func (r *BackupScheduleReconciler) reconcileRetention(ctx context.Context, sched
 	}
 	return nil
 }
+
+// retentionRequeueAfter returns how long until the soonest terminal child
+// crosses spec.retention.maxAge and becomes eligible for age-based GC, so the
+// reconciler can requeue to prune it on time rather than waiting for the
+// manager's periodic resync or an unrelated child event. It returns 0 (no
+// requeue on this axis) when maxAge is unset or no surviving child has a
+// future expiry - a child already past maxAge was deleted in this same
+// reconcile, so it is never counted here.
+func (r *BackupScheduleReconciler) retentionRequeueAfter(schedule *backupv1alpha1.BackupSchedule, children []backupv1alpha1.Backup) time.Duration {
+	maxAge := schedule.Spec.Retention.MaxAge
+	if maxAge == nil {
+		return 0
+	}
+	now := r.now()
+
+	var soonest time.Duration
+	for i := range children {
+		if !backupTerminal(&children[i]) {
+			continue
+		}
+		untilExpiry := backupCompletionTime(&children[i]).Add(maxAge.Duration).Sub(now)
+		if untilExpiry <= 0 {
+			continue
+		}
+		if soonest == 0 || untilExpiry < soonest {
+			soonest = untilExpiry
+		}
+	}
+	return soonest
+}

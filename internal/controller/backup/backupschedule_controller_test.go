@@ -203,7 +203,7 @@ var _ = Describe("BackupSchedule Controller", func() {
 			Expect(listChildBackups(name)).To(HaveLen(1))
 		})
 
-		It("skips a long backlog and stamps only the most recent missed tick", func() {
+		It("skips a long backlog and stamps only the single most recent missed tick", func() {
 			const name = "sched-backlog"
 			// Every minute, 200 missed ticks - well past maxMissedSchedules.
 			seedSchedule(name, "* * * * *", false, backupv1alpha1.BackupRetentionPolicy{}, baseTime)
@@ -213,9 +213,40 @@ var _ = Describe("BackupSchedule Controller", func() {
 			r := newReconciler(rec, now)
 			reconcileOnce(r, name)
 
-			// Exactly one Backup, not 200.
-			Expect(listChildBackups(name)).To(HaveLen(1))
+			// Exactly one Backup, not 200 - and it must be for the GENUINE
+			// most-recent tick (base+200m), not the 101st tick after base
+			// (the catch-up-burst bug). lastScheduleTime advances past the
+			// whole backlog so a second reconcile stamps nothing more.
+			wantTick := baseTime.Add(200 * time.Minute)
+			children := listChildBackups(name)
+			Expect(children).To(HaveLen(1))
+			Expect(children[0].Name).To(Equal(scheduledBackupName(name, wantTick)))
+			Expect(getSchedule(name).Status.LastScheduleTime.Time).To(BeTemporally("==", wantTick))
 			Expect(rec.Events).To(Receive(ContainSubstring("TooManyMissedSchedules")))
+
+			// A second reconcile at the same instant must not stamp a catch-up
+			// Backup for any earlier backlog tick.
+			reconcileOnce(r, name)
+			Expect(listChildBackups(name)).To(HaveLen(1))
+		})
+
+		It("crash-replays the same due tick without duplicating the child", func() {
+			// Simulates a crash after the child was created but before
+			// status.lastScheduleTime was persisted: the deterministic name
+			// makes the re-create a no-op (AlreadyExists), and status still
+			// advances.
+			const name = "sched-crash-replay"
+			seedSchedule(name, testCronDaily, false, backupv1alpha1.BackupRetentionPolicy{}, baseTime)
+			schedule := getSchedule(name)
+
+			wantTick := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+			createChildBackup(schedule, scheduledBackupName(name, wantTick), backupv1alpha1.BackupPhaseRunning, time.Time{})
+
+			r := newReconciler(nil, baseTime.Add(25*time.Hour))
+			reconcileOnce(r, name)
+
+			Expect(listChildBackups(name)).To(HaveLen(1))
+			Expect(getSchedule(name).Status.LastScheduleTime.Time).To(BeTemporally("==", wantTick))
 		})
 	})
 
@@ -252,6 +283,28 @@ var _ = Describe("BackupSchedule Controller", func() {
 
 			reconcileOnce(r, name)
 			Consistently(rec.Events).ShouldNot(Receive())
+		})
+
+		It("surfaces a never-fires condition for a parseable-but-impossible schedule, stamping nothing", func() {
+			// "0 0 31 2 *" (February 31) passes the CEL shape check and
+			// cron.ParseStandard, but Next() never returns a time. Without the
+			// never-fires guard this would create a bogus year-1 Backup and
+			// loop; it must instead be surfaced as invalid.
+			const name = "sched-never-fires"
+			seedSchedule(name, "0 0 31 2 *", false, backupv1alpha1.BackupRetentionPolicy{}, time.Time{})
+
+			rec := events.NewFakeRecorder(8)
+			r := newReconciler(rec, baseTime)
+			res := reconcileOnce(r, name)
+
+			schedule := getSchedule(name)
+			cond := findCondition(schedule)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(reasonScheduleNeverFires))
+			Expect(rec.Events).To(Receive(ContainSubstring("Warning")))
+			Expect(listChildBackups(name)).To(BeEmpty())
+			Expect(res.RequeueAfter).To(BeZero())
 		})
 	})
 
@@ -320,6 +373,30 @@ var _ = Describe("BackupSchedule Controller", func() {
 			Expect(children).To(HaveLen(1))
 			Expect(children[0].Name).To(Equal(running.Name))
 		})
+
+		It("requeues on the suspended path when maxAge is set so age-based GC runs on a timer", func() {
+			// Suspended schedules have no next cron tick to requeue on, so
+			// without a retention-driven requeue their maxAge GC would only
+			// run on a child event or the manager's slow resync. A not-yet-
+			// expired child must produce a positive RequeueAfter <= its
+			// remaining lifetime.
+			const name = "sched-suspended-maxage-requeue"
+			seedSchedule(name, testCronDaily, true, backupv1alpha1.BackupRetentionPolicy{
+				MaxAge: &metav1.Duration{Duration: 24 * time.Hour},
+			}, baseTime)
+			schedule := getSchedule(name)
+
+			now := baseTime.Add(48 * time.Hour)
+			// Completed 1h ago => 23h of its 24h lifetime remain.
+			createChildBackup(schedule, name+"-fresh", backupv1alpha1.BackupPhaseCompleted, now.Add(-1*time.Hour))
+
+			r := newReconciler(nil, now)
+			res := reconcileOnce(r, name)
+
+			Expect(listChildBackups(name)).To(HaveLen(1)) // not yet expired
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(res.RequeueAfter).To(BeNumerically("<=", 23*time.Hour))
+		})
 	})
 
 	Context("status aggregation", func() {
@@ -340,6 +417,35 @@ var _ = Describe("BackupSchedule Controller", func() {
 			Expect(got.Status.Active[0].Name).To(Equal(name + "-running"))
 			Expect(got.Status.LastSuccessfulTime).NotTo(BeNil())
 			Expect(got.Status.LastSuccessfulTime.Time).To(BeTemporally("==", backupCompletionTime(newest)))
+		})
+
+		It("keeps lastSuccessfulTime even after the backing Completed backup is pruned by retention", func() {
+			// updateChildStatus records lastSuccessfulTime before retention GC
+			// runs, and only ever advances (never clears) it, so the timestamp
+			// survives the deletion of the very Backup that set it - and a
+			// later reconcile with no Completed children does not wipe it.
+			const name = "sched-status-persist"
+			seedSchedule(name, testCronDaily, true, backupv1alpha1.BackupRetentionPolicy{
+				SuccessfulBackupsHistoryLimit: int32Ptr(0),
+			}, baseTime)
+			schedule := getSchedule(name)
+
+			completedAt := baseTime.Add(2 * time.Hour)
+			createChildBackup(schedule, name+"-done", backupv1alpha1.BackupPhaseCompleted, completedAt)
+
+			r := newReconciler(nil, baseTime.Add(3*time.Hour))
+			reconcileOnce(r, name)
+
+			// history limit 0 => the Completed child is GC'd this pass...
+			Expect(listChildBackups(name)).To(BeEmpty())
+			// ...but its completion time is retained in status.
+			got := getSchedule(name)
+			Expect(got.Status.LastSuccessfulTime).NotTo(BeNil())
+			Expect(got.Status.LastSuccessfulTime.Time).To(BeTemporally("==", completedAt))
+
+			// And a subsequent reconcile with zero children must not clear it.
+			reconcileOnce(r, name)
+			Expect(getSchedule(name).Status.LastSuccessfulTime.Time).To(BeTemporally("==", completedAt))
 		})
 	})
 })

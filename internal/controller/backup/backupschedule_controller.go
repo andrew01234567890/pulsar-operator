@@ -30,8 +30,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	backupv1alpha1 "github.com/andrew01234567890/pulsar-operator/api/backup/v1alpha1"
 )
@@ -44,6 +46,7 @@ const (
 
 	reasonValid                  = "Valid"
 	reasonInvalidSchedule        = "InvalidSchedule"
+	reasonScheduleNeverFires     = "ScheduleNeverFires"
 	reasonBackupCreated          = "BackupCreated"
 	reasonTooManyMissedSchedules = "TooManyMissedSchedules"
 )
@@ -119,21 +122,32 @@ func (r *BackupScheduleReconciler) advance(ctx context.Context, schedule *backup
 
 	sched, parseErr := parseSchedule(schedule.Spec.Schedule)
 	if parseErr != nil {
-		r.setInvalidSchedule(schedule, parseErr)
-		return ctrl.Result{}, nil
+		r.setScheduleInvalid(schedule, reasonInvalidSchedule, parseErr.Error())
+		return r.retentionResult(schedule, children), nil
+	}
+	// A schedule can be valid cron syntax yet match no calendar date (e.g.
+	// February 31): robfig parses it but Next() never returns a time. Surface
+	// that as invalid rather than letting mostRecentDueTime chase a year-1
+	// zero tick and stamp a bogus Backup.
+	if scheduleNeverFires(sched, r.now()) {
+		r.setScheduleInvalid(schedule, reasonScheduleNeverFires, fmt.Sprintf(
+			"schedule %q is valid cron syntax but matches no calendar date (e.g. February 31); it will never fire",
+			schedule.Spec.Schedule))
+		return r.retentionResult(schedule, children), nil
 	}
 	r.setValidSchedule(schedule)
 
 	if scheduleSuspended(schedule.Spec) {
-		return ctrl.Result{}, nil
+		return r.retentionResult(schedule, children), nil
 	}
 
-	return r.reconcileDueBackup(ctx, schedule, sched)
+	return r.reconcileDueBackup(ctx, schedule, sched, children)
 }
 
 // reconcileDueBackup stamps out a Backup for the most recent due cron tick
-// (if any) and requeues at the next tick after now.
-func (r *BackupScheduleReconciler) reconcileDueBackup(ctx context.Context, schedule *backupv1alpha1.BackupSchedule, sched cron.Schedule) (ctrl.Result, error) {
+// (if any) and requeues at whichever comes first: the next cron tick or the
+// next retention.maxAge expiry.
+func (r *BackupScheduleReconciler) reconcileDueBackup(ctx context.Context, schedule *backupv1alpha1.BackupSchedule, sched cron.Schedule, children []backupv1alpha1.Backup) (ctrl.Result, error) {
 	now := r.now()
 	earliest := earliestScheduleTime(schedule)
 
@@ -155,7 +169,33 @@ func (r *BackupScheduleReconciler) reconcileDueBackup(ctx context.Context, sched
 	// correct under an injected clock (r.Now): time.Until measures against
 	// the real wall clock, which would desync from "now" in tests (and, more
 	// subtly, from whatever instant r.now() actually returned in production).
-	return ctrl.Result{RequeueAfter: sched.Next(now).Sub(now)}, nil
+	// Requeue at whichever is sooner - the next tick, or the next maxAge
+	// expiry - so time-based retention GC runs promptly.
+	requeue := minRequeueAfter(sched.Next(now).Sub(now), r.retentionRequeueAfter(schedule, children))
+	return ctrl.Result{RequeueAfter: requeue}, nil
+}
+
+// retentionResult is the requeue decision for the paths that do not schedule a
+// Backup (invalid schedule, never-fires, suspended): they have no next-tick to
+// requeue on, so they requeue only when retention.maxAge is set, so age-based
+// GC still runs on a timer rather than waiting for the manager's resync or a
+// child event.
+func (r *BackupScheduleReconciler) retentionResult(schedule *backupv1alpha1.BackupSchedule, children []backupv1alpha1.Backup) ctrl.Result {
+	return ctrl.Result{RequeueAfter: r.retentionRequeueAfter(schedule, children)}
+}
+
+// minRequeueAfter returns the sooner of two RequeueAfter durations, treating a
+// non-positive duration as "no requeue on this axis" (so it never wins over a
+// real positive requeue, and two zeros collapse to zero = no requeue).
+func minRequeueAfter(a, b time.Duration) time.Duration {
+	switch {
+	case a <= 0:
+		return b
+	case b <= 0:
+		return a
+	default:
+		return min(a, b)
+	}
 }
 
 // ensureBackupForTick creates the owned Backup for a due cron tick. It is
@@ -183,22 +223,24 @@ func (r *BackupScheduleReconciler) ensureBackupForTick(ctx context.Context, sche
 	}
 }
 
-// setInvalidSchedule records that spec.schedule does not parse as a cron
-// expression. The Warning event only fires the first reconcile the failure
-// is observed (deduped against the current condition), so a schedule left
-// invalid doesn't re-fire the Warning on every reconcile.
-func (r *BackupScheduleReconciler) setInvalidSchedule(schedule *backupv1alpha1.BackupSchedule, parseErr error) {
+// setScheduleInvalid records that spec.schedule cannot produce fire times -
+// either because it does not parse (reasonInvalidSchedule) or because it
+// parses but matches no calendar date (reasonScheduleNeverFires). The Warning
+// event only fires when the condition actually changes (deduped against the
+// current status+reason), so a schedule left invalid doesn't re-fire the
+// Warning on every reconcile.
+func (r *BackupScheduleReconciler) setScheduleInvalid(schedule *backupv1alpha1.BackupSchedule, reason, message string) {
 	prior := apimeta.FindStatusCondition(schedule.Status.Conditions, conditionTypeScheduleValid)
-	changed := prior == nil || prior.Status != metav1.ConditionFalse
+	changed := prior == nil || prior.Status != metav1.ConditionFalse || prior.Reason != reason
 	apimeta.SetStatusCondition(&schedule.Status.Conditions, metav1.Condition{
 		Type:               conditionTypeScheduleValid,
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: schedule.Generation,
-		Reason:             reasonInvalidSchedule,
-		Message:            parseErr.Error(),
+		Reason:             reason,
+		Message:            message,
 	})
 	if changed {
-		r.recorder().Eventf(schedule, nil, corev1.EventTypeWarning, reasonInvalidSchedule, "BackupSchedule", "%s", parseErr.Error())
+		r.recorder().Eventf(schedule, nil, corev1.EventTypeWarning, reason, "BackupSchedule", "%s", message)
 	}
 }
 
@@ -232,9 +274,18 @@ func (r *BackupScheduleReconciler) recorder() events.EventRecorder {
 // SetupWithManager sets up the controller with the Manager, watching the
 // Backups it owns so a child's phase change (e.g. Running -> Completed)
 // re-triggers reconciliation.
+//
+// The GenerationChangedPredicate on the BackupSchedule's own watch is load-
+// bearing, not an optimization: every reconcile patches status
+// (lastScheduleTime/active/conditions), and without the predicate that
+// status write would re-enqueue the same object immediately, spinning a hot
+// loop that ignores the RequeueAfter timing entirely. Filtering to spec
+// (generation) changes lets time-based requeues drive the cron cadence while
+// status-only writes stay quiet; child-driven reconciles still arrive via the
+// Owns watch, which the predicate does not touch.
 func (r *BackupScheduleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&backupv1alpha1.BackupSchedule{}).
+		For(&backupv1alpha1.BackupSchedule{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&backupv1alpha1.Backup{}).
 		Named("backup-backupschedule").
 		Complete(r)
