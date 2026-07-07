@@ -51,6 +51,7 @@ type OxiaClusterReconciler struct {
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile drives an OxiaCluster towards two owned workloads: an
 // oxia-server StatefulSet (the data plane) and an oxia-coordinator

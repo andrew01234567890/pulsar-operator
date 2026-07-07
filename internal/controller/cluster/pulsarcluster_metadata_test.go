@@ -133,6 +133,19 @@ func TestWithBrokerProxyMetadataDefaults(t *testing.T) {
 	})
 }
 
+func TestWithClusterNameDefault(t *testing.T) {
+	if got := withClusterNameDefault(nil, testMetadataClusterName); got[configKeyClusterName] != testMetadataClusterName {
+		t.Errorf("clusterName = %q, want %q", got[configKeyClusterName], testMetadataClusterName)
+	}
+
+	const userClusterName = "user-set-cluster"
+	cfg := map[string]string{configKeyClusterName: userClusterName}
+	got := withClusterNameDefault(cfg, testMetadataClusterName)
+	if got[configKeyClusterName] != userClusterName {
+		t.Errorf("clusterName = %q, want user value preserved", got[configKeyClusterName])
+	}
+}
+
 func TestWithBookKeeperMetadataDefault(t *testing.T) {
 	const (
 		wantURI = "metadata-store:oxia://test-cluster-oxia-oxia:6648/bookkeeper"

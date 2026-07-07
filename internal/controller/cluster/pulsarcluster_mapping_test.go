@@ -323,11 +323,16 @@ func TestBuildOxiaSpec(t *testing.T) {
 	}
 
 	got := buildOxiaSpec(spec)
-	if got.Coordinator.Image != spec.Image {
-		t.Errorf("Coordinator.Image = %q, want %q", got.Coordinator.Image, spec.Image)
+	// Regression: Oxia ships a wholly different image family (oxia/oxia) from
+	// the cluster-wide Pulsar image (which has no oxia binary at all), so
+	// merely setting a sub-spec (Coordinator/Server non-nil, as above) must
+	// never stamp spec.Image onto an unset Coordinator/Server Image - it must
+	// stay empty so the OxiaCluster reconciler's own default takes over.
+	if got.Coordinator.Image != "" {
+		t.Errorf("Coordinator.Image = %q, want empty (must not inherit the cluster's pulsar image)", got.Coordinator.Image)
 	}
-	if got.Server.Image != spec.Image {
-		t.Errorf("Server.Image = %q, want %q", got.Server.Image, spec.Image)
+	if got.Server.Image != "" {
+		t.Errorf("Server.Image = %q, want empty (must not inherit the cluster's pulsar image)", got.Server.Image)
 	}
 	if got.Server.StorageClassName == nil || *got.Server.StorageClassName != globalSC {
 		t.Errorf("Server.StorageClassName = %v, want %q", got.Server.StorageClassName, globalSC)
@@ -338,6 +343,19 @@ func TestBuildOxiaSpec(t *testing.T) {
 	got = buildOxiaSpec(spec)
 	if *got.Server.StorageClassName != explicitSC {
 		t.Errorf("Server.StorageClassName = %q, want %q (explicit value preserved)", *got.Server.StorageClassName, explicitSC)
+	}
+
+	// An explicit user-set oxia image (a different image family entirely from
+	// spec.Image) must be preserved untouched.
+	const userOxiaImage = "oxia/oxia:0.99.0"
+	spec.Oxia.Coordinator.Image = userOxiaImage
+	spec.Oxia.Server.Image = userOxiaImage
+	got = buildOxiaSpec(spec)
+	if got.Coordinator.Image != userOxiaImage {
+		t.Errorf("Coordinator.Image = %q, want user-set %q preserved", got.Coordinator.Image, userOxiaImage)
+	}
+	if got.Server.Image != userOxiaImage {
+		t.Errorf("Server.Image = %q, want user-set %q preserved", got.Server.Image, userOxiaImage)
 	}
 
 	// Oxia is mandatory: an omitted spec.oxia must still yield a non-nil
