@@ -158,24 +158,6 @@ func TestWithBrokerOffloadDefaults(t *testing.T) {
 	})
 }
 
-func TestPulsarAllImage(t *testing.T) {
-	cases := []struct {
-		name    string
-		version string
-		want    string
-	}{
-		{"empty version yields empty image", "", ""},
-		{"version builds the pulsar-all image", testPulsarVersion, "apachepulsar/pulsar-all:" + testPulsarVersion},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := pulsarAllImage(tc.version); got != tc.want {
-				t.Errorf("pulsarAllImage(%q) = %q, want %q", tc.version, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestOffloadCredentialEnv(t *testing.T) {
 	const secretName = "offload-creds"
 	secretRef := &corev1.LocalObjectReference{Name: secretName}
@@ -320,16 +302,24 @@ func assertSecretEnvVars(t *testing.T, got []corev1.EnvVar, wantSecretName strin
 }
 
 func TestBuildBrokerSpec_Offload(t *testing.T) {
-	t.Run("offload set with no explicit image anywhere selects pulsar-all", func(t *testing.T) {
+	t.Run("offload set with no explicit image anywhere never fabricates pulsar-all", func(t *testing.T) {
+		// Regression: buildBrokerSpec used to swap in
+		// apachepulsar/pulsar-all:<pulsarVersion> here, a tag that isn't
+		// guaranteed to be published (e.g. milestone releases like
+		// 5.0.0-M1), silently producing an ImagePullBackOff. It must no
+		// longer synthesize any pulsar-all tag; a PulsarClusterSpec
+		// XValidation rule now requires an explicit spec.image or
+		// spec.broker.image whenever spec.offload is set, so real clusters
+		// reaching this function will already carry one.
 		spec := clusterv1alpha1.PulsarClusterSpec{
 			PulsarVersion: testPulsarVersion,
 			Broker:        &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(3))},
 			Offload:       &clusterv1alpha1.OffloadSpec{Driver: offloadDriverAWSS3, Bucket: "b"},
 		}
 		got := buildBrokerSpec(spec)
-		want := "apachepulsar/pulsar-all:" + testPulsarVersion
+		want := "apachepulsar/pulsar:" + testPulsarVersion
 		if got.Image != want {
-			t.Errorf("Image = %q, want %q", got.Image, want)
+			t.Errorf("Image = %q, want %q (the slim cluster default, not pulsar-all)", got.Image, want)
 		}
 	})
 
