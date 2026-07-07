@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	kyaml "sigs.k8s.io/yaml"
 )
 
 // EnvPrefix is the environment-variable prefix recognized by the Pulsar
@@ -80,6 +81,24 @@ var propKeyEscaper = strings.NewReplacer(
 	"=", "\\=",
 	":", "\\:",
 )
+
+// RenderYAML renders cfg as a flat YAML mapping, one top-level scalar entry
+// per key, suitable for functions_worker.yml ConfigMap data. Marshaling goes
+// through encoding/json first (via sigs.k8s.io/yaml), which sorts map keys
+// lexicographically, so output is deterministic like RenderProperties; string
+// values are quoted/escaped by the YAML marshaler, so no key or value can
+// break the mapping's line structure. Marshaling a map[string]string cannot
+// fail, so an error here is not reachable in practice.
+func RenderYAML(cfg map[string]string) string {
+	if cfg == nil {
+		cfg = map[string]string{}
+	}
+	out, err := kyaml.Marshal(cfg)
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
 
 // PrefixedEnv converts cfg into a deterministic, sorted-by-key list of
 // PULSAR_PREFIX_<key> env vars, the mechanism a per-set override (e.g. one

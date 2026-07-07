@@ -203,8 +203,9 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&clustercontroller.ProxyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("cluster-proxy"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "cluster-proxy")
 		os.Exit(1)

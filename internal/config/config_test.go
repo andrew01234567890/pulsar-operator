@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	kyaml "sigs.k8s.io/yaml"
 )
 
 const (
@@ -257,6 +258,87 @@ func TestRenderProperties_EscapeRegression(t *testing.T) {
 	got := RenderProperties(map[string]string{keyAEqB: valMultiline})
 	if got != want {
 		t.Errorf("RenderProperties escaping changed: got %q, want %q (confirm this is intentional)", got, want)
+	}
+}
+
+func TestRenderYAML(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  map[string]string
+		want string
+	}{
+		{
+			name: "sorted keys",
+			cfg:  map[string]string{keyWebServicePort: "8080", "workerPort": "6750"},
+			want: "webServicePort: \"8080\"\nworkerPort: \"6750\"\n",
+		},
+		{
+			name: "one key",
+			cfg:  map[string]string{"workerId": "standalone"},
+			want: "workerId: standalone\n",
+		},
+		{
+			name: "empty map",
+			cfg:  map[string]string{},
+			want: "{}\n",
+		},
+		{
+			name: "nil map",
+			cfg:  nil,
+			want: "{}\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RenderYAML(tt.cfg)
+			if got != tt.want {
+				t.Errorf("RenderYAML(%v) = %q, want %q", tt.cfg, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRenderYAML_Deterministic(t *testing.T) {
+	cfg := map[string]string{
+		"workerPort":                    "6750",
+		"configurationMetadataStoreUrl": "",
+		"pulsarServiceUrl":              "pulsar://broker:6650/",
+	}
+
+	first := RenderYAML(cfg)
+	for i := range 20 {
+		if got := RenderYAML(cfg); got != first {
+			t.Fatalf("RenderYAML is not deterministic across calls: run %d = %q, want %q", i, got, first)
+		}
+	}
+}
+
+func TestRenderYAML_RoundTrip(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  map[string]string
+	}{
+		{name: "value with colon", cfg: map[string]string{"k": "a: b"}},
+		{name: "value with newline", cfg: map[string]string{"k": valMultiline}},
+		{name: "value that looks like a bool", cfg: map[string]string{"k": "true"}},
+		{name: "value that looks like a number", cfg: map[string]string{"k": "8080"}},
+		{name: "empty value", cfg: map[string]string{"k": ""}},
+		{name: "value with quotes", cfg: map[string]string{"k": `say "hi"`}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rendered := RenderYAML(tt.cfg)
+
+			var got map[string]string
+			if err := kyaml.Unmarshal([]byte(rendered), &got); err != nil {
+				t.Fatalf("RenderYAML(%v) = %q, which failed to parse back as YAML: %v", tt.cfg, rendered, err)
+			}
+			if !mapsEqual(got, tt.cfg) {
+				t.Errorf("round-trip mismatch: RenderYAML(%v) => %q => parsed %v", tt.cfg, rendered, got)
+			}
+		})
 	}
 }
 

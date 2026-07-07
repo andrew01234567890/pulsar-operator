@@ -69,7 +69,7 @@ var _ = Describe("Broker Controller", func() {
 					Spec: clusterv1alpha1.BrokerSpec{
 						Replicas: int32Ptr(2),
 						Config: map[string]string{
-							"metadataStoreUrl": testMetadataStoreURL,
+							configKeyMetadataStoreURL: testMetadataStoreURL,
 						},
 					},
 				}
