@@ -25,9 +25,9 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	clusterv1alpha1 "github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1"
@@ -39,10 +39,19 @@ import (
 // PulsarCluster is the umbrella resource: this controller stamps out and
 // keeps reconciled the per-component child CRs (Broker, BookKeeper, Proxy,
 // AutoRecovery, FunctionsWorker, metadata.OxiaCluster) that the component
-// controllers own the workloads for (the KAAP hybrid pattern).
+// controllers own the workloads for (the KAAP hybrid pattern). Updates that
+// change a child's spec are rolled out in dependency order rather than all at
+// once - see pulsarcluster_upgrade.go.
 type PulsarClusterReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Recorder emits Events describing ordered-rollout progress (a tier
+	// starting to roll, or a downstream tier's update deferred behind an
+	// unsettled upstream tier). cmd/main.go wires it to
+	// mgr.GetEventRecorder(...); a nil Recorder is treated as a no-op sink so
+	// tests may leave it unset.
+	Recorder events.EventRecorder
 }
 
 const (
@@ -83,11 +92,16 @@ const (
 // +kubebuilder:rbac:groups=metadata.pulsaroperator.io,resources=oxiaclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=metadata.pulsaroperator.io,resources=oxiaclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile decomposes a PulsarCluster into its per-component child CRs,
-// creates or updates the desired ones (owned by the PulsarCluster so they are
-// garbage-collected with it), prunes children whose sub-spec was removed, and
-// aggregates their reported readiness back onto PulsarCluster.Status.
+// creates the still-missing ones eagerly, and rolls out spec changes to the
+// existing ones in dependency order - OxiaCluster (metadata) -> BookKeeper
+// (bookies, with AutoRecovery alongside) -> Broker -> Proxy -> FunctionsWorker
+// - so e.g. a pulsarVersion bump never lands on every component at once (see
+// pulsarcluster_upgrade.go). It also prunes children whose sub-spec was
+// removed and aggregates their reported readiness back onto
+// PulsarCluster.Status.
 func (r *PulsarClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -96,49 +110,9 @@ func (r *PulsarClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	reports := make([]componentReport, 0, 6)
+	reports := make([]componentReport, 0, 7)
 
-	brokerReport, err := r.reconcileBroker(ctx, cluster)
-	if err != nil {
-		log.Error(err, "failed to reconcile child Broker")
-		return ctrl.Result{}, err
-	}
-	cluster.Status.BrokerPhase = componentPhase(brokerReport)
-	reports = append(reports, brokerReport)
-
-	bookKeeperReport, err := r.reconcileBookKeeper(ctx, cluster)
-	if err != nil {
-		log.Error(err, "failed to reconcile child BookKeeper")
-		return ctrl.Result{}, err
-	}
-	cluster.Status.BookKeeperPhase = componentPhase(bookKeeperReport)
-	reports = append(reports, bookKeeperReport)
-
-	proxyReport, err := r.reconcileProxy(ctx, cluster)
-	if err != nil {
-		log.Error(err, "failed to reconcile child Proxy")
-		return ctrl.Result{}, err
-	}
-	cluster.Status.ProxyPhase = componentPhase(proxyReport)
-	reports = append(reports, proxyReport)
-
-	autoRecoveryReport, err := r.reconcileAutoRecovery(ctx, cluster)
-	if err != nil {
-		log.Error(err, "failed to reconcile child AutoRecovery")
-		return ctrl.Result{}, err
-	}
-	cluster.Status.AutoRecoveryPhase = componentPhase(autoRecoveryReport)
-	reports = append(reports, autoRecoveryReport)
-
-	functionsWorkerReport, err := r.reconcileFunctionsWorker(ctx, cluster)
-	if err != nil {
-		log.Error(err, "failed to reconcile child FunctionsWorker")
-		return ctrl.Result{}, err
-	}
-	cluster.Status.FunctionsWorkerPhase = componentPhase(functionsWorkerReport)
-	reports = append(reports, functionsWorkerReport)
-
-	oxiaReport, err := r.reconcileOxia(ctx, cluster)
+	oxiaReport, oxiaOut, err := r.reconcileOxia(ctx, cluster)
 	if err != nil {
 		log.Error(err, "failed to reconcile child OxiaCluster")
 		return ctrl.Result{}, err
@@ -153,8 +127,67 @@ func (r *PulsarClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	reports = append(reports, metadataInitReport)
 
+	bookKeeperReport, bookKeeperOut, err := r.reconcileBookKeeper(ctx, cluster, oxiaOut.settled)
+	if err != nil {
+		log.Error(err, "failed to reconcile child BookKeeper")
+		return ctrl.Result{}, err
+	}
+	cluster.Status.BookKeeperPhase = componentPhase(bookKeeperReport)
+	reports = append(reports, bookKeeperReport)
+
+	// AutoRecovery rolls alongside BookKeeper (both gated on Oxia having
+	// settled) rather than waiting on BookKeeper's own settlement: disabling
+	// AutoRecovery for the duration of the bookie roll would be the ideal,
+	// but that enable/disable toggle isn't implemented yet (follow-up).
+	autoRecoveryReport, autoRecoveryOut, err := r.reconcileAutoRecovery(ctx, cluster, oxiaOut.settled)
+	if err != nil {
+		log.Error(err, "failed to reconcile child AutoRecovery")
+		return ctrl.Result{}, err
+	}
+	cluster.Status.AutoRecoveryPhase = componentPhase(autoRecoveryReport)
+	reports = append(reports, autoRecoveryReport)
+
+	brokerReport, brokerOut, err := r.reconcileBroker(ctx, cluster, oxiaOut.settled && bookKeeperOut.settled)
+	if err != nil {
+		log.Error(err, "failed to reconcile child Broker")
+		return ctrl.Result{}, err
+	}
+	cluster.Status.BrokerPhase = componentPhase(brokerReport)
+	reports = append(reports, brokerReport)
+
+	proxyReport, proxyOut, err := r.reconcileProxy(ctx, cluster, oxiaOut.settled && bookKeeperOut.settled && brokerOut.settled)
+	if err != nil {
+		log.Error(err, "failed to reconcile child Proxy")
+		return ctrl.Result{}, err
+	}
+	cluster.Status.ProxyPhase = componentPhase(proxyReport)
+	reports = append(reports, proxyReport)
+
+	functionsWorkerReport, functionsWorkerOut, err := r.reconcileFunctionsWorker(
+		ctx, cluster, oxiaOut.settled && bookKeeperOut.settled && brokerOut.settled && proxyOut.settled)
+	if err != nil {
+		log.Error(err, "failed to reconcile child FunctionsWorker")
+		return ctrl.Result{}, err
+	}
+	cluster.Status.FunctionsWorkerPhase = componentPhase(functionsWorkerReport)
+	reports = append(reports, functionsWorkerReport)
+
+	states := []tierState{
+		{tier: tierOxia, present: oxiaReport.present, outcome: oxiaOut},
+		{tier: tierBookKeeper, present: bookKeeperReport.present, outcome: bookKeeperOut},
+		{tier: tierAutoRecovery, present: autoRecoveryReport.present, outcome: autoRecoveryOut},
+		{tier: tierBroker, present: brokerReport.present, outcome: brokerOut},
+		{tier: tierProxy, present: proxyReport.present, outcome: proxyOut},
+		{tier: tierFunctionsWorker, present: functionsWorkerReport.present, outcome: functionsWorkerOut},
+	}
+
 	cluster.Status.ObservedGeneration = cluster.Generation
 	apimeta.SetStatusCondition(&cluster.Status.Conditions, aggregateReadyCondition(cluster.Generation, reports))
+
+	upgrading := rollingOutCondition(cluster.Generation, states)
+	priorUpgrading := apimeta.FindStatusCondition(cluster.Status.Conditions, conditionTypeUpgrading)
+	r.recordRolloutEvents(cluster, priorUpgrading, upgrading, states)
+	apimeta.SetStatusCondition(&cluster.Status.Conditions, upgrading)
 
 	if err := r.Status().Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating PulsarCluster status: %w", err)
@@ -163,156 +196,186 @@ func (r *PulsarClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if requeueMetadataInit {
 		return ctrl.Result{RequeueAfter: metadataInitRetryInterval}, nil
 	}
+	if _, rolling := rollingBottleneck(states); rolling {
+		// Some tier has a spec roll in flight - just written and not yet
+		// converged, or deferred behind an unsettled upstream tier. Requeue
+		// to keep making progress: owner watches on the child CRs already
+		// fire when a child's status changes, but this is a defensive
+		// backstop so gating decisions get rechecked even without one. A
+		// steady-state cluster has no rolling tier, so this never churns.
+		return ctrl.Result{RequeueAfter: rolloutRequeueInterval}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
-func (r *PulsarClusterReconciler) reconcileBroker(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, error) {
+// reconcileBroker creates the Broker child if it's missing, or - once
+// upstreamSettled (Oxia and BookKeeper have both settled on their latest
+// specs) - rolls out a changed desired spec to an existing one. It returns
+// (report, outcome, err): outcome.settled feeds the Proxy/FunctionsWorker
+// gate, and outcome's applied/deferred flags drive Reconcile's rollout
+// events, requeue, and Upgrading condition.
+func (r *PulsarClusterReconciler) reconcileBroker(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, upstreamSettled bool) (componentReport, tierOutcome, error) {
 	const name = "broker"
 	child := &clusterv1alpha1.Broker{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(cluster.Name, name), Namespace: cluster.Namespace},
 	}
 	if cluster.Spec.Broker == nil {
-		return pruneChild(ctx, r, name, child)
+		report, err := pruneChild(ctx, r, name, child)
+		return report, tierOutcome{settled: true}, err
 	}
 
 	desired := buildBrokerSpec(cluster.Spec)
 	desired.Config = withBrokerProxyMetadataDefaults(desired.Config, cluster.Name)
 	desired.Config = withClusterNameDefault(desired.Config, cluster.Name)
 	desired.Config = withBrokerOffloadDefaults(desired.Config, cluster.Spec.Offload)
-	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
-		child.Spec = *desired
-		return nil
-	}); err != nil {
-		return componentReport{}, fmt.Errorf("broker: %w", err)
+
+	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
+		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled)
+	if err != nil {
+		return componentReport{}, tierOutcome{}, fmt.Errorf("broker: %w", err)
 	}
 
-	return reportFromConditions(name, child.Generation, child.Status.Conditions), nil
+	report := reportFromConditions(name, child.Generation, child.Status.Conditions)
+	outcome.settled = tierSettled(report.ready, outcome.deferred)
+	return report, outcome, nil
 }
 
-func (r *PulsarClusterReconciler) reconcileBookKeeper(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, error) {
+// reconcileBookKeeper is reconcileBroker's counterpart for the bookie tier:
+// its update is gated on upstreamSettled, which the caller passes as Oxia's
+// own settled state (BookKeeper is the tier directly downstream of Oxia).
+func (r *PulsarClusterReconciler) reconcileBookKeeper(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, upstreamSettled bool) (componentReport, tierOutcome, error) {
 	const name = "bookkeeper"
 	child := &clusterv1alpha1.BookKeeper{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(cluster.Name, name), Namespace: cluster.Namespace},
 	}
 	if cluster.Spec.BookKeeper == nil {
-		return pruneChild(ctx, r, name, child)
+		report, err := pruneChild(ctx, r, name, child)
+		return report, tierOutcome{settled: true}, err
 	}
 
 	desired := buildBookKeeperSpec(cluster.Spec)
 	desired.Config = withBookKeeperMetadataDefault(desired.Config, cluster.Name)
-	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
-		child.Spec = *desired
-		return nil
-	}); err != nil {
-		return componentReport{}, fmt.Errorf("bookkeeper: %w", err)
+
+	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
+		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled)
+	if err != nil {
+		return componentReport{}, tierOutcome{}, fmt.Errorf("bookkeeper: %w", err)
 	}
 
-	return reportFromConditions(name, child.Generation, child.Status.Conditions), nil
+	report := reportFromConditions(name, child.Generation, child.Status.Conditions)
+	outcome.settled = tierSettled(report.ready, outcome.deferred)
+	return report, outcome, nil
 }
 
-func (r *PulsarClusterReconciler) reconcileProxy(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, error) {
+// reconcileProxy gates its update on upstreamSettled, the caller-computed
+// conjunction of every tier upstream of Proxy (Oxia, BookKeeper, Broker).
+func (r *PulsarClusterReconciler) reconcileProxy(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, upstreamSettled bool) (componentReport, tierOutcome, error) {
 	const name = "proxy"
 	child := &clusterv1alpha1.Proxy{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(cluster.Name, name), Namespace: cluster.Namespace},
 	}
 	if cluster.Spec.Proxy == nil {
-		return pruneChild(ctx, r, name, child)
+		report, err := pruneChild(ctx, r, name, child)
+		return report, tierOutcome{settled: true}, err
 	}
 
 	desired := buildProxySpec(cluster.Spec)
 	desired.Config = withBrokerProxyMetadataDefaults(desired.Config, cluster.Name)
 	desired.Config = withClusterNameDefault(desired.Config, cluster.Name)
-	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
-		child.Spec = *desired
-		return nil
-	}); err != nil {
-		return componentReport{}, fmt.Errorf("proxy: %w", err)
+
+	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
+		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled)
+	if err != nil {
+		return componentReport{}, tierOutcome{}, fmt.Errorf("proxy: %w", err)
 	}
 
-	return reportFromConditions(name, child.Generation, child.Status.Conditions), nil
+	report := reportFromConditions(name, child.Generation, child.Status.Conditions)
+	outcome.settled = tierSettled(report.ready, outcome.deferred)
+	return report, outcome, nil
 }
 
-func (r *PulsarClusterReconciler) reconcileAutoRecovery(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, error) {
+// reconcileAutoRecovery gates its update on upstreamSettled - the caller
+// passes Oxia's settled state, the same gate BookKeeper uses, so AutoRecovery
+// rolls alongside the bookie tier rather than waiting on it.
+func (r *PulsarClusterReconciler) reconcileAutoRecovery(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, upstreamSettled bool) (componentReport, tierOutcome, error) {
 	const name = "autorecovery"
 	child := &clusterv1alpha1.AutoRecovery{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(cluster.Name, name), Namespace: cluster.Namespace},
 	}
 	if cluster.Spec.AutoRecovery == nil {
-		return pruneChild(ctx, r, name, child)
+		report, err := pruneChild(ctx, r, name, child)
+		return report, tierOutcome{settled: true}, err
 	}
 
 	desired := buildAutoRecoverySpec(cluster.Spec)
-	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
-		child.Spec = *desired
-		return nil
-	}); err != nil {
-		return componentReport{}, fmt.Errorf("autorecovery: %w", err)
+
+	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
+		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled)
+	if err != nil {
+		return componentReport{}, tierOutcome{}, fmt.Errorf("autorecovery: %w", err)
 	}
 
-	return reportFromConditions(name, child.Generation, child.Status.Conditions), nil
+	report := reportFromConditions(name, child.Generation, child.Status.Conditions)
+	outcome.settled = tierSettled(report.ready, outcome.deferred)
+	return report, outcome, nil
 }
 
-func (r *PulsarClusterReconciler) reconcileFunctionsWorker(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, error) {
+// reconcileFunctionsWorker gates its update on upstreamSettled, the
+// caller-computed conjunction of every other tier: it is last in the rollout
+// order.
+func (r *PulsarClusterReconciler) reconcileFunctionsWorker(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, upstreamSettled bool) (componentReport, tierOutcome, error) {
 	const name = "functionsworker"
 	child := &clusterv1alpha1.FunctionsWorker{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(cluster.Name, name), Namespace: cluster.Namespace},
 	}
 	if cluster.Spec.FunctionsWorker == nil {
-		return pruneChild(ctx, r, name, child)
+		report, err := pruneChild(ctx, r, name, child)
+		return report, tierOutcome{settled: true}, err
 	}
 
 	desired := buildFunctionsWorkerSpec(cluster.Spec)
 	desired.Config = withFunctionsWorkerMetadataDefault(desired.Config, cluster.Name)
-	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
-		child.Spec = *desired
-		return nil
-	}); err != nil {
-		return componentReport{}, fmt.Errorf("functionsworker: %w", err)
+
+	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
+		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled)
+	if err != nil {
+		return componentReport{}, tierOutcome{}, fmt.Errorf("functionsworker: %w", err)
 	}
 
-	return reportFromConditions(name, child.Generation, child.Status.Conditions), nil
+	report := reportFromConditions(name, child.Generation, child.Status.Conditions)
+	outcome.settled = tierSettled(report.ready, outcome.deferred)
+	return report, outcome, nil
 }
 
-func (r *PulsarClusterReconciler) reconcileOxia(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, error) {
+// reconcileOxia has no upstream tier of its own (it is first in the rollout
+// order), so its update is never gated - upstreamSettled is hardcoded true.
+//
+// Oxia is the mandatory metadata store: brokers and bookies have nowhere to
+// store metadata without it, so the child is always provisioned while oxia
+// is the selected store (a default OxiaClusterSpec is used when the user
+// omits spec.oxia). It is only pruned if a future non-Oxia store is ever
+// selected.
+func (r *PulsarClusterReconciler) reconcileOxia(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) (componentReport, tierOutcome, error) {
 	const name = "oxia"
 	child := &metadatav1alpha1.OxiaCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(cluster.Name, name), Namespace: cluster.Namespace},
 	}
-	// Oxia is the mandatory metadata store: brokers and bookies have nowhere
-	// to store metadata without it, so the child is always provisioned while
-	// oxia is the selected store (a default OxiaClusterSpec is used when the
-	// user omits spec.oxia). It is only pruned if a future non-Oxia store is
-	// ever selected.
 	if !oxiaSelected(cluster.Spec) {
-		return pruneChild(ctx, r, name, child)
+		report, err := pruneChild(ctx, r, name, child)
+		return report, tierOutcome{settled: true}, err
 	}
 
 	desired := buildOxiaSpec(cluster.Spec)
-	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
-		child.Spec = *desired
-		return nil
-	}); err != nil {
-		return componentReport{}, fmt.Errorf("oxia: %w", err)
+
+	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
+		func() any { return child.Spec }, func() { child.Spec = *desired }, true)
+	if err != nil {
+		return componentReport{}, tierOutcome{}, fmt.Errorf("oxia: %w", err)
 	}
 
-	return reportFromConditions(name, child.Generation, child.Status.Conditions), nil
-}
-
-// createOrUpdateChild creates or updates a child object, setting cluster as
-// its controller owner reference so it is garbage-collected with the parent.
-func (r *PulsarClusterReconciler) createOrUpdateChild(
-	ctx context.Context,
-	cluster *clusterv1alpha1.PulsarCluster,
-	child client.Object,
-	applySpec func() error,
-) error {
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, child, func() error {
-		if err := applySpec(); err != nil {
-			return err
-		}
-		return controllerutil.SetControllerReference(cluster, child, r.Scheme)
-	})
-	return err
+	report := reportFromConditions(name, child.Generation, child.Status.Conditions)
+	outcome.settled = tierSettled(report.ready, outcome.deferred)
+	return report, outcome, nil
 }
 
 // pruneChild deletes a no-longer-desired child (identified by its deterministic
