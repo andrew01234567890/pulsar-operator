@@ -117,6 +117,21 @@ Progress is surfaced as a `Decommissioning` condition plus Kubernetes Events.
 The same state machine is exposed as an on-demand manual drain (via an
 annotation / subresource) for cases like planned node maintenance.
 
+## Field ownership under the PulsarCluster umbrella
+
+When a `Broker` or `BookKeeper` is managed indirectly through a `PulsarCluster`
+(rather than applied standalone), the umbrella reconciler normally keeps the
+child's spec in sync with `PulsarCluster.spec.broker`/`.bookKeeper`, reverting
+any out-of-band edit as drift (see [Ordered rolling
+upgrades](./high-availability.md#ordered-rolling-upgrades)). `spec.replicas` is
+the one field exempted from that: once a child's own `autoscaler.enabled` is
+`true`, the umbrella treats `spec.replicas` as owned by that autoscaler and
+never writes or reverts it, including while rolling out an unrelated spec
+change (e.g. a `pulsarVersion` bump) - the child keeps its current,
+autoscaler-set replica count through the roll. With autoscaling disabled (the
+default), the umbrella owns `spec.replicas` exactly as it owns every other
+field.
+
 ## Related
 
 - [High availability](./high-availability.md) for the quorum math
