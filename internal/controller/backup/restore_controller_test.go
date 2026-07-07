@@ -60,7 +60,7 @@ var _ = Describe("Restore Controller", func() {
 							Destination: backupv1alpha1.BackupDestination{
 								Driver: testDriverFilesystem,
 							},
-							ArtifactURI: "file:///backups/test-cluster/backup-1.tar",
+							ArtifactURI: testArtifactURI,
 						},
 						TargetClusterRef: corev1.LocalObjectReference{Name: testClusterName},
 					},

@@ -21,6 +21,7 @@ const (
 	testClusterName       = "test-cluster"
 	testDriverFilesystem  = "filesystem"
 	testCronDaily         = "0 0 * * *"
+	testArtifactURI       = "file:///backups/test-cluster/backup-1.tar"
 	testCaseExplicitTrue  = "explicit true"
 	testCaseExplicitFalse = "explicit false"
 )

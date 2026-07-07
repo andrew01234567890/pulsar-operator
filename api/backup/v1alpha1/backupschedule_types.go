@@ -61,12 +61,14 @@ type BackupScheduleSpec struct {
 	BackupTemplate BackupSpec `json:"backupTemplate"`
 
 	// retention controls how many completed Backups this schedule retains.
-	// Uses "omitempty" rather than "omitzero" so an omitted retention block
-	// still serializes as {} on the wire: the apiserver's structural-schema
-	// defaulting only recurses into a sub-object's own field defaults (e.g.
-	// successfulBackupsHistoryLimit) when that sub-object is present at all,
-	// even as an empty object.
+	// The +kubebuilder:default={} on the field itself makes the apiserver
+	// materialize an empty retention object when the submitted bytes omit it
+	// entirely (as a raw `kubectl apply` does), which is what then lets
+	// structural-schema defaulting recurse into the nested
+	// successfulBackupsHistoryLimit default. Without it, an omitted retention
+	// block is stored null and no nested defaults fire.
 	// +optional
+	// +kubebuilder:default={}
 	Retention BackupRetentionPolicy `json:"retention,omitempty"`
 }
 
