@@ -17,9 +17,12 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -39,6 +42,7 @@ import (
 	backupv1alpha1 "github.com/andrew01234567890/pulsar-operator/api/backup/v1alpha1"
 	clusterv1alpha1 "github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1"
 	metadatav1alpha1 "github.com/andrew01234567890/pulsar-operator/api/metadata/v1alpha1"
+	backuptool "github.com/andrew01234567890/pulsar-operator/internal/backup"
 	backupcontroller "github.com/andrew01234567890/pulsar-operator/internal/controller/backup"
 	clustercontroller "github.com/andrew01234567890/pulsar-operator/internal/controller/cluster"
 	metadatacontroller "github.com/andrew01234567890/pulsar-operator/internal/controller/metadata"
@@ -59,8 +63,42 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
+// runBackupSubcommand dispatches "manager backup-export"/"manager
+// backup-import" (see internal/backup.ExportCommandName/ImportCommandName)
+// to the Oxia logical export/import engine instead of starting the
+// controller manager. handled is false for any other/no subcommand, in
+// which case the caller falls through to the normal manager startup.
+func runBackupSubcommand(name string, args []string) (handled bool, exitCode int) {
+	switch name {
+	case backuptool.ExportCommandName:
+		if err := backuptool.RunExportCommand(context.Background(), args, os.Stdout, os.Stderr, time.Now()); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case backuptool.ImportCommandName:
+		if err := backuptool.RunImportCommand(context.Background(), args, os.Stdin, os.Stderr); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	default:
+		return false, 0
+	}
+}
+
 // nolint:gocyclo
 func main() {
+	// The backup Job (a follow-up to this PR) runs this same manager image
+	// with a subcommand instead of standing up the controller manager, so
+	// the Backup/Restore reconcilers can shell out to it rather than
+	// vendoring the Oxia export/import engine into a second binary/image.
+	if len(os.Args) > 1 {
+		if handled, exitCode := runBackupSubcommand(os.Args[1], os.Args[2:]); handled {
+			os.Exit(exitCode)
+		}
+	}
+
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
