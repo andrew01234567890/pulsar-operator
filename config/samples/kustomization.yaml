@@ -7,4 +7,7 @@ resources:
 - cluster_v1alpha1_autorecovery.yaml
 - cluster_v1alpha1_functionsworker.yaml
 - metadata_v1alpha1_oxiacluster.yaml
+- backup_v1alpha1_backup.yaml
+- backup_v1alpha1_restore.yaml
+- backup_v1alpha1_backupschedule.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

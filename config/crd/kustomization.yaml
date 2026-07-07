@@ -9,6 +9,9 @@ resources:
 - bases/cluster.pulsaroperator.io_autorecoveries.yaml
 - bases/cluster.pulsaroperator.io_functionsworkers.yaml
 - bases/metadata.pulsaroperator.io_oxiaclusters.yaml
+- bases/backup.pulsaroperator.io_backups.yaml
+- bases/backup.pulsaroperator.io_restores.yaml
+- bases/backup.pulsaroperator.io_backupschedules.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

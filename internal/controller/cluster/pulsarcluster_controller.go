@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -48,10 +49,15 @@ type PulsarClusterReconciler struct {
 
 	// Recorder emits Events describing ordered-rollout progress (a tier
 	// starting to roll, or a downstream tier's update deferred behind an
-	// unsettled upstream tier). cmd/main.go wires it to
-	// mgr.GetEventRecorder(...); a nil Recorder is treated as a no-op sink so
-	// tests may leave it unset.
+	// unsettled upstream tier), and the metadata-init Job getting stuck on an
+	// image pull. cmd/main.go wires it to mgr.GetEventRecorder(...); a nil
+	// Recorder is treated as a no-op sink so tests may leave it unset.
 	Recorder events.EventRecorder
+
+	// Now returns the current time; nil defaults to time.Now. Tests override
+	// it to make the metadata-init image-pull-stuck recreate's
+	// metadataInitRetryInterval gate deterministic without a real sleep.
+	Now func() time.Time
 }
 
 const (
@@ -93,6 +99,7 @@ const (
 // +kubebuilder:rbac:groups=metadata.pulsaroperator.io,resources=oxiaclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile decomposes a PulsarCluster into its per-component child CRs,
