@@ -71,6 +71,17 @@ spec:
               autoscaler:
                 description: autoscaler configures the disk-watermark-driven autoscaler.
                 properties:
+                  decommissionTimeoutSeconds:
+                    default: 1800
+                    description: |-
+                      decommissionTimeoutSeconds bounds how long the guarded scale-down state
+                      machine waits, once a bookie is marked read-only, for re-replication to
+                      finish (zero ledgers on the target bookie and zero cluster-wide
+                      under-replicated ledgers) before auto-reverting the bookie to writable,
+                      clearing the decommission state, and raising a Warning condition.
+                    format: int32
+                    minimum: 60
+                    type: integer
                   diskUsageToleranceHwm:
                     default: 92
                     description: |-
@@ -149,6 +160,9 @@ spec:
                     minimum: 0
                     type: integer
                 type: object
+                x-kubernetes-validations:
+                - message: Lwm must be below Hwm
+                  rule: self.diskUsageToleranceLwm < self.diskUsageToleranceHwm
               config:
                 additionalProperties:
                   type: string
@@ -187,6 +201,10 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
+                x-kubernetes-validations:
+                - message: ackQuorum <= writeQuorum <= ensembleSize
+                  rule: self.ackQuorum <= self.writeQuorum && self.writeQuorum <=
+                    self.ensembleSize
               image:
                 description: |-
                   image overrides the bookie container image. Falls back to
@@ -196,12 +214,14 @@ spec:
                 default: Parallel
                 description: |-
                   podManagementPolicy is the StatefulSet pod management policy. Immutable
-                  once set; changing it requires operator-guarded validation in a future
-                  webhook.
+                  once set.
                 enum:
                 - OrderedReady
                 - Parallel
                 type: string
+                x-kubernetes-validations:
+                - message: podManagementPolicy is immutable
+                  rule: self == oldSelf
               replicas:
                 description: replicas is the number of bookie pods.
                 format: int32
@@ -261,9 +281,24 @@ spec:
                     type: object
                 type: object
             type: object
+            x-kubernetes-validations:
+            - message: ensembleSize cannot exceed replicas
+              rule: '!has(self.ensemble) || !has(self.ensemble.ensembleSize) || !has(self.replicas)
+                || self.ensemble.ensembleSize <= self.replicas'
           status:
             description: status defines the observed state of BookKeeper
             properties:
+              bookieRacks:
+                additionalProperties:
+                  type: string
+                description: |-
+                  bookieRacks is the last-applied bookie-id -> rack mapping written by
+                  the rack-awareness sync controller (gated on spec.autoRackConfig).
+                  It is the operator's own cache for diffing the desired mapping against
+                  what was last applied, not a read-back of BookKeeper's rack-placement
+                  metadata, so a sync tick calls the rack setter only for bookies whose
+                  desired rack differs from this cache.
+                type: object
               conditions:
                 description: conditions represent the current state of the BookKeeper
                   resource.
@@ -325,6 +360,55 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              decommission:
+                description: |-
+                  decommission tracks the guarded, resumable bookie scale-down state
+                  machine's progress when one is in flight (triggered automatically or via
+                  AnnotationDrainBookieOrdinal). Persisting this on status, rather than
+                  holding it only in memory, is what lets the state machine resume after
+                  an operator restart instead of starting the decommission over. Absent
+                  when no decommission is running.
+                properties:
+                  manual:
+                    description: |-
+                      manual is true when this decommission was requested via
+                      AnnotationDrainBookieOrdinal rather than triggered automatically by the
+                      disk-watermark/under-replication guard.
+                    type: boolean
+                  message:
+                    description: |-
+                      message is a human-readable summary of the current phase, or of why the
+                      decommission was aborted/reverted/completed.
+                    type: string
+                  phase:
+                    description: phase is the state machine's current step.
+                    type: string
+                  startedAt:
+                    description: |-
+                      startedAt is when the state machine began. DecommissionTimeoutSeconds
+                      is measured from this timestamp.
+                    format: date-time
+                    type: string
+                  targetBookieId:
+                    description: |-
+                      targetBookieId is the BookKeeper bookie ID (host:port form) of the
+                      bookie being decommissioned.
+                    type: string
+                  targetOrdinal:
+                    description: |-
+                      targetOrdinal is the StatefulSet ordinal of the bookie being
+                      decommissioned.
+                    format: int32
+                    type: integer
+                type: object
+              lastScaleTime:
+                description: |-
+                  lastScaleTime is when the disk-watermark autoscaler last changed
+                  spec.replicas. The autoscaler's stabilization window is measured from
+                  this timestamp, not from pod age, so it gates repeated scaling events
+                  directly rather than as a side effect of pod restarts.
+                format: date-time
+                type: string
               observedGeneration:
                 description: observedGeneration is the most recent generation observed
                   by the controller.
@@ -340,8 +424,9 @@ spec:
                 format: int32
                 type: integer
               writableBookies:
-                description: writableBookies is the observed number of writable (non-read-only)
-                  bookies.
+                description: |-
+                  writableBookies is the observed number of writable (non-read-only) bookies,
+                  as last polled by the disk-watermark autoscaler.
                 format: int32
                 type: integer
             type: object

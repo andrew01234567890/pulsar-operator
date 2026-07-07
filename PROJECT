@@ -77,4 +77,31 @@ resources:
   kind: OxiaCluster
   path: github.com/andrew01234567890/pulsar-operator/api/metadata/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: pulsaroperator.io
+  group: backup
+  kind: Backup
+  path: github.com/andrew01234567890/pulsar-operator/api/backup/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: pulsaroperator.io
+  group: backup
+  kind: Restore
+  path: github.com/andrew01234567890/pulsar-operator/api/backup/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: pulsaroperator.io
+  group: backup
+  kind: BackupSchedule
+  path: github.com/andrew01234567890/pulsar-operator/api/backup/v1alpha1
+  version: v1alpha1
 version: "3"
