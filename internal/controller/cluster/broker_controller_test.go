@@ -120,6 +120,19 @@ var _ = Describe("Broker Controller", func() {
 			Expect(sts.Spec.Template.Annotations).To(HaveKey(builder.ConfigChecksumAnnotation))
 			Expect(sts.Spec.Template.Annotations[builder.ConfigChecksumAnnotation]).NotTo(BeEmpty())
 
+			By("soft anti-affinity by default (stateless tier)")
+			affinity := sts.Spec.Template.Spec.Affinity
+			Expect(affinity).NotTo(BeNil())
+			Expect(affinity.PodAntiAffinity).NotTo(BeNil())
+			Expect(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution).To(BeEmpty())
+			Expect(affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution).To(HaveLen(1))
+			Expect(affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0].PodAffinityTerm.TopologyKey).To(Equal(builder.HostnameTopologyKey))
+
+			By("default zone topology spread constraints")
+			Expect(sts.Spec.Template.Spec.TopologySpreadConstraints).To(HaveLen(1))
+			Expect(sts.Spec.Template.Spec.TopologySpreadConstraints[0].TopologyKey).To(Equal(builder.ZoneTopologyKey))
+			Expect(sts.Spec.Template.Spec.TopologySpreadConstraints[0].WhenUnsatisfiable).To(Equal(corev1.ScheduleAnyway))
+
 			By("the headless Service")
 			svc := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, svc)).To(Succeed())

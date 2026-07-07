@@ -62,6 +62,10 @@ const (
 	// maxUnavailable for a BookKeeper built directly (bypassing CRD defaulting).
 	defaultWriteQuorum int32 = 2
 
+	// defaultAckQuorum mirrors BookKeeperEnsembleSpec.AckQuorum's kubebuilder
+	// default, used the same way as defaultWriteQuorum above.
+	defaultAckQuorum int32 = 2
+
 	bookiePort      = 3181
 	bookieAdminPort = 8000
 
@@ -327,11 +331,30 @@ func resolveWriteQuorum(spec clusterv1alpha1.BookKeeperSpec) int32 {
 	return defaultWriteQuorum
 }
 
-// resolvePDBMaxUnavailable keeps at least writeQuorum bookies available
-// through a voluntary disruption, so in-flight ledger writes can still reach
-// quorum; it never returns a negative count.
-func resolvePDBMaxUnavailable(replicas, writeQuorum int32) intstr.IntOrString {
-	return intstr.FromInt32(max(replicas-writeQuorum, 0))
+func resolveAckQuorum(spec clusterv1alpha1.BookKeeperSpec) int32 {
+	if spec.Ensemble != nil && spec.Ensemble.AckQuorum != nil {
+		return *spec.Ensemble.AckQuorum
+	}
+	return defaultAckQuorum
+}
+
+// resolvePDBMaxUnavailable bounds voluntary bookie disruption to the ledger
+// ack-quorum slack: writeQuorum-ackQuorum is how many bookies belonging to a
+// single ledger's write-quorum group can be unavailable while writes to that
+// ledger still reach ackQuorum acks, even in the worst case where every
+// voluntarily-evicted bookie happens to belong to that group (bounded
+// overlap: at most min(maxUnavailable, writeQuorum) of the evicted bookies
+// can be in any one ledger's write-quorum group).
+//
+// The slack is clamped to at least 1 so a voluntary disruption (e.g. a node
+// drain) is never fully blocked - when writeQuorum==ackQuorum there is no
+// true safety margin, and a single eviction can transiently force an
+// ensemble change on affected ledgers, an accepted trade-off - and to at
+// most replicas-1 so the PDB can never permit evicting every bookie at once.
+func resolvePDBMaxUnavailable(replicas, writeQuorum, ackQuorum int32) intstr.IntOrString {
+	maxUnavailable := max(writeQuorum-ackQuorum, 1)
+	maxUnavailable = min(maxUnavailable, replicas-1)
+	return intstr.FromInt32(max(maxUnavailable, 0))
 }
 
 func desiredConfigMap(bk *clusterv1alpha1.BookKeeper, rendered string) *corev1.ConfigMap {
@@ -349,7 +372,8 @@ func desiredHeadlessService(bk *clusterv1alpha1.BookKeeper) *corev1.Service {
 func desiredPDB(bk *clusterv1alpha1.BookKeeper) *policyv1.PodDisruptionBudget {
 	replicas := resolveReplicas(bk.Spec)
 	writeQuorum := resolveWriteQuorum(bk.Spec)
-	maxUnavailable := resolvePDBMaxUnavailable(replicas, writeQuorum)
+	ackQuorum := resolveAckQuorum(bk.Spec)
+	maxUnavailable := resolvePDBMaxUnavailable(replicas, writeQuorum, ackQuorum)
 	return builder.PodDisruptionBudget(bk.Name, bk.Namespace, builder.Labels(bk.Name, bookkeeperComponent), builder.SelectorLabels(bk.Name, bookkeeperComponent), maxUnavailable)
 }
 
@@ -380,13 +404,19 @@ func desiredStatefulSet(bk *clusterv1alpha1.BookKeeper, image string, rendered s
 }
 
 func buildPodTemplate(bk *clusterv1alpha1.BookKeeper, image string, rendered string) corev1.PodTemplateSpec {
+	selector := builder.SelectorLabels(bk.Name, bookkeeperComponent)
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels:      builder.Labels(bk.Name, bookkeeperComponent),
 			Annotations: builder.WithConfigChecksum(nil, rendered),
 		},
 		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{buildBookieContainer(image)},
+			// Bookies are a stateful quorum tier: co-locating two ensemble
+			// members on one node would let a single node loss cost ack
+			// quorum outright, so anti-affinity here is hard, not soft.
+			Affinity:                  builder.PodAntiAffinity(true, selector),
+			TopologySpreadConstraints: builder.ZoneTopologySpreadConstraints(selector),
+			Containers:                []corev1.Container{buildBookieContainer(image)},
 			Volumes: []corev1.Volume{
 				{
 					Name: volumeNameConfig,

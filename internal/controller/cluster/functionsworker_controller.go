@@ -239,6 +239,11 @@ func (r *FunctionsWorkerReconciler) reconcileStatefulSet(
 				Annotations: builder.WithConfigChecksum(sts.Spec.Template.Annotations, renderedConf),
 			},
 			Spec: corev1.PodSpec{
+				// Standalone functions-worker is stateless (function state
+				// lives in BookKeeper/metadata, not on the worker pod), so
+				// anti-affinity here is soft, not hard.
+				Affinity:                  builder.PodAntiAffinity(false, selector),
+				TopologySpreadConstraints: builder.ZoneTopologySpreadConstraints(selector),
 				Containers: []corev1.Container{{
 					Name:           functionsWorkerComponent,
 					Image:          functionsWorkerImage(fw.Spec.Image),

@@ -137,9 +137,26 @@ var _ = Describe("BookKeeper Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, pdb)).To(Succeed())
 			Expect(pdb.Spec.Selector.MatchLabels).To(Equal(builder.SelectorLabels(resourceName, bookkeeperComponent)))
 			Expect(pdb.Spec.MaxUnavailable).NotTo(BeNil())
-			// 3 replicas - default write quorum 2 = 1 tolerable disruption.
+			// default write quorum 2 - default ack quorum 2 = 0 ack-quorum
+			// slack, clamped up to the practical floor of 1.
 			Expect(*pdb.Spec.MaxUnavailable).To(Equal(intstr.FromInt32(1)))
 			Expect(ownerRefNames(pdb.OwnerReferences)).To(ContainElement(owner.Name))
+
+			By("hard anti-affinity keyed on the bookie selector (stateful quorum tier)")
+			affinity := sts.Spec.Template.Spec.Affinity
+			Expect(affinity).NotTo(BeNil())
+			Expect(affinity.PodAntiAffinity).NotTo(BeNil())
+			Expect(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution).To(HaveLen(1))
+			Expect(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0].TopologyKey).To(Equal(builder.HostnameTopologyKey))
+			Expect(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0].LabelSelector.MatchLabels).To(Equal(builder.SelectorLabels(resourceName, bookkeeperComponent)))
+			Expect(affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution).To(BeEmpty())
+
+			By("default zone topology spread constraints")
+			Expect(sts.Spec.Template.Spec.TopologySpreadConstraints).To(HaveLen(1))
+			tsc := sts.Spec.Template.Spec.TopologySpreadConstraints[0]
+			Expect(tsc.MaxSkew).To(Equal(int32(1)))
+			Expect(tsc.TopologyKey).To(Equal(builder.ZoneTopologyKey))
+			Expect(tsc.WhenUnsatisfiable).To(Equal(corev1.ScheduleAnyway))
 		})
 
 		It("should report Ready only once the StatefulSet is fully ready and rolled out", func() {

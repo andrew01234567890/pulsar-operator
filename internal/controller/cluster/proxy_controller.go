@@ -212,6 +212,11 @@ func (r *ProxyReconciler) reconcileStatefulSet(
 				Annotations: builder.WithConfigChecksum(sts.Spec.Template.Annotations, renderedConf),
 			},
 			Spec: corev1.PodSpec{
+				// Proxies are stateless: losing one just drops its share of
+				// client connections (which reconnect elsewhere), so
+				// anti-affinity here is soft, not hard.
+				Affinity:                  builder.PodAntiAffinity(false, selector),
+				TopologySpreadConstraints: builder.ZoneTopologySpreadConstraints(selector),
 				Containers: []corev1.Container{{
 					Name:           proxyComponent,
 					Image:          proxyImage(proxy.Spec.Image),
