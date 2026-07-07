@@ -60,6 +60,27 @@ var _ = Describe("CEL admission validation", func() {
 			Expect(err.Error()).To(ContainSubstring("ackQuorum <= writeQuorum <= ensembleSize"))
 		})
 
+		It("rejects an Ensemble where writeQuorum > ensembleSize", func() {
+			// Isolates the second conjunct: ackQuorum <= writeQuorum holds
+			// (2 <= 3) and ensembleSize <= replicas holds (2 <= 3), so only
+			// writeQuorum <= ensembleSize (3 <= 2) can trip the rule.
+			bk := &clusterv1alpha1.BookKeeper{
+				ObjectMeta: metav1.ObjectMeta{Name: "bk-cel-writequorum-invalid", Namespace: testNamespaceDefault},
+				Spec: clusterv1alpha1.BookKeeperSpec{
+					Replicas: ptr(int32(3)),
+					Ensemble: &clusterv1alpha1.BookKeeperEnsembleSpec{
+						EnsembleSize: ptr(int32(2)),
+						WriteQuorum:  ptr(int32(3)),
+						AckQuorum:    ptr(int32(2)),
+					},
+				},
+			}
+			err := k8sClient.Create(celCtx, bk)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("ackQuorum <= writeQuorum <= ensembleSize"))
+		})
+
 		It("rejects an ensembleSize greater than replicas", func() {
 			bk := &clusterv1alpha1.BookKeeper{
 				ObjectMeta: metav1.ObjectMeta{Name: "bk-cel-ensemblesize-invalid", Namespace: testNamespaceDefault},
@@ -118,6 +139,36 @@ var _ = Describe("CEL admission validation", func() {
 			Expect(k8sClient.Get(celCtx, key, latest)).To(Succeed())
 			latest.Spec.Replicas = ptr(int32(5))
 			Expect(k8sClient.Update(celCtx, latest)).To(Succeed())
+		})
+
+		It("rejects an autoscaler with diskUsageToleranceLwm >= diskUsageToleranceHwm", func() {
+			bk := &clusterv1alpha1.BookKeeper{
+				ObjectMeta: metav1.ObjectMeta{Name: "bk-cel-watermark-invalid", Namespace: testNamespaceDefault},
+				Spec: clusterv1alpha1.BookKeeperSpec{
+					Autoscaler: &clusterv1alpha1.BookKeeperAutoscalerSpec{
+						DiskUsageToleranceLwm: ptr(int32(90)),
+						DiskUsageToleranceHwm: ptr(int32(80)),
+					},
+				},
+			}
+			err := k8sClient.Create(celCtx, bk)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("Lwm must be below Hwm"))
+		})
+
+		It("accepts an autoscaler with diskUsageToleranceLwm below diskUsageToleranceHwm", func() {
+			bk := &clusterv1alpha1.BookKeeper{
+				ObjectMeta: metav1.ObjectMeta{Name: "bk-cel-watermark-valid", Namespace: testNamespaceDefault},
+				Spec: clusterv1alpha1.BookKeeperSpec{
+					Autoscaler: &clusterv1alpha1.BookKeeperAutoscalerSpec{
+						DiskUsageToleranceLwm: ptr(int32(80)),
+						DiskUsageToleranceHwm: ptr(int32(90)),
+					},
+				},
+			}
+			Expect(k8sClient.Create(celCtx, bk)).To(Succeed())
+			Expect(k8sClient.Delete(celCtx, bk)).To(Succeed())
 		})
 	})
 
