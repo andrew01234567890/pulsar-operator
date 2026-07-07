@@ -125,6 +125,20 @@ func withBookKeeperMetadataDefault(cfg map[string]string, clusterName string) ma
 	return setConfigDefault(cfg, configKeyMetadataServiceURI, uri)
 }
 
+// withAutoRecoveryMetadataDefault sets metadataServiceUri to the SAME
+// metadata-store:oxia://.../bookkeeper URI the bookies register under (see
+// withBookKeeperMetadataDefault), unless the user already set it.
+// AutoRecovery's dedicated Auditor + ReplicationWorker share BookKeeper's own
+// metadata store, so it must resolve to the identical bookies as the bookie
+// tier. The standalone AutoRecovery reconciler deliberately leaves
+// metadataServiceUri blank (see autoRecoveryDefaultConfig) since a bare
+// AutoRecovery has no notion of which metadata store implementation the
+// cluster uses; the umbrella PulsarCluster reconciler is the one place with
+// that context, exactly as it is for BookKeeper.
+func withAutoRecoveryMetadataDefault(cfg map[string]string, clusterName string) map[string]string {
+	return withBookKeeperMetadataDefault(cfg, clusterName)
+}
+
 // withBrokerBookkeeperMetadataDefault sets the broker's
 // bookkeeperMetadataServiceUri to the SAME metadata-store:oxia://.../bookkeeper
 // URI the bookies register under (see withBookKeeperMetadataDefault), unless

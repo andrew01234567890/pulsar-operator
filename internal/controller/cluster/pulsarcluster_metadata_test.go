@@ -169,6 +169,29 @@ func TestWithBookKeeperMetadataDefault(t *testing.T) {
 	}
 }
 
+func TestWithAutoRecoveryMetadataDefault(t *testing.T) {
+	const (
+		wantURI = "metadata-store:oxia://test-cluster-oxia-oxia:6648/bookkeeper"
+		userURI = "metadata-store:oxia://user-store:6648/bookkeeper"
+	)
+
+	// AutoRecovery MUST resolve to the SAME metadata store as the bookies
+	// (same "bookkeeper" Oxia namespace): it shares BookKeeper's own cluster
+	// metadata, not a separate one.
+	if got := withAutoRecoveryMetadataDefault(nil, testMetadataClusterName)[configKeyMetadataServiceURI]; got != wantURI {
+		t.Errorf("metadataServiceUri = %q, want %q", got, wantURI)
+	}
+	if got := withBookKeeperMetadataDefault(nil, testMetadataClusterName)[configKeyMetadataServiceURI]; got != wantURI {
+		t.Errorf("AutoRecovery metadataServiceUri must match the bookie metadataServiceUri, bookie got %q", got)
+	}
+
+	cfg := map[string]string{configKeyMetadataServiceURI: userURI}
+	got := withAutoRecoveryMetadataDefault(cfg, testMetadataClusterName)
+	if got[configKeyMetadataServiceURI] != userURI {
+		t.Errorf("metadataServiceUri = %q, want user value preserved", got[configKeyMetadataServiceURI])
+	}
+}
+
 func TestWithBrokerBookkeeperMetadataDefault(t *testing.T) {
 	const (
 		wantURI = "metadata-store:oxia://test-cluster-oxia-oxia:6648/bookkeeper"
