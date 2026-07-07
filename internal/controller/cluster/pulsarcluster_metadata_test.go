@@ -17,6 +17,7 @@ limitations under the License.
 package cluster
 
 import (
+	"strings"
 	"testing"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -29,6 +30,11 @@ import (
 const (
 	testMetadataClusterName = "test-cluster"
 	testMetadataNamespace   = "pulsar-ns"
+
+	// testMetadataInitName is metadataInitJobName(testMetadataClusterName),
+	// shared by the Job and ConfigMap this file's tests assert on (both are
+	// named identically - see buildMetadataInitConfigMap/buildMetadataInitJob).
+	testMetadataInitName = "test-cluster-metadata-init"
 
 	// testWantOxiaURL is the oxia:// metadataStoreUrl/configurationMetadataStoreUrl
 	// the umbrella reconciler injects for testMetadataClusterName's Oxia child.
@@ -163,6 +169,28 @@ func TestWithBookKeeperMetadataDefault(t *testing.T) {
 	}
 }
 
+func TestWithBrokerBookkeeperMetadataDefault(t *testing.T) {
+	const (
+		wantURI = "metadata-store:oxia://test-cluster-oxia-oxia:6648/bookkeeper"
+		userURI = "metadata-store:oxia://user-store:6648/bookkeeper"
+	)
+
+	// The broker's bookkeeperMetadataServiceUri MUST equal the bookies' own
+	// metadataServiceUri (same "bookkeeper" Oxia namespace), or the broker
+	// can't find the bookies and every ledger create fails rc=-6.
+	if got := withBrokerBookkeeperMetadataDefault(nil, testMetadataClusterName)[configKeyBookkeeperMetadataServiceURI]; got != wantURI {
+		t.Errorf("bookkeeperMetadataServiceUri = %q, want %q", got, wantURI)
+	}
+	if got := withBookKeeperMetadataDefault(nil, testMetadataClusterName)[configKeyMetadataServiceURI]; got != wantURI {
+		t.Errorf("broker bookkeeperMetadataServiceUri must match the bookie metadataServiceUri, bookie got %q", got)
+	}
+
+	cfg := map[string]string{configKeyBookkeeperMetadataServiceURI: userURI}
+	if got := withBrokerBookkeeperMetadataDefault(cfg, testMetadataClusterName)[configKeyBookkeeperMetadataServiceURI]; got != userURI {
+		t.Errorf("bookkeeperMetadataServiceUri = %q, want user value preserved", got)
+	}
+}
+
 func TestWithFunctionsWorkerMetadataDefault(t *testing.T) {
 	if got := withFunctionsWorkerMetadataDefault(nil, testMetadataClusterName); got[configKeyConfigurationMetadataStoreURL] != testWantOxiaURL {
 		t.Errorf("configurationMetadataStoreUrl = %q, want %q", got[configKeyConfigurationMetadataStoreURL], testWantOxiaURL)
@@ -176,7 +204,7 @@ func TestWithFunctionsWorkerMetadataDefault(t *testing.T) {
 }
 
 func TestMetadataInitJobName(t *testing.T) {
-	if got, want := metadataInitJobName(testMetadataClusterName), "test-cluster-metadata-init"; got != want {
+	if got, want := metadataInitJobName(testMetadataClusterName), testMetadataInitName; got != want {
 		t.Errorf("metadataInitJobName() = %q, want %q", got, want)
 	}
 }
@@ -189,8 +217,8 @@ func TestBuildMetadataInitJob(t *testing.T) {
 
 	job := buildMetadataInitJob(cluster)
 
-	if job.Name != "test-cluster-metadata-init" {
-		t.Errorf("Name = %q, want %q", job.Name, "test-cluster-metadata-init")
+	if job.Name != testMetadataInitName {
+		t.Errorf("Name = %q, want %q", job.Name, testMetadataInitName)
 	}
 	if job.Namespace != testMetadataNamespace {
 		t.Errorf("Namespace = %q, want %q", job.Namespace, testMetadataNamespace)
@@ -209,25 +237,44 @@ func TestBuildMetadataInitJob(t *testing.T) {
 	if container.Image != testClusterImage {
 		t.Errorf("Image = %q, want %q", container.Image, testClusterImage)
 	}
-	if len(container.Command) != 1 || container.Command[0] != cmdBinPulsar {
-		t.Errorf("Command = %v, want [%q]", container.Command, cmdBinPulsar)
+	if len(container.Command) != 2 || container.Command[0] != "sh" || container.Command[1] != "-c" {
+		t.Errorf("Command = %v, want [sh -c]", container.Command)
+	}
+	if len(container.Args) != 1 {
+		t.Fatalf("Args = %d, want 1 (single script)", len(container.Args))
 	}
 
-	wantArgs := []string{
-		"initialize-cluster-metadata",
-		"--cluster", testMetadataClusterName,
-		"--metadata-store", testWantOxiaURL,
-		"--configuration-store", testWantOxiaURL,
-		"--web-service-url", "http://test-cluster-broker:8080",
-		"--broker-service-url", "pulsar://test-cluster-broker:6650",
+	script := container.Args[0]
+	wantSubstrings := []string{
+		"bin/bookkeeper shell whatisinstanceid",
+		"bin/bookkeeper shell initnewcluster",
+		`--cluster "` + testMetadataClusterName + `"`,
+		`--metadata-store "` + testWantOxiaURL + `"`,
+		`--configuration-store "` + testWantOxiaURL + `"`,
+		`--web-service-url "http://test-cluster-broker:8080"`,
+		`--broker-service-url "pulsar://test-cluster-broker:6650"`,
 	}
-	if len(container.Args) != len(wantArgs) {
-		t.Fatalf("Args = %v, want %v", container.Args, wantArgs)
-	}
-	for i, want := range wantArgs {
-		if container.Args[i] != want {
-			t.Errorf("Args[%d] = %q, want %q", i, container.Args[i], want)
+	for _, want := range wantSubstrings {
+		if !strings.Contains(script, want) {
+			t.Errorf("script does not contain %q\nscript:\n%s", want, script)
 		}
+	}
+
+	// Regression (Bug A): bookies abort with "BookKeeper cluster not
+	// initialized" unless BookKeeper's own cluster metadata is bootstrapped
+	// before Pulsar's initialize-cluster-metadata runs.
+	if strings.Index(script, "initnewcluster") > strings.Index(script, "initialize-cluster-metadata") {
+		t.Errorf("bookkeeper initnewcluster must run before pulsar initialize-cluster-metadata:\n%s", script)
+	}
+
+	if len(container.VolumeMounts) != 1 || container.VolumeMounts[0].MountPath != bookieConfMountPath {
+		t.Errorf("VolumeMounts = %+v, want a single mount at %q", container.VolumeMounts, bookieConfMountPath)
+	}
+
+	wantCMName := testMetadataInitName
+	if len(job.Spec.Template.Spec.Volumes) != 1 || job.Spec.Template.Spec.Volumes[0].ConfigMap == nil ||
+		job.Spec.Template.Spec.Volumes[0].ConfigMap.Name != wantCMName {
+		t.Errorf("Volumes = %+v, want a configMap volume named %q", job.Spec.Template.Spec.Volumes, wantCMName)
 	}
 }
 
@@ -249,24 +296,35 @@ func TestBuildMetadataInitJobHonorsBrokerPortOverrides(t *testing.T) {
 		},
 	}
 
-	args := buildMetadataInitJob(cluster).Spec.Template.Spec.Containers[0].Args
+	script := buildMetadataInitJob(cluster).Spec.Template.Spec.Containers[0].Args[0]
 
-	assertArgValue(t, args, "--web-service-url", "http://test-cluster-broker:9090")
-	assertArgValue(t, args, "--broker-service-url", "pulsar://test-cluster-broker:7650")
+	if !strings.Contains(script, `--web-service-url "http://test-cluster-broker:9090"`) {
+		t.Errorf("script does not honor overridden web service port:\n%s", script)
+	}
+	if !strings.Contains(script, `--broker-service-url "pulsar://test-cluster-broker:7650"`) {
+		t.Errorf("script does not honor overridden broker service port:\n%s", script)
+	}
 }
 
-// assertArgValue asserts that flag appears in args immediately followed by want.
-func assertArgValue(t *testing.T, args []string, flag, want string) {
-	t.Helper()
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] == flag {
-			if args[i+1] != want {
-				t.Errorf("%s = %q, want %q", flag, args[i+1], want)
-			}
-			return
-		}
+func TestBuildMetadataInitConfigMap(t *testing.T) {
+	cluster := &clusterv1alpha1.PulsarCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetadataClusterName, Namespace: testMetadataNamespace},
+		Spec:       clusterv1alpha1.PulsarClusterSpec{Image: testClusterImage},
 	}
-	t.Errorf("flag %q not found in args %v", flag, args)
+
+	cm := buildMetadataInitConfigMap(cluster)
+
+	if cm.Name != testMetadataInitName {
+		t.Errorf("Name = %q, want %q", cm.Name, testMetadataInitName)
+	}
+	if cm.Namespace != testMetadataNamespace {
+		t.Errorf("Namespace = %q, want %q", cm.Namespace, testMetadataNamespace)
+	}
+
+	const wantURI = "metadataServiceUri=metadata-store:oxia://test-cluster-oxia-oxia:6648/bookkeeper\n"
+	if got := cm.Data[configMapKey]; got != wantURI {
+		t.Errorf("Data[%q] = %q, want %q", configMapKey, got, wantURI)
+	}
 }
 
 func TestMetadataInitializedCondition(t *testing.T) {

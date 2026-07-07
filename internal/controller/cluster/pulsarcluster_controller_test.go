@@ -345,7 +345,17 @@ var _ = Describe("PulsarCluster Controller", func() {
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-metadata-init", Namespace: namespace.Name}, metadataInitJob)).To(Succeed())
 		Expect(metav1.IsControlledBy(metadataInitJob, pulsarCluster)).To(BeTrue())
-		Expect(metadataInitJob.Spec.Template.Spec.Containers[0].Args).To(ContainElement(clusterName))
+		Expect(metadataInitJob.Spec.Template.Spec.Containers[0].Args).To(HaveLen(1))
+		script := metadataInitJob.Spec.Template.Spec.Containers[0].Args[0]
+		Expect(script).To(ContainSubstring(clusterName))
+		Expect(script).To(ContainSubstring("bin/bookkeeper shell initnewcluster"))
+		Expect(script).To(ContainSubstring("bin/pulsar initialize-cluster-metadata"))
+
+		By("wiring the BookKeeper metadataServiceUri into the Job's mounted config, same as the BookKeeper reconciler")
+		metadataInitConfigMap := &corev1.ConfigMap{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-metadata-init", Namespace: namespace.Name}, metadataInitConfigMap)).To(Succeed())
+		Expect(metav1.IsControlledBy(metadataInitConfigMap, pulsarCluster)).To(BeTrue())
+		Expect(metadataInitConfigMap.Data[configMapKey]).To(ContainSubstring(withBookKeeperMetadataDefault(nil, clusterName)[configKeyMetadataServiceURI]))
 
 		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
 		readyCond := apimeta.FindStatusCondition(pulsarCluster.Status.Conditions, conditionTypeReady)

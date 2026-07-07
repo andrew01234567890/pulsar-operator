@@ -43,6 +43,17 @@ const (
 	// declared in proxy_controller.go and shared package-wide).
 	configKeyMetadataServiceURI = "metadataServiceUri"
 
+	// configKeyBookkeeperMetadataServiceURI is broker.conf's key telling the
+	// broker's managed-ledger BookKeeper client where BookKeeper's OWN metadata
+	// lives. It must equal the bookies' metadataServiceUri (the "bookkeeper"
+	// Oxia namespace), NOT the broker's metadataStoreUrl (the "default"
+	// namespace): absent it, the broker's BookKeeper client looks for available
+	// bookies under its own metadata-store namespace, finds none, and every
+	// ledger create fails "Not enough non-faulty bookies available" (rc=-6)
+	// even though healthy, writable bookies are registered under the
+	// "bookkeeper" namespace.
+	configKeyBookkeeperMetadataServiceURI = "bookkeeperMetadataServiceUri"
+
 	// configKeyClusterName is broker.conf/proxy.conf's key naming the Pulsar
 	// cluster a component belongs to. Pulsar 5.0.0-M1 refuses to start
 	// without it: the broker errors "Required clusterName is null" and the
@@ -114,6 +125,16 @@ func withBookKeeperMetadataDefault(cfg map[string]string, clusterName string) ma
 	return setConfigDefault(cfg, configKeyMetadataServiceURI, uri)
 }
 
+// withBrokerBookkeeperMetadataDefault sets the broker's
+// bookkeeperMetadataServiceUri to the SAME metadata-store:oxia://.../bookkeeper
+// URI the bookies register under (see withBookKeeperMetadataDefault), unless
+// the user already set it. Without this the broker's BookKeeper client can't
+// find the bookies (see configKeyBookkeeperMetadataServiceURI).
+func withBrokerBookkeeperMetadataDefault(cfg map[string]string, clusterName string) map[string]string {
+	uri := oxiaurl.BookkeeperMetadataServiceURI(oxiaPublicServiceName(clusterName))
+	return setConfigDefault(cfg, configKeyBookkeeperMetadataServiceURI, uri)
+}
+
 // withFunctionsWorkerMetadataDefault sets configurationMetadataStoreUrl (the
 // only metadata-store key functions_worker.yml has) to the cluster's Oxia
 // metadata store, unless the user already set it.
@@ -162,21 +183,82 @@ func metadataInitBrokerServiceURLs(cluster *clusterv1alpha1.PulsarCluster) (web,
 	return web, broker
 }
 
-// buildMetadataInitJob renders the Job that runs `bin/pulsar
-// initialize-cluster-metadata` once against the cluster's Oxia metadata
-// store, registering the cluster's name and its broker/web service URLs -
-// the one-time bootstrap every Pulsar cluster needs before any broker can
-// serve traffic. It is a pure function of cluster so it is unit-testable
-// without a client; the caller sets the owner reference and creates it.
+// metadataInitScriptTemplate is the metadata-init Job's single container
+// script. BookKeeper has its OWN cluster metadata, separate from Pulsar's:
+// without initializing it first, bookies abort at startup with "BookKeeper
+// cluster not initialized" and the broker can never create its
+// loadbalancer-service-unit-state ledger ("Not enough non-faulty bookies
+// available", rc=-6), so broker and proxy crashloop forever. This mirrors
+// pulsar-helm-chart's separate bookkeeper-cluster-initialize.yaml Job, folded
+// into one script so the whole bootstrap stays a single idempotent Job:
+//   - `bin/bookkeeper shell whatisinstanceid` succeeding means BookKeeper's
+//     cluster metadata already exists, exactly the check-then-init guard the
+//     helm chart's own init job uses. `bin/bookkeeper shell initnewcluster` is
+//     NOT idempotent (it errors on an already-initialized cluster), so this
+//     guard is required both for a from-scratch idempotent Job and so a Job
+//     retry (RestartPolicy OnFailure, e.g. after initialize-cluster-metadata
+//     below fails transiently) never re-runs initnewcluster a second time.
+//   - `bin/pulsar initialize-cluster-metadata` then runs as before to
+//     initialize Pulsar's own cluster metadata (cluster name, default
+//     namespace, broker/web service URLs). It is deliberately NOT
+//     idempotent-guarded here: reconcileMetadataInitJob's alreadyInitialized
+//     short-circuit is what prevents ever recreating this Job (and thus ever
+//     re-running this line) once MetadataInitialized has gone True.
+//
+// BOOKIE_MEM/PULSAR_MEM are lowered to match pulsar-helm-chart's own init
+// jobs: the image's default JVM heap sizing is tuned for a running
+// broker/bookie, not a short-lived init Job, and can OOM-kill the pod under
+// constrained resource limits.
+const metadataInitScriptTemplate = `set -e
+export BOOKIE_MEM="-Xmx128M"
+export PULSAR_MEM="-Xmx128M"
+if bin/bookkeeper shell whatisinstanceid; then
+  echo "BookKeeper cluster metadata already initialized"
+else
+  bin/bookkeeper shell initnewcluster
+fi
+bin/pulsar initialize-cluster-metadata \
+  --cluster "%s" \
+  --metadata-store "%s" \
+  --configuration-store "%s" \
+  --web-service-url "%s" \
+  --broker-service-url "%s"
+`
+
+func buildMetadataInitScript(clusterName, storeURL, webServiceURL, brokerServiceURL string) string {
+	return fmt.Sprintf(metadataInitScriptTemplate, clusterName, storeURL, storeURL, webServiceURL, brokerServiceURL)
+}
+
+// buildMetadataInitConfigMap renders the bookkeeper.conf the metadata-init
+// Job's container mounts at bookieConfMountPath: just enough config
+// (metadataServiceUri, defaulted through the same withBookKeeperMetadataDefault
+// helper the BookKeeper reconciler itself uses, so the Job addresses the
+// identical Oxia-backed BookKeeper metadata store bookies will) for
+// `bin/bookkeeper shell whatisinstanceid`/`initnewcluster` to run against.
+func buildMetadataInitConfigMap(cluster *clusterv1alpha1.PulsarCluster) *corev1.ConfigMap {
+	labels := builder.Labels(cluster.Name, metadataInitComponentName)
+	rendered := config.RenderProperties(withBookKeeperMetadataDefault(nil, cluster.Name))
+	return builder.ConfigMap(metadataInitJobName(cluster.Name), cluster.Namespace, labels, map[string]string{configMapKey: rendered})
+}
+
+// buildMetadataInitJob renders the Job that bootstraps both BookKeeper's own
+// cluster metadata and Pulsar's cluster metadata against the cluster's Oxia
+// metadata store (see metadataInitScriptTemplate) - the one-time bootstrap
+// every Pulsar cluster needs before any bookie or broker can serve traffic.
+// It is a pure function of cluster so it is unit-testable without a client;
+// the caller reconciles buildMetadataInitConfigMap first, sets the owner
+// reference, and creates it.
 func buildMetadataInitJob(cluster *clusterv1alpha1.PulsarCluster) *batchv1.Job {
 	labels := builder.Labels(cluster.Name, metadataInitComponentName)
+	name := metadataInitJobName(cluster.Name)
 
 	storeURL := oxiaurl.MetadataStoreURL(oxiaPublicServiceName(cluster.Name), oxiaurl.DefaultNamespace)
 	webServiceURL, brokerServiceURL := metadataInitBrokerServiceURLs(cluster)
+	script := buildMetadataInitScript(cluster.Name, storeURL, webServiceURL, brokerServiceURL)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      metadataInitJobName(cluster.Name),
+			Name:      name,
 			Namespace: cluster.Namespace,
 			Labels:    labels,
 		},
@@ -190,14 +272,20 @@ func buildMetadataInitJob(cluster *clusterv1alpha1.PulsarCluster) *batchv1.Job {
 						{
 							Name:    metadataInitContainerName,
 							Image:   clusterDefaultImage(cluster.Spec),
-							Command: []string{cmdBinPulsar},
-							Args: []string{
-								"initialize-cluster-metadata",
-								"--cluster", cluster.Name,
-								"--metadata-store", storeURL,
-								"--configuration-store", storeURL,
-								"--web-service-url", webServiceURL,
-								"--broker-service-url", brokerServiceURL,
+							Command: []string{"sh", "-c"},
+							Args:    []string{script},
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: volumeNameConfig, MountPath: bookieConfMountPath, SubPath: configMapKey, ReadOnly: true},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: volumeNameConfig,
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{Name: name},
+								},
 							},
 						},
 					},
@@ -214,12 +302,23 @@ func buildMetadataInitJob(cluster *clusterv1alpha1.PulsarCluster) *batchv1.Job {
 // terminally-Failed Job was deleted to be retried). When a non-Oxia metadata
 // store is ever selected, the Job (like the OxiaCluster child) is pruned.
 func (r *PulsarClusterReconciler) reconcileMetadataInit(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, oxiaReady bool) (componentReport, bool, error) {
+	name := metadataInitJobName(cluster.Name)
+
 	if !oxiaSelected(cluster.Spec) {
-		job := &batchv1.Job{
-			ObjectMeta: metav1.ObjectMeta{Name: metadataInitJobName(cluster.Name), Namespace: cluster.Namespace},
-		}
+		job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace}}
 		report, err := pruneChild(ctx, r, metadataInitComponentName, job)
-		return report, false, err
+		if err != nil {
+			return report, false, err
+		}
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace}}
+		if err := r.Delete(ctx, cm); client.IgnoreNotFound(err) != nil {
+			return componentReport{}, false, fmt.Errorf("%s: pruning configmap: %w", metadataInitComponentName, err)
+		}
+		return report, false, nil
+	}
+
+	if err := r.reconcileMetadataInitConfigMap(ctx, cluster); err != nil {
+		return componentReport{}, false, fmt.Errorf("%s: %w", metadataInitComponentName, err)
 	}
 
 	alreadyInitialized := apimeta.IsStatusConditionTrue(cluster.Status.Conditions, conditionTypeMetadataInitialized)
@@ -239,6 +338,27 @@ func (r *PulsarClusterReconciler) reconcileMetadataInit(ctx context.Context, clu
 		reason:  cond.Reason,
 		message: cond.Message,
 	}, requeue, nil
+}
+
+// reconcileMetadataInitConfigMap ensures the metadata-init Job's
+// bookkeeper.conf ConfigMap (see buildMetadataInitConfigMap) exists and
+// carries the cluster's current Oxia-backed BookKeeper metadataServiceUri.
+// Reconciled unconditionally, not gated on the Job not yet existing, so a
+// ConfigMap deleted out from under a not-yet-created Job (or not yet
+// reconciled on a fresh cluster) is always in place before
+// reconcileMetadataInitJob creates the Job that mounts it; updating it after
+// the Job has already run is harmless since the Job's pod template - and
+// thus its volume mount - never changes once created.
+func (r *PulsarClusterReconciler) reconcileMetadataInitConfigMap(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster) error {
+	wanted := buildMetadataInitConfigMap(cluster)
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: wanted.Name, Namespace: wanted.Namespace}}
+
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+		cm.Labels = wanted.Labels
+		cm.Data = wanted.Data
+		return controllerutil.SetControllerReference(cluster, cm, r.Scheme)
+	})
+	return err
 }
 
 // reconcileMetadataInitJob creates the cluster-metadata-init Job once the
