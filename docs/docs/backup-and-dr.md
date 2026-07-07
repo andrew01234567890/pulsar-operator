@@ -21,6 +21,30 @@ retention tiering, not a backup mechanism**:
 - Deleting a topic deletes its offloaded data too. Offload is a storage tier
   for an existing topic, not a point-in-time recovery mechanism.
 
+### Offload requires an explicit offloader-capable image
+
+The tiered-storage offloader jars ship only in the `apachepulsar/pulsar-all`
+image, not the slim `apachepulsar/pulsar` image every other component
+defaults to. Earlier versions of `pulsar-operator` derived
+`apachepulsar/pulsar-all:<pulsarVersion>` automatically whenever `spec.offload`
+was set — but that tag is **not guaranteed to be published for every
+`pulsarVersion`**. At the `5.0.0-M1` milestone, for example, Docker Hub
+publishes `apachepulsar/pulsar-all` only up to the `4.x` series and
+`apachepulsar/pulsar:5.0.0-M1` (the slim image), with no matching
+`apachepulsar/pulsar-all:5.0.0-M1` tag. The auto-derived reference silently
+produced a broker image that doesn't exist, surfacing only as a confusing
+`ImagePullBackOff` well after the `PulsarCluster` was accepted.
+
+`pulsar-operator` now requires you to set an offloader-capable image
+explicitly — via `spec.image` (cluster-wide) or `spec.broker.image`
+(broker-only) — whenever `spec.offload` is configured. A `PulsarCluster` with
+`spec.offload` set and neither image field populated is **rejected at
+admission time** (CEL validation on the CRD) with a message pointing at this
+requirement, instead of being silently accepted and failing later at the pod
+level. Set the image to an `apachepulsar/pulsar-all` tag that is actually
+published for your Pulsar version, or to a custom image that bundles the
+offloader NARs.
+
 ## Oxia is TIER-0, and it has no native snapshot
 
 This is the load-bearing fact for this whole page: **Oxia holds Pulsar's

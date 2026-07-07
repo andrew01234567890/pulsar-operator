@@ -30,6 +30,16 @@ import (
 // mechanism: offloaded objects are only reachable through Pulsar's own
 // managed-ledger metadata, and are deleted along with the topic that
 // offloaded them (see docs/docs/backup-and-dr.md).
+//
+// The offloader jars ship only in apachepulsar/pulsar-all, not the slim
+// apachepulsar/pulsar image, so offload needs an offloader-capable image.
+// This file does NOT derive one: a PulsarClusterSpec XValidation rule
+// (api/cluster/v1alpha1/pulsarcluster_types.go) requires the user to set
+// spec.image or spec.broker.image explicitly whenever spec.offload is set,
+// since apachepulsar/pulsar-all:<pulsarVersion> is not guaranteed to be
+// published for every pulsarVersion (e.g. milestone releases like
+// 5.0.0-M1) and silently synthesizing that tag produced an
+// ImagePullBackOff instead of a clear error.
 
 const (
 	// offloadDriverAWSS3 / offloadDriverGCS / offloadDriverAzureBlob /
@@ -88,12 +98,6 @@ const (
 	gcsOffloadKeyDir            = "/etc/pulsar/offload-gcs"
 	gcsOffloadKeySecretKey      = "key.json"
 	gcsOffloadKeyPath           = gcsOffloadKeyDir + "/" + gcsOffloadKeySecretKey
-
-	// pulsarAllImageRepository is the Pulsar "full" image, which bundles the
-	// tiered-storage offloader NARs under offloadersDirectory (./offloaders by
-	// default) that the slim apachepulsar/pulsar image omits. A broker cannot
-	// offload without them.
-	pulsarAllImageRepository = "apachepulsar/pulsar-all"
 )
 
 // withBrokerOffloadDefaults sets managedLedgerOffloadDriver, its
@@ -143,16 +147,6 @@ func setConfigDefaultIfSet(cfg map[string]string, key, value string) map[string]
 		return cfg
 	}
 	return setConfigDefault(cfg, key, value)
-}
-
-// pulsarAllImage builds the apachepulsar/pulsar-all image reference pinned to
-// pulsarVersion, or "" when pulsarVersion is unset (mirrors
-// clusterDefaultImage's own empty-version fallback).
-func pulsarAllImage(pulsarVersion string) string {
-	if pulsarVersion == "" {
-		return ""
-	}
-	return pulsarAllImageRepository + ":" + pulsarVersion
 }
 
 // offloadCredentialEnv returns the env vars that wire spec.offload.

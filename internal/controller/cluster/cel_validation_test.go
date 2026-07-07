@@ -227,7 +227,8 @@ var _ = Describe("CEL admission validation", func() {
 			pc := &clusterv1alpha1.PulsarCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: "pc-cel-offload-invalid", Namespace: testNamespaceDefault},
 				Spec: clusterv1alpha1.PulsarClusterSpec{
-					Offload: &clusterv1alpha1.OffloadSpec{Driver: "aws-s3"},
+					Image:   testClusterImage,
+					Offload: &clusterv1alpha1.OffloadSpec{Driver: offloadDriverAWSS3},
 				},
 			}
 			err := k8sClient.Create(celCtx, pc)
@@ -240,7 +241,8 @@ var _ = Describe("CEL admission validation", func() {
 			pc := &clusterv1alpha1.PulsarCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: "pc-cel-offload-valid", Namespace: testNamespaceDefault},
 				Spec: clusterv1alpha1.PulsarClusterSpec{
-					Offload: &clusterv1alpha1.OffloadSpec{Driver: "aws-s3", Bucket: "my-bucket"},
+					Image:   testClusterImage,
+					Offload: &clusterv1alpha1.OffloadSpec{Driver: offloadDriverAWSS3, Bucket: "my-bucket"},
 				},
 			}
 			Expect(k8sClient.Create(celCtx, pc)).To(Succeed())
@@ -251,7 +253,62 @@ var _ = Describe("CEL admission validation", func() {
 			pc := &clusterv1alpha1.PulsarCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: "pc-cel-offload-filesystem", Namespace: testNamespaceDefault},
 				Spec: clusterv1alpha1.PulsarClusterSpec{
-					Offload: &clusterv1alpha1.OffloadSpec{Driver: "filesystem"},
+					Image:   testClusterImage,
+					Offload: &clusterv1alpha1.OffloadSpec{Driver: offloadDriverFilesystem},
+				},
+			}
+			Expect(k8sClient.Create(celCtx, pc)).To(Succeed())
+			Expect(k8sClient.Delete(celCtx, pc)).To(Succeed())
+		})
+
+		It("rejects offload with no explicit image anywhere", func() {
+			// Regression: the operator used to silently derive
+			// apachepulsar/pulsar-all:<pulsarVersion> for the broker in this
+			// exact situation - a tag that isn't guaranteed to be published
+			// (e.g. milestone releases like 5.0.0-M1) - producing an
+			// ImagePullBackOff instead of a clear error at admission time.
+			pc := &clusterv1alpha1.PulsarCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "pc-cel-offload-no-image", Namespace: testNamespaceDefault},
+				Spec: clusterv1alpha1.PulsarClusterSpec{
+					PulsarVersion: testPulsarVersion,
+					Offload:       &clusterv1alpha1.OffloadSpec{Driver: offloadDriverFilesystem},
+				},
+			}
+			err := k8sClient.Create(celCtx, pc)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("offload requires spec.image or spec.broker.image to be set explicitly"))
+		})
+
+		It("accepts offload with only the cluster-wide image set", func() {
+			pc := &clusterv1alpha1.PulsarCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "pc-cel-offload-cluster-image", Namespace: testNamespaceDefault},
+				Spec: clusterv1alpha1.PulsarClusterSpec{
+					Image:   testClusterImage,
+					Offload: &clusterv1alpha1.OffloadSpec{Driver: offloadDriverFilesystem},
+				},
+			}
+			Expect(k8sClient.Create(celCtx, pc)).To(Succeed())
+			Expect(k8sClient.Delete(celCtx, pc)).To(Succeed())
+		})
+
+		It("accepts offload with only the broker-level image set", func() {
+			pc := &clusterv1alpha1.PulsarCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "pc-cel-offload-broker-image", Namespace: testNamespaceDefault},
+				Spec: clusterv1alpha1.PulsarClusterSpec{
+					Broker:  &clusterv1alpha1.BrokerSpec{Image: testClusterImage},
+					Offload: &clusterv1alpha1.OffloadSpec{Driver: offloadDriverFilesystem},
+				},
+			}
+			Expect(k8sClient.Create(celCtx, pc)).To(Succeed())
+			Expect(k8sClient.Delete(celCtx, pc)).To(Succeed())
+		})
+
+		It("accepts a broker sub-spec with no image and no offload", func() {
+			pc := &clusterv1alpha1.PulsarCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "pc-cel-no-offload-no-image", Namespace: testNamespaceDefault},
+				Spec: clusterv1alpha1.PulsarClusterSpec{
+					Broker: &clusterv1alpha1.BrokerSpec{},
 				},
 			}
 			Expect(k8sClient.Create(celCtx, pc)).To(Succeed())

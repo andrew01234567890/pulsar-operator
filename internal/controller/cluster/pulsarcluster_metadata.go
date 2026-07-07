@@ -72,8 +72,25 @@ const (
 	reasonMetadataInitJobFailed      = "JobFailed"
 	reasonMetadataInitJobSucceeded   = "JobSucceeded"
 
+	// reasonMetadataInitImagePullError reports the metadata-init Job's pod
+	// stuck Waiting on ImagePullBackOff/ErrImagePull (see imagePullStuckInfo):
+	// unlike a terminally-Failed Job, a stuck pull never flips the Job's own
+	// Failed condition, so without this distinct reason the cluster would
+	// look like it's merely still JobRunning forever.
+	reasonMetadataInitImagePullError = "InitImagePullError"
+
 	metadataInitComponentName = "metadata-init"
 	metadataInitContainerName = "initialize-cluster-metadata"
+
+	// containerWaitingReasonImagePullBackOff/ErrImagePull are the kubelet
+	// Waiting-state reasons for a container whose image can't be pulled - a
+	// nonexistent tag, a private registry it lacks credentials for, etc. The
+	// pod never fails and is never recreated while in this state (the
+	// kubelet just keeps retrying the pull on the same pod, backing off up to
+	// ~5m between attempts), which is exactly why it never trips the Job's
+	// own BackoffLimit/Failed condition.
+	containerWaitingReasonImagePullBackOff = "ImagePullBackOff"
+	containerWaitingReasonErrImagePull     = "ErrImagePull"
 
 	// metadataInitBackoffLimit bounds the Job's own pod-level retries (the pod
 	// RestartPolicy is OnFailure) before the Job is marked Failed. Once it
@@ -83,8 +100,9 @@ const (
 	metadataInitBackoffLimit int32 = 6
 
 	// metadataInitRetryInterval spaces out the operator-level recreate of a
-	// terminally-Failed init Job so a hard misconfiguration doesn't spin in a
-	// tight delete/recreate loop.
+	// terminally-Failed init Job, or one stuck on an image pull (see
+	// imagePullStuckInfo), so a hard misconfiguration doesn't spin in a tight
+	// delete/recreate loop.
 	metadataInitRetryInterval = 30 * time.Second
 )
 
@@ -337,12 +355,13 @@ func (r *PulsarClusterReconciler) reconcileMetadataInit(ctx context.Context, clu
 
 	alreadyInitialized := apimeta.IsStatusConditionTrue(cluster.Status.Conditions, conditionTypeMetadataInitialized)
 
-	job, requeue, err := r.reconcileMetadataInitJob(ctx, cluster, oxiaReady, alreadyInitialized)
+	job, imagePull, requeue, err := r.reconcileMetadataInitJob(ctx, cluster, oxiaReady, alreadyInitialized)
 	if err != nil {
 		return componentReport{}, false, fmt.Errorf("%s: %w", metadataInitComponentName, err)
 	}
 
-	cond := metadataInitializedCondition(cluster.Generation, oxiaReady, job, alreadyInitialized)
+	cond := metadataInitializedCondition(cluster.Generation, oxiaReady, job, alreadyInitialized, imagePull)
+	r.recordMetadataInitImagePullEvent(cluster, cond, imagePull)
 	apimeta.SetStatusCondition(&cluster.Status.Conditions, cond)
 
 	return componentReport{
@@ -386,6 +405,16 @@ func (r *PulsarClusterReconciler) reconcileMetadataInitConfigMap(ctx context.Con
 // this cycle's status truthfully reports the failure; the returned bool then
 // asks the caller to requeue the retry.
 //
+// A Job whose pod is stuck Waiting on ImagePullBackOff/ErrImagePull (see
+// metadataInitImagePullStuck) never trips that Failed condition - the pod
+// just sits Pending forever - so it gets the same treatment via a second,
+// independent check: report it (imagePullStuckInfo, and the requeue bool) so
+// the caller surfaces it instead of looking silently stuck, and once it's
+// been stuck longer than metadataInitRetryInterval, delete the Job so the
+// next reconcile (after the caller's requeue) recreates it - self-healing
+// once the image becomes pullable, while the interval keeps a genuinely bad
+// image from spinning in a tight delete/recreate loop.
+//
 // alreadyInitialized short-circuits the NotFound case before it would
 // otherwise recreate the Job: initialize-cluster-metadata is NOT idempotent
 // (it errors if the cluster's metadata already exists), so once
@@ -394,7 +423,7 @@ func (r *PulsarClusterReconciler) reconcileMetadataInitConfigMap(ctx context.Con
 // an admin ran `kubectl delete job`, or a finished-Job TTL/cleanup policy
 // reaped it). Recreating it would rerun the non-idempotent command, fail, and
 // wedge the cluster Ready=False forever.
-func (r *PulsarClusterReconciler) reconcileMetadataInitJob(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, oxiaReady, alreadyInitialized bool) (*batchv1.Job, bool, error) {
+func (r *PulsarClusterReconciler) reconcileMetadataInitJob(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, oxiaReady, alreadyInitialized bool) (*batchv1.Job, imagePullStuckInfo, bool, error) {
 	job := &batchv1.Job{}
 	key := types.NamespacedName{Name: metadataInitJobName(cluster.Name), Namespace: cluster.Namespace}
 	err := r.Get(ctx, key, job)
@@ -402,29 +431,130 @@ func (r *PulsarClusterReconciler) reconcileMetadataInitJob(ctx context.Context, 
 	case err == nil:
 		if jobFailedPermanently(job) {
 			if delErr := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(delErr) != nil {
-				return nil, false, fmt.Errorf("deleting failed cluster-metadata-init job: %w", delErr)
+				return nil, imagePullStuckInfo{}, false, fmt.Errorf("deleting failed cluster-metadata-init job: %w", delErr)
 			}
-			return job, true, nil
+			return job, imagePullStuckInfo{}, true, nil
 		}
-		return job, false, nil
+
+		imagePull, err := r.metadataInitImagePullStuck(ctx, cluster, job)
+		if err != nil {
+			return nil, imagePullStuckInfo{}, false, err
+		}
+		if !imagePull.stuck {
+			return job, imagePullStuckInfo{}, false, nil
+		}
+		if r.now().Sub(imagePull.since) >= metadataInitRetryInterval {
+			if delErr := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(delErr) != nil {
+				return nil, imagePullStuckInfo{}, false, fmt.Errorf("deleting cluster-metadata-init job stuck on image pull: %w", delErr)
+			}
+		}
+		// Requeue even when the retry interval hasn't elapsed yet: once a Job
+		// stops changing (no further Failed/Succeeded/Active transitions),
+		// nothing else re-triggers this reconciler, so this is what keeps
+		// re-checking the elapsed time until it crosses the threshold above.
+		return job, imagePull, true, nil
 	case !apierrors.IsNotFound(err):
-		return nil, false, fmt.Errorf("getting cluster-metadata-init job: %w", err)
+		return nil, imagePullStuckInfo{}, false, fmt.Errorf("getting cluster-metadata-init job: %w", err)
 	case !oxiaReady:
-		return nil, false, nil
+		return nil, imagePullStuckInfo{}, false, nil
 	}
 
 	if alreadyInitialized {
-		return nil, false, nil
+		return nil, imagePullStuckInfo{}, false, nil
 	}
 
 	desired := buildMetadataInitJob(cluster)
 	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
-		return nil, false, fmt.Errorf("setting owner reference on cluster-metadata-init job: %w", err)
+		return nil, imagePullStuckInfo{}, false, fmt.Errorf("setting owner reference on cluster-metadata-init job: %w", err)
 	}
 	if err := r.Create(ctx, desired); err != nil {
-		return nil, false, fmt.Errorf("creating cluster-metadata-init job: %w", err)
+		return nil, imagePullStuckInfo{}, false, fmt.Errorf("creating cluster-metadata-init job: %w", err)
 	}
-	return desired, false, nil
+	return desired, imagePullStuckInfo{}, false, nil
+}
+
+// imagePullStuckInfo captures the metadata-init Job's pod being stuck
+// Waiting on an image it cannot pull (see
+// containerWaitingReasonImagePullBackOff/ErrImagePull). The zero value means
+// "not stuck". since is the stuck pod's own CreationTimestamp, not the time
+// this was observed: the pod is never recreated while stuck (the kubelet
+// retries the pull on the same pod), so it stays a stable measure of how
+// long the pull has been failing across reconciles, letting the caller rate
+// -limit the recreate to metadataInitRetryInterval without persisting its
+// own timestamp anywhere.
+type imagePullStuckInfo struct {
+	stuck  bool
+	image  string
+	reason string
+	since  time.Time
+}
+
+// metadataInitImagePullStuck inspects the metadata-init Job's own pod(s) for
+// its single container Waiting on ImagePullBackOff/ErrImagePull. Pods are
+// found via the component's stable selector labels (see builder.SelectorLabels)
+// and filtered to ones this specific job controls, which guards against a
+// stale pod from a just-deleted prior Job generation still existing under
+// the same labels during the delete/recreate race window.
+//
+// This is what makes a bad/nonexistent image tag visible at all: such a pod
+// stays Pending forever (see containerWaitingReasonImagePullBackOff) and so
+// never reaches the terminal Failed Job condition jobFailedPermanently
+// checks for - without this, the cluster looks like it's merely still
+// JobRunning, forever, which is the silent-wedge bug this guards against.
+func (r *PulsarClusterReconciler) metadataInitImagePullStuck(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, job *batchv1.Job) (imagePullStuckInfo, error) {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(cluster.Namespace), client.MatchingLabels(builder.SelectorLabels(cluster.Name, metadataInitComponentName))); err != nil {
+		return imagePullStuckInfo{}, fmt.Errorf("listing cluster-metadata-init pods: %w", err)
+	}
+
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, job) {
+			continue
+		}
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.Name != metadataInitContainerName || cs.State.Waiting == nil {
+				continue
+			}
+			switch cs.State.Waiting.Reason {
+			case containerWaitingReasonImagePullBackOff, containerWaitingReasonErrImagePull:
+				return imagePullStuckInfo{
+					stuck:  true,
+					image:  cs.Image,
+					reason: cs.State.Waiting.Reason,
+					since:  pod.CreationTimestamp.Time,
+				}, nil
+			}
+		}
+	}
+	return imagePullStuckInfo{}, nil
+}
+
+// recordMetadataInitImagePullEvent emits a Warning Event the first reconcile
+// the metadata-init Job's pod is observed stuck on an image pull, so the
+// failure is surfaced via `kubectl describe`/`get events` rather than the
+// operator merely looking stuck - but not on every later reconcile of the
+// same stuck state (e.g. the polling requeue in reconcileMetadataInitJob),
+// which would otherwise re-fire it every metadataInitRetryInterval.
+func (r *PulsarClusterReconciler) recordMetadataInitImagePullEvent(cluster *clusterv1alpha1.PulsarCluster, cond metav1.Condition, imagePull imagePullStuckInfo) {
+	if !imagePull.stuck {
+		return
+	}
+	prior := apimeta.FindStatusCondition(cluster.Status.Conditions, conditionTypeMetadataInitialized)
+	if prior != nil && prior.Reason == reasonMetadataInitImagePullError {
+		return
+	}
+	r.recorder().Eventf(cluster, nil, corev1.EventTypeWarning, reasonMetadataInitImagePullError, "MetadataInit", "%s", cond.Message)
+}
+
+// now returns the current time; nil Now defaults to time.Now. Tests override
+// it so metadataInitRetryInterval-gated recreate logic doesn't need a real
+// 30s sleep.
+func (r *PulsarClusterReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 // metadataInitializedCondition computes the MetadataInitialized condition
@@ -439,9 +569,10 @@ func (r *PulsarClusterReconciler) reconcileMetadataInitJob(ctx context.Context, 
 // (e.g. an Oxia pod restart) nor the Job object being deleted out from under
 // the operator (admin cleanup, finished-Job TTL) may ever flip
 // MetadataInitialized True->False and flap the umbrella's Ready. A
-// terminally-Failed Job is likewise reported regardless of Oxia readiness so
+// terminally-Failed Job, or one stuck on an image pull (see
+// imagePullStuckInfo), is likewise reported regardless of Oxia readiness so
 // the real failure isn't masked as "waiting for Oxia".
-func metadataInitializedCondition(generation int64, oxiaReady bool, job *batchv1.Job, alreadyInitialized bool) metav1.Condition {
+func metadataInitializedCondition(generation int64, oxiaReady bool, job *batchv1.Job, alreadyInitialized bool, imagePull imagePullStuckInfo) metav1.Condition {
 	base := metav1.Condition{Type: conditionTypeMetadataInitialized, ObservedGeneration: generation}
 
 	switch {
@@ -453,6 +584,10 @@ func metadataInitializedCondition(generation int64, oxiaReady bool, job *batchv1
 		base.Status = metav1.ConditionFalse
 		base.Reason = reasonMetadataInitJobFailed
 		base.Message = fmt.Sprintf("cluster-metadata-init job %s failed", job.Name)
+	case imagePull.stuck:
+		base.Status = metav1.ConditionFalse
+		base.Reason = reasonMetadataInitImagePullError
+		base.Message = fmt.Sprintf("cluster-metadata-init job %s cannot pull image %q: %s", job.Name, imagePull.image, imagePull.reason)
 	case !oxiaReady:
 		base.Status = metav1.ConditionFalse
 		base.Reason = reasonMetadataInitWaitingForOxia
