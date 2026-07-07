@@ -423,6 +423,13 @@ func (in *BookKeeperStatus) DeepCopyInto(out *BookKeeperStatus) {
 		*out = new(BookKeeperDecommissionStatus)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.BookieRacks != nil {
+		in, out := &in.BookieRacks, &out.BookieRacks
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))
