@@ -77,7 +77,7 @@ func runBackupSubcommand(name string, args []string) (handled bool, exitCode int
 		}
 		return true, 0
 	case backuptool.ImportCommandName:
-		if err := backuptool.RunImportCommand(context.Background(), args, os.Stdin, os.Stderr); err != nil {
+		if err := backuptool.RunImportCommand(context.Background(), args, os.Stdin, os.Stdout, os.Stderr); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return true, 1
 		}
@@ -329,8 +329,13 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&backupcontroller.RestoreReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("backup-restore"),
+		// The import Job runs this same operator image with the
+		// `manager backup-import` subcommand; OPERATOR_IMAGE is injected onto
+		// the controller-manager pod (config/manager/manager.yaml).
+		OperatorImage: os.Getenv("OPERATOR_IMAGE"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "backup-restore")
 		os.Exit(1)

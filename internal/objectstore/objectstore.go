@@ -44,6 +44,8 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"path/filepath"
+	"strings"
 )
 
 // Driver identifiers, mirroring backup/v1alpha1.BackupDestination.Driver's
@@ -81,6 +83,37 @@ type Config struct {
 	// several backups can share one bucket without collision. It is joined
 	// with the per-call key by Store implementations and by URI.
 	Prefix string
+
+	// The fields below are an EXCEPTION to the package doc's "credentials are
+	// never carried in Config" rule, added specifically for the Restore
+	// reconciler's cookie-lineage pre-flight check: unlike the export/import
+	// Job (which always runs in its own pod and picks up credentials from its
+	// own environment/mounted volume), the reconciler needs to peek at a
+	// manifest's header from inside the shared manager process, where it
+	// cannot safely mutate the process environment on every Restore's behalf.
+	// Instead it resolves the destination's credentialsSecretRef itself and
+	// passes the values through here. Left empty (the Job's own path always
+	// leaves them empty), every driver falls back to its normal
+	// environment/default-credential-chain behavior, unchanged.
+
+	// AWSAccessKeyID / AWSSecretAccessKey optionally provide a static AWS
+	// credential inline, bypassing the AWS SDK's default chain (env vars,
+	// shared config, IRSA/instance profile).
+	AWSAccessKeyID     string
+	AWSSecretAccessKey string
+
+	// AzureAccount / AzureAccessKey optionally provide an Azure shared-key
+	// credential inline instead of via the AZURE_STORAGE_ACCOUNT /
+	// AZURE_STORAGE_ACCESS_KEY environment variables.
+	AzureAccount   string
+	AzureAccessKey string
+
+	// GCSCredentialsJSON optionally provides a GCS service-account key inline
+	// instead of via GOOGLE_APPLICATION_CREDENTIALS (a mounted file path). A
+	// string (not []byte) so Config stays comparable with ==/!=, which
+	// existing tests (and BackupDestination-derived Config values in
+	// general) rely on.
+	GCSCredentialsJSON string
 }
 
 // DefaultFilesystemRoot is the base directory the filesystem driver writes
@@ -157,6 +190,67 @@ func resolveKey(cfg Config, key string) string {
 		return key
 	}
 	return path.Join(cfg.Prefix, key)
+}
+
+// KeyFromURI inverts URI: given the same cfg that produced uri, it recovers
+// the raw per-call key (relative to Config.Prefix) that a Store's
+// Upload/Download/URI expect. This is the Restore reconciler's counterpart to
+// a Backup's status.artifactURI - a Restore only carries the fully-qualified
+// URI (spec.source.artifactURI), but Store.Download needs a bare key, so this
+// recovers it without any I/O.
+func KeyFromURI(cfg Config, uri string) (string, error) {
+	scheme, ok := uriScheme(cfg.Driver)
+	if !ok {
+		return "", fmt.Errorf("objectstore: unsupported driver %q", cfg.Driver)
+	}
+	rest, ok := strings.CutPrefix(uri, scheme)
+	if !ok {
+		return "", fmt.Errorf("objectstore: artifact URI %q does not have the %s scheme expected for driver %q", uri, scheme, cfg.Driver)
+	}
+
+	if cfg.Driver == DriverFilesystem {
+		root := cfg.Bucket
+		if root == "" {
+			root = DefaultFilesystemRoot
+		}
+		base := filepath.Join(root, cfg.Prefix)
+		rel, err := filepath.Rel(base, rest)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("objectstore: artifact URI %q is not under %q", uri, base)
+		}
+		return rel, nil
+	}
+
+	bucketPrefix := cfg.Bucket + "/"
+	full, ok := strings.CutPrefix(rest, bucketPrefix)
+	if !ok {
+		return "", fmt.Errorf("objectstore: artifact URI %q does not belong to bucket %q", uri, cfg.Bucket)
+	}
+	if cfg.Prefix != "" {
+		keyPrefix := cfg.Prefix + "/"
+		key, ok := strings.CutPrefix(full, keyPrefix)
+		if !ok {
+			return "", fmt.Errorf("objectstore: artifact URI %q does not have prefix %q", uri, cfg.Prefix)
+		}
+		full = key
+	}
+	return full, nil
+}
+
+// uriScheme returns the URI scheme (including "://") a driver's URI uses.
+func uriScheme(driver string) (string, bool) {
+	switch driver {
+	case DriverAWSS3:
+		return "s3://", true
+	case DriverGCS:
+		return "gs://", true
+	case DriverAzureBlob:
+		return "azblob://", true
+	case DriverFilesystem:
+		return "file://", true
+	default:
+		return "", false
+	}
 }
 
 // IsNotExist reports whether err indicates the requested blob does not exist,

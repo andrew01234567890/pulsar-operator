@@ -23,6 +23,7 @@ import (
 	"io"
 
 	"cloud.google.com/go/storage"
+	"google.golang.org/api/option"
 )
 
 // gcsStore uploads/downloads blobs to a Google Cloud Storage bucket.
@@ -36,7 +37,20 @@ type gcsStore struct {
 }
 
 func newGCSStore(ctx context.Context, cfg Config) (*gcsStore, error) {
-	client, err := storage.NewClient(ctx)
+	var opts []option.ClientOption
+	if cfg.GCSCredentialsJSON != "" {
+		// An inline credential (see Config's doc) overrides the default
+		// Application Default Credentials chain - used by the Restore
+		// reconciler's in-process manifest-header peek, which resolves
+		// credentialsSecretRef itself rather than mounting a key file the
+		// way the export/import Job does. WithAuthCredentialsJSON (rather
+		// than the deprecated WithCredentialsJSON) pins the expected
+		// credential type: the Secret this comes from is documented (see
+		// BackupDestination) to hold a service-account key, exactly like the
+		// Job's own GOOGLE_APPLICATION_CREDENTIALS file mount expects.
+		opts = append(opts, option.WithAuthCredentialsJSON(option.ServiceAccount, []byte(cfg.GCSCredentialsJSON)))
+	}
+	client, err := storage.NewClient(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("objectstore: create GCS client: %w", err)
 	}

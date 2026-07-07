@@ -23,21 +23,23 @@ import (
 	"io"
 )
 
-// ImportResult summarizes an Import call, in the shape the Restore
-// reconciler (a follow-up) surfaces onto Restore.status.
+// ImportResult summarizes an Import call. Its JSON encoding is also the wire
+// contract the Restore reconciler's import Job writes to its container
+// termination message (see writeImportResult) and reads back (see
+// ParseImportResult); keep the tags stable.
 type ImportResult struct {
 	// CapturedInstanceID is the manifest header's BookKeeper instanceId,
 	// surfaced so the caller can run its own cookie-lineage check against
 	// the target cluster.
-	CapturedInstanceID string
+	CapturedInstanceID string `json:"capturedInstanceId"`
 
-	// KeysWritten is the number of non-ephemeral records Put into the
+	// KeysRestored is the number of non-ephemeral records Put into the
 	// target Oxia.
-	KeysWritten int64
+	KeysRestored int64 `json:"keysRestored"`
 
 	// KeysSkippedEphemeral is the number of ephemeral-flagged records
-	// skipped (see RecordVersion.Ephemeral).
-	KeysSkippedEphemeral int64
+	// skipped (see RecordVersion.Ephemeral and Importer.IncludeEphemeral).
+	KeysSkippedEphemeral int64 `json:"keysSkippedEphemeral"`
 }
 
 // Importer reads a manifest and re-applies its records into a target Oxia.
@@ -45,6 +47,15 @@ type Importer struct {
 	// NewClient creates a namespace-scoped Oxia client for the *target*
 	// Oxia the manifest is being replayed into. Required.
 	NewClient ClientFactory
+
+	// IncludeEphemeral replays ephemeral (session-scoped) records instead of
+	// skipping them. Defaults to false (skip): an ephemeral record is a
+	// stale lock/ownership claim from a session that, by restore time, no
+	// longer exists, so replaying it is almost always wrong. Restore's
+	// spec.skipEphemeral defaults to true (skip) for the same reason; this
+	// field is that default inverted, purely so the zero value preserves
+	// today's unconditional-skip behavior for any existing caller.
+	IncludeEphemeral bool
 }
 
 // Import reads a manifest from r and replays its non-ephemeral records into
@@ -113,7 +124,7 @@ func (imp *Importer) apply(ctx context.Context, header ManifestHeader, records [
 			return result, err
 		}
 
-		if rec.Version.Ephemeral {
+		if rec.Version.Ephemeral && !imp.IncludeEphemeral {
 			result.KeysSkippedEphemeral++
 			continue
 		}
@@ -131,7 +142,7 @@ func (imp *Importer) apply(ctx context.Context, header ManifestHeader, records [
 		if err := client.Put(ctx, rec.Key, rec.Value); err != nil {
 			return result, fmt.Errorf("backup: put key %q into namespace %q: %w", rec.Key, rec.Namespace, err)
 		}
-		result.KeysWritten++
+		result.KeysRestored++
 	}
 
 	return result, nil
