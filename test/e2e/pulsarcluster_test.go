@@ -546,7 +546,14 @@ func applyObject(obj any) error {
 // kubectl and unmarshals it into out, so assertions can use the project's own
 // real API types instead of fragile jsonpath string matching.
 func getJSON(resourceType, name string, out any) error {
-	cmd := exec.Command(kubectlBinary, "get", resourceType, name, "-n", pulsarClusterE2ENamespace, "-o", "json")
+	return getJSONNamespace(pulsarClusterE2ENamespace, resourceType, name, out)
+}
+
+// getJSONNamespace is getJSON's namespace-parameterized sibling, for e2e
+// specs (e.g. pulsarcluster_functionsworker_test.go) that run against their
+// own dedicated namespace rather than pulsarClusterE2ENamespace.
+func getJSONNamespace(namespace, resourceType, name string, out any) error {
+	cmd := exec.Command(kubectlBinary, "get", resourceType, name, "-n", namespace, "-o", "json")
 	output, err := utils.Run(cmd)
 	if err != nil {
 		return err
@@ -600,11 +607,18 @@ func jobSucceededE2E(job *batchv1.Job) bool {
 // e2e_test.go's AfterEach collects for the manager namespace, so a CI failure
 // in this Context is debuggable from the job log alone.
 func dumpPulsarClusterDiagnostics() {
-	const allKinds = "all,pulsarclusters,oxiaclusters,brokers,bookkeepers,proxies"
+	dumpNamespaceDiagnostics(pulsarClusterE2ENamespace)
+}
+
+// dumpNamespaceDiagnostics is dumpPulsarClusterDiagnostics's
+// namespace-parameterized sibling, reused by other e2e specs (e.g.
+// pulsarcluster_functionsworker_test.go) that run in their own namespace.
+func dumpNamespaceDiagnostics(namespace string) {
+	const allKinds = "all,pulsarclusters,oxiaclusters,brokers,bookkeepers,proxies,functionsworkers"
 	commands := [][]string{
-		{kubectlBinary, "get", allKinds, "-n", pulsarClusterE2ENamespace, "-o", "wide"},
-		{kubectlBinary, "get", "events", "-n", pulsarClusterE2ENamespace, "--sort-by=.lastTimestamp"},
-		{kubectlBinary, "describe", "pods", "-n", pulsarClusterE2ENamespace},
+		{kubectlBinary, "get", allKinds, "-n", namespace, "-o", "wide"},
+		{kubectlBinary, "get", "events", "-n", namespace, "--sort-by=.lastTimestamp"},
+		{kubectlBinary, "describe", "pods", "-n", namespace},
 	}
 	for _, c := range commands {
 		cmd := exec.Command(c[0], c[1:]...)

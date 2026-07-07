@@ -315,4 +315,100 @@ var _ = Describe("CEL admission validation", func() {
 			Expect(k8sClient.Delete(celCtx, pc)).To(Succeed())
 		})
 	})
+
+	// These specs are the admission-time regression guard for PR #39's two CEL
+	// rules on FunctionsWorkerSpec (api/cluster/v1alpha1/functionsworker_types.go):
+	// standalone mode and any non-FileSystem packageStorage both crash the
+	// broker/worker at startup against an Oxia-only metadata store (see that
+	// type's doc comment for the verified-against-Pulsar-source background), so
+	// both must be rejected by the real apiserver - not just accepted by a
+	// fake client - on both a bare FunctionsWorker and one embedded in a
+	// PulsarCluster.
+	Context("FunctionsWorker", func() {
+		It("rejects mode: standalone", func() {
+			fw := &clusterv1alpha1.FunctionsWorker{
+				ObjectMeta: metav1.ObjectMeta{Name: "fw-cel-standalone-invalid", Namespace: testNamespaceDefault},
+				Spec:       clusterv1alpha1.FunctionsWorkerSpec{Mode: functionsWorkerModeStandalone},
+			}
+			err := k8sClient.Create(celCtx, fw)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("standalone FunctionsWorker is unsupported on this Oxia-only operator"))
+			Expect(err.Error()).To(ContainSubstring("use mode: colocated instead"))
+		})
+
+		It("rejects a non-FileSystem packageStorage (S3PackagesStorage)", func() {
+			fw := &clusterv1alpha1.FunctionsWorker{
+				ObjectMeta: metav1.ObjectMeta{Name: "fw-cel-packagestorage-invalid", Namespace: testNamespaceDefault},
+				Spec:       clusterv1alpha1.FunctionsWorkerSpec{PackageStorage: "S3PackagesStorage"},
+			}
+			err := k8sClient.Create(celCtx, fw)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("only FileSystemPackagesStorage is supported on this Oxia-only operator"))
+			Expect(err.Error()).To(ContainSubstring("use packageStorage: FileSystemPackagesStorage"))
+		})
+
+		It("rejects a non-FileSystem packageStorage (GCSPackagesStorage)", func() {
+			fw := &clusterv1alpha1.FunctionsWorker{
+				ObjectMeta: metav1.ObjectMeta{Name: "fw-cel-packagestorage-gcs-invalid", Namespace: testNamespaceDefault},
+				Spec:       clusterv1alpha1.FunctionsWorkerSpec{PackageStorage: "GCSPackagesStorage"},
+			}
+			err := k8sClient.Create(celCtx, fw)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("only FileSystemPackagesStorage is supported on this Oxia-only operator"))
+		})
+
+		It("accepts the default (colocated mode, FileSystemPackagesStorage)", func() {
+			fw := &clusterv1alpha1.FunctionsWorker{
+				ObjectMeta: metav1.ObjectMeta{Name: "fw-cel-valid", Namespace: testNamespaceDefault},
+				Spec:       clusterv1alpha1.FunctionsWorkerSpec{},
+			}
+			Expect(k8sClient.Create(celCtx, fw)).To(Succeed())
+			Expect(fw.Spec.Mode).To(Equal("colocated"))
+			Expect(fw.Spec.PackageStorage).To(Equal("FileSystemPackagesStorage"))
+			Expect(k8sClient.Delete(celCtx, fw)).To(Succeed())
+		})
+
+		It("rejects a PulsarCluster whose embedded FunctionsWorker sets mode: standalone", func() {
+			pc := &clusterv1alpha1.PulsarCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "pc-cel-fw-standalone-invalid", Namespace: testNamespaceDefault},
+				Spec: clusterv1alpha1.PulsarClusterSpec{
+					Image:           testClusterImage,
+					FunctionsWorker: &clusterv1alpha1.FunctionsWorkerSpec{Mode: functionsWorkerModeStandalone},
+				},
+			}
+			err := k8sClient.Create(celCtx, pc)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("standalone FunctionsWorker is unsupported on this Oxia-only operator"))
+		})
+
+		It("rejects a PulsarCluster whose embedded FunctionsWorker sets a non-FileSystem packageStorage", func() {
+			pc := &clusterv1alpha1.PulsarCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "pc-cel-fw-packagestorage-invalid", Namespace: testNamespaceDefault},
+				Spec: clusterv1alpha1.PulsarClusterSpec{
+					Image:           testClusterImage,
+					FunctionsWorker: &clusterv1alpha1.FunctionsWorkerSpec{PackageStorage: "S3PackagesStorage"},
+				},
+			}
+			err := k8sClient.Create(celCtx, pc)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("only FileSystemPackagesStorage is supported on this Oxia-only operator"))
+		})
+
+		It("accepts a PulsarCluster with the default embedded FunctionsWorker (colocated, FileSystemPackagesStorage)", func() {
+			pc := &clusterv1alpha1.PulsarCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "pc-cel-fw-valid", Namespace: testNamespaceDefault},
+				Spec: clusterv1alpha1.PulsarClusterSpec{
+					Image:           testClusterImage,
+					FunctionsWorker: &clusterv1alpha1.FunctionsWorkerSpec{},
+				},
+			}
+			Expect(k8sClient.Create(celCtx, pc)).To(Succeed())
+			Expect(k8sClient.Delete(celCtx, pc)).To(Succeed())
+		})
+	})
 })

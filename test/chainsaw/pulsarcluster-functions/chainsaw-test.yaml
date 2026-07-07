@@ -1,0 +1,134 @@
+# Declarative reconcile-contract case for a colocated FunctionsWorker (mode
+# and packageStorage left at their CRD defaults: colocated +
+# FileSystemPackagesStorage) - the regression guard for PR #39's Fix A
+# (reconcileColocated used to be a no-op that never wired anything onto the
+# broker and reported Ready=True unconditionally). Like pulsarcluster-full and
+# pulsarcluster-oxia-only, this never waits for any pod to actually become
+# Ready (see test/e2e's Ginkgo suite, specifically
+# pulsarcluster_functionsworker_test.go, for the real-cluster path that does)
+# - every assertion here resolves as soon as the controllers' first reconcile
+# writes the child objects/status.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: pulsarcluster-functions
+spec:
+  steps:
+  - try:
+    - apply:
+        resource:
+          apiVersion: cluster.pulsaroperator.io/v1alpha1
+          kind: PulsarCluster
+          metadata:
+            name: functions
+          spec:
+            pulsarVersion: "5.0.0-M1"
+            broker:
+              replicas: 1
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 512Mi
+            bookKeeper:
+              replicas: 1
+              ensemble:
+                ensembleSize: 1
+                writeQuorum: 1
+                ackQuorum: 1
+              volumes:
+                journal:
+                  size: 1Gi
+                ledgers:
+                  size: 2Gi
+                index:
+                  size: 1Gi
+            oxia:
+              coordinator:
+                replicas: 1
+                resources:
+                  requests:
+                    cpu: 25m
+                    memory: 128Mi
+              server:
+                replicas: 1
+                storageSize: 1Gi
+                dbCacheSizeMb: 64
+              namespaces:
+              - name: default
+                initialShardCount: 1
+                replicationFactor: 1
+              - name: bookkeeper
+                initialShardCount: 1
+                replicationFactor: 1
+              allowExtraAuthorities: true
+            functionsWorker: {}
+
+    # The Broker child's spec.config is what wireFunctionsWorkerColocated
+    # actually writes (internal/controller/cluster/pulsarcluster_functionsworker.go);
+    # this is the declarative regression guard for Fix A landing on the
+    # broker at all, distinct from and complementing the e2e suite's stronger
+    # assertion against the broker's own rendered broker.conf ConfigMap.
+    - assert:
+        resource:
+          apiVersion: cluster.pulsaroperator.io/v1alpha1
+          kind: Broker
+          metadata:
+            name: functions-broker
+            ownerReferences:
+            - apiVersion: cluster.pulsaroperator.io/v1alpha1
+              kind: PulsarCluster
+              name: functions
+              controller: true
+          spec:
+            replicas: 1
+            config:
+              functionsWorkerEnabled: "true"
+              enablePackagesManagement: "true"
+              functionsWorkerEnablePackageManagement: "true"
+              packagesManagementStorageProvider: org.apache.pulsar.packages.management.storage.filesystem.FileSystemPackagesStorageProvider
+              STORAGE_PATH: /pulsar/packages-storage
+
+    # The shared FileSystemPackagesStorage PVC every broker pod mounts.
+    - assert:
+        resource:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: functions-functions-package-storage
+            ownerReferences:
+            - apiVersion: cluster.pulsaroperator.io/v1alpha1
+              kind: PulsarCluster
+              name: functions
+              controller: true
+          spec:
+            accessModes:
+            - ReadWriteOnce
+
+    # The FunctionsWorker child CR itself: PR #39's bug was a reconciler that
+    # never inspected this at all (Ready=True regardless), so its mere
+    # existence with the right owner is the minimum bar; the e2e suite
+    # additionally proves its Ready condition is truthfully mirrored from the
+    # sibling Broker.
+    - assert:
+        resource:
+          apiVersion: cluster.pulsaroperator.io/v1alpha1
+          kind: FunctionsWorker
+          metadata:
+            name: functions-functionsworker
+            ownerReferences:
+            - apiVersion: cluster.pulsaroperator.io/v1alpha1
+              kind: PulsarCluster
+              name: functions
+              controller: true
+
+    - assert:
+        resource:
+          apiVersion: cluster.pulsaroperator.io/v1alpha1
+          kind: PulsarCluster
+          metadata:
+            name: functions
+          status:
+            brokerPhase: NotReady
+            bookKeeperPhase: NotReady
+            oxiaPhase: NotReady
+            functionsWorkerPhase: NotReady
