@@ -54,21 +54,40 @@ const (
 	confKeyGCSOffloadBucket = "gcsManagedLedgerOffloadBucket"
 	confKeyGCSOffloadRegion = "gcsManagedLedgerOffloadRegion"
 
+	// confKeyGCSOffloadServiceAccountKeyFile names the FILESYSTEM PATH to the
+	// GCS service-account JSON key file the offloader reads. Unlike AWS/Azure
+	// (whose credential env vars ARE read as literal secret values), GCS
+	// authenticates from a key file on disk - GOOGLE_APPLICATION_CREDENTIALS is
+	// itself a path, not the credential content - so the operator mounts
+	// credentialsSecretRef as a secret volume and points this key at the mount
+	// path rather than injecting an env var.
+	confKeyGCSOffloadServiceAccountKeyFile = "gcsManagedLedgerOffloadServiceAccountKeyFile"
+
 	// confKeyAzureOffloadBucket is the Azure BlobStore ledger offload bucket
 	// key - upstream broker.conf has no azure-prefixed key, unlike s3/gcs; the
 	// jcloud azureblob provider reads the same generic
 	// managedLedgerOffloadBucket key.
 	confKeyAzureOffloadBucket = "managedLedgerOffloadBucket"
 
-	// Offload credential env vars, read by the jcloud BlobStore provider each
-	// driver selects. They are wired from spec.offload.credentialsSecretRef,
-	// which must contain a key matching each var name below for the selected
-	// driver.
-	envAWSAccessKeyID               = "AWS_ACCESS_KEY_ID"
-	envAWSSecretAccessKey           = "AWS_SECRET_ACCESS_KEY"
-	envGoogleApplicationCredentials = "GOOGLE_APPLICATION_CREDENTIALS"
-	envAzureStorageAccount          = "AZURE_STORAGE_ACCOUNT"
-	envAzureStorageAccessKey        = "AZURE_STORAGE_ACCESS_KEY"
+	// Offload credential env vars, read as literal secret values by the jcloud
+	// BlobStore provider each driver selects. They are wired from
+	// spec.offload.credentialsSecretRef, which must contain a key matching each
+	// var name below for the selected driver. GCS is deliberately absent: it
+	// authenticates from a mounted key file, not an env var (see
+	// offloadCredentialVolumes).
+	envAWSAccessKeyID        = "AWS_ACCESS_KEY_ID"
+	envAWSSecretAccessKey    = "AWS_SECRET_ACCESS_KEY"
+	envAzureStorageAccount   = "AZURE_STORAGE_ACCOUNT"
+	envAzureStorageAccessKey = "AZURE_STORAGE_ACCESS_KEY"
+
+	// offloadCredentialVolumeName / gcsOffloadKeyDir / gcsOffloadKeySecretKey /
+	// gcsOffloadKeyPath place the GCS service-account JSON key file at a fixed,
+	// well-known path inside the broker container. The referenced Secret must
+	// carry the JSON under the gcsOffloadKeySecretKey key.
+	offloadCredentialVolumeName = "offload-gcs-credentials"
+	gcsOffloadKeyDir            = "/etc/pulsar/offload-gcs"
+	gcsOffloadKeySecretKey      = "key.json"
+	gcsOffloadKeyPath           = gcsOffloadKeyDir + "/" + gcsOffloadKeySecretKey
 
 	// pulsarAllImageRepository is the Pulsar "full" image, which bundles the
 	// tiered-storage offloader NARs under offloadersDirectory (./offloaders by
@@ -97,6 +116,9 @@ func withBrokerOffloadDefaults(cfg map[string]string, offload *clusterv1alpha1.O
 	case offloadDriverGCS:
 		cfg = setConfigDefaultIfSet(cfg, confKeyGCSOffloadBucket, offload.Bucket)
 		cfg = setConfigDefaultIfSet(cfg, confKeyGCSOffloadRegion, offload.Region)
+		if offload.CredentialsSecretRef != nil {
+			cfg = setConfigDefault(cfg, confKeyGCSOffloadServiceAccountKeyFile, gcsOffloadKeyPath)
+		}
 	case offloadDriverAzureBlob:
 		cfg = setConfigDefaultIfSet(cfg, confKeyAzureOffloadBucket, offload.Bucket)
 	case offloadDriverFilesystem:
@@ -137,9 +159,10 @@ func pulsarAllImage(pulsarVersion string) string {
 // credentialsSecretRef into the broker container so the offloader driver can
 // authenticate, keyed by driver since each jcloud BlobStore provider reads a
 // different credential env var pair. It expects the referenced Secret to
-// contain a key named exactly like each returned env var. Filesystem offload
-// needs no credentials, and a nil offload or unset credentialsSecretRef
-// yields no env vars.
+// contain a key named exactly like each returned env var. GCS is deliberately
+// excluded: it authenticates from a mounted key file, not an env var (see
+// offloadCredentialVolumes). Filesystem offload needs no credentials, and a
+// nil offload or unset credentialsSecretRef yields no env vars.
 func offloadCredentialEnv(offload *clusterv1alpha1.OffloadSpec) []corev1.EnvVar {
 	if offload == nil || offload.CredentialsSecretRef == nil {
 		return nil
@@ -148,8 +171,6 @@ func offloadCredentialEnv(offload *clusterv1alpha1.OffloadSpec) []corev1.EnvVar 
 	switch offload.Driver {
 	case offloadDriverAWSS3:
 		return secretEnvVars(offload.CredentialsSecretRef.Name, envAWSAccessKeyID, envAWSSecretAccessKey)
-	case offloadDriverGCS:
-		return secretEnvVars(offload.CredentialsSecretRef.Name, envGoogleApplicationCredentials)
 	case offloadDriverAzureBlob:
 		return secretEnvVars(offload.CredentialsSecretRef.Name, envAzureStorageAccount, envAzureStorageAccessKey)
 	default:
@@ -173,4 +194,49 @@ func secretEnvVars(secretName string, keys ...string) []corev1.EnvVar {
 		})
 	}
 	return envVars
+}
+
+// offloadCredentialVolumes returns the pod volume(s) that project
+// spec.offload.credentialsSecretRef into the broker as a file, for drivers
+// that authenticate from a key file on disk rather than an env value. Only GCS
+// needs this today: gcsManagedLedgerOffloadServiceAccountKeyFile names a PATH
+// to the service-account JSON, so the secret's gcsOffloadKeySecretKey entry is
+// mounted at gcsOffloadKeyPath. AWS/Azure use env vars (offloadCredentialEnv);
+// a nil offload or unset credentialsSecretRef yields no volumes.
+func offloadCredentialVolumes(offload *clusterv1alpha1.OffloadSpec) []corev1.Volume {
+	if !gcsKeyFileMounted(offload) {
+		return nil
+	}
+	return []corev1.Volume{{
+		Name: offloadCredentialVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: offload.CredentialsSecretRef.Name,
+				Items: []corev1.KeyToPath{
+					{Key: gcsOffloadKeySecretKey, Path: gcsOffloadKeySecretKey},
+				},
+			},
+		},
+	}}
+}
+
+// offloadCredentialVolumeMounts returns the broker-container mount(s) paired
+// with offloadCredentialVolumes, placing the GCS service-account key file at
+// gcsOffloadKeyPath (the path gcsManagedLedgerOffloadServiceAccountKeyFile
+// points at).
+func offloadCredentialVolumeMounts(offload *clusterv1alpha1.OffloadSpec) []corev1.VolumeMount {
+	if !gcsKeyFileMounted(offload) {
+		return nil
+	}
+	return []corev1.VolumeMount{{
+		Name:      offloadCredentialVolumeName,
+		MountPath: gcsOffloadKeyDir,
+		ReadOnly:  true,
+	}}
+}
+
+// gcsKeyFileMounted reports whether a GCS service-account key file should be
+// mounted: the driver is google-cloud-storage and a credentials secret is set.
+func gcsKeyFileMounted(offload *clusterv1alpha1.OffloadSpec) bool {
+	return offload != nil && offload.Driver == offloadDriverGCS && offload.CredentialsSecretRef != nil
 }

@@ -119,6 +119,18 @@ type BrokerSpec struct {
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
+	// volumes are additional pod volumes for the broker, paired with
+	// VolumeMounts. The umbrella PulsarCluster reconciler uses these to mount a
+	// GCS tiered-storage service-account key file from
+	// spec.offload.credentialsSecretRef.
+	// +optional
+	Volumes []corev1.Volume `json:"volumes,omitempty"`
+
+	// volumeMounts are additional broker-container volume mounts, paired with
+	// Volumes.
+	// +optional
+	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
+
 	// resources are the compute resource requirements for the broker container.
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`

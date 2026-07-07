@@ -530,13 +530,15 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(broker.Spec.Config).To(HaveKeyWithValue("s3ManagedLedgerOffloadRegion", testOffloadRegion))
 		Expect(broker.Spec.Config).To(HaveKeyWithValue("managedLedgerOffloadAutoTriggerSizeThresholdBytes", "1073741824"))
 
-		By("wiring the credentials secret in as broker env vars")
+		By("wiring the credentials secret in as broker env vars (S3 reads them as literal values)")
 		envNames := make([]string, 0, len(broker.Spec.Env))
 		for _, e := range broker.Spec.Env {
 			envNames = append(envNames, e.Name)
 			Expect(e.ValueFrom.SecretKeyRef.Name).To(Equal("offload-creds"))
 		}
 		Expect(envNames).To(ConsistOf("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"))
+		Expect(broker.Spec.Volumes).To(BeEmpty())
+		Expect(broker.Spec.VolumeMounts).To(BeEmpty())
 
 		By("removing offload leaves the broker on the base image with no offload keys")
 		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
@@ -550,6 +552,47 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(broker.Spec.Image).To(Equal("apachepulsar/pulsar:" + testPulsarVersion))
 		Expect(broker.Spec.Config).NotTo(HaveKey("managedLedgerOffloadDriver"))
 		Expect(broker.Spec.Env).To(BeEmpty())
+	})
+
+	It("mounts the GCS service-account key as a file, not an env var", func() {
+		By("reconciling a cluster with google-cloud-storage offload configured")
+		pulsarCluster := &clusterv1alpha1.PulsarCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: namespace.Name,
+			},
+			Spec: clusterv1alpha1.PulsarClusterSpec{
+				PulsarVersion: testPulsarVersion,
+				Broker:        &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(1))},
+				Offload: &clusterv1alpha1.OffloadSpec{
+					Driver:               offloadDriverGCS,
+					Bucket:               testOffloadBucket,
+					Region:               testOffloadRegion,
+					CredentialsSecretRef: &corev1.LocalObjectReference{Name: testGCSCreds},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		broker := &clusterv1alpha1.Broker{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
+
+		By("setting the GCS offload keys, including the service-account key FILE path")
+		Expect(broker.Spec.Config).To(HaveKeyWithValue("managedLedgerOffloadDriver", "google-cloud-storage"))
+		Expect(broker.Spec.Config).To(HaveKeyWithValue("gcsManagedLedgerOffloadBucket", testOffloadBucket))
+		Expect(broker.Spec.Config).To(HaveKeyWithValue("gcsManagedLedgerOffloadServiceAccountKeyFile", gcsOffloadKeyPath))
+
+		By("mounting the credentials secret as a file and NOT wiring a credential env var")
+		Expect(broker.Spec.Env).To(BeEmpty())
+		Expect(broker.Spec.Volumes).To(HaveLen(1))
+		Expect(broker.Spec.Volumes[0].Secret).NotTo(BeNil())
+		Expect(broker.Spec.Volumes[0].Secret.SecretName).To(Equal(testGCSCreds))
+		Expect(broker.Spec.VolumeMounts).To(HaveLen(1))
+		Expect(broker.Spec.VolumeMounts[0].MountPath).To(Equal(gcsOffloadKeyDir))
+		Expect(broker.Spec.VolumeMounts[0].Name).To(Equal(broker.Spec.Volumes[0].Name))
 	})
 })
 

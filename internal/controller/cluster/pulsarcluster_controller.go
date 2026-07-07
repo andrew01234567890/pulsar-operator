@@ -368,8 +368,9 @@ func globalStorageClassName(spec clusterv1alpha1.PulsarClusterSpec) *string {
 // user set an explicit image of their own - either on the Broker sub-spec or
 // cluster-wide - which is left untouched since it may already be pulsar-all
 // or a custom build with offloaders baked in. It also wires
-// spec.offload.credentialsSecretRef in as broker container env vars so the
-// offloader driver can authenticate.
+// spec.offload.credentialsSecretRef into the broker so the offloader driver
+// can authenticate: as env vars for AWS/Azure (read as literal values), or as
+// a mounted key file for GCS (whose credential is a path to a JSON key file).
 func buildBrokerSpec(spec clusterv1alpha1.PulsarClusterSpec) *clusterv1alpha1.BrokerSpec {
 	out := spec.Broker.DeepCopy()
 	if out == nil {
@@ -386,6 +387,8 @@ func buildBrokerSpec(spec clusterv1alpha1.PulsarClusterSpec) *clusterv1alpha1.Br
 			}
 		}
 		out.Env = append(out.Env, offloadCredentialEnv(spec.Offload)...)
+		out.Volumes = append(out.Volumes, offloadCredentialVolumes(spec.Offload)...)
+		out.VolumeMounts = append(out.VolumeMounts, offloadCredentialVolumeMounts(spec.Offload)...)
 	}
 
 	return out
