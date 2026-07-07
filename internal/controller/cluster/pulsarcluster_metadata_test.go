@@ -260,14 +260,14 @@ func TestMetadataInitializedCondition(t *testing.T) {
 	const generation = int64(3)
 
 	t.Run("waiting for oxia", func(t *testing.T) {
-		got := metadataInitializedCondition(generation, false, nil)
+		got := metadataInitializedCondition(generation, false, nil, false)
 		if got.Status != metav1.ConditionFalse || got.Reason != reasonMetadataInitWaitingForOxia {
 			t.Errorf("got %+v, want False/%s", got, reasonMetadataInitWaitingForOxia)
 		}
 	})
 
 	t.Run("oxia ready but job not created yet", func(t *testing.T) {
-		got := metadataInitializedCondition(generation, true, nil)
+		got := metadataInitializedCondition(generation, true, nil, false)
 		if got.Status != metav1.ConditionFalse || got.Reason != reasonMetadataInitJobRunning {
 			t.Errorf("got %+v, want False/%s", got, reasonMetadataInitJobRunning)
 		}
@@ -275,7 +275,7 @@ func TestMetadataInitializedCondition(t *testing.T) {
 
 	t.Run("job running", func(t *testing.T) {
 		job := &batchv1.Job{}
-		got := metadataInitializedCondition(generation, true, job)
+		got := metadataInitializedCondition(generation, true, job, false)
 		if got.Status != metav1.ConditionFalse || got.Reason != reasonMetadataInitJobRunning {
 			t.Errorf("got %+v, want False/%s", got, reasonMetadataInitJobRunning)
 		}
@@ -283,7 +283,7 @@ func TestMetadataInitializedCondition(t *testing.T) {
 
 	t.Run("job succeeded via status count", func(t *testing.T) {
 		job := &batchv1.Job{Status: batchv1.JobStatus{Succeeded: 1}}
-		got := metadataInitializedCondition(generation, true, job)
+		got := metadataInitializedCondition(generation, true, job, false)
 		if got.Status != metav1.ConditionTrue || got.Reason != reasonMetadataInitJobSucceeded {
 			t.Errorf("got %+v, want True/%s", got, reasonMetadataInitJobSucceeded)
 		}
@@ -293,7 +293,7 @@ func TestMetadataInitializedCondition(t *testing.T) {
 		job := &batchv1.Job{Status: batchv1.JobStatus{
 			Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
 		}}
-		got := metadataInitializedCondition(generation, true, job)
+		got := metadataInitializedCondition(generation, true, job, false)
 		if got.Status != metav1.ConditionTrue || got.Reason != reasonMetadataInitJobSucceeded {
 			t.Errorf("got %+v, want True/%s", got, reasonMetadataInitJobSucceeded)
 		}
@@ -303,7 +303,7 @@ func TestMetadataInitializedCondition(t *testing.T) {
 		job := &batchv1.Job{Status: batchv1.JobStatus{
 			Conditions: []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue}},
 		}}
-		got := metadataInitializedCondition(generation, true, job)
+		got := metadataInitializedCondition(generation, true, job, false)
 		if got.Status != metav1.ConditionFalse || got.Reason != reasonMetadataInitJobFailed {
 			t.Errorf("got %+v, want False/%s", got, reasonMetadataInitJobFailed)
 		}
@@ -314,13 +314,30 @@ func TestMetadataInitializedCondition(t *testing.T) {
 		// A transient Oxia readiness blip (oxiaReady=false) must NOT flip a
 		// previously-succeeded MetadataInitialized back to False/WaitingForOxia.
 		job := &batchv1.Job{Status: batchv1.JobStatus{Succeeded: 1}}
-		got := metadataInitializedCondition(generation, false, job)
+		got := metadataInitializedCondition(generation, false, job, false)
 		if got.Status != metav1.ConditionTrue || got.Reason != reasonMetadataInitJobSucceeded {
 			t.Errorf("got %+v, want True/%s", got, reasonMetadataInitJobSucceeded)
 		}
 	})
 
-	if got := metadataInitializedCondition(generation, true, nil).Type; got != conditionTypeMetadataInitialized {
+	t.Run("already-initialized stays True when the Job object is absent (deleted succeeded Job)", func(t *testing.T) {
+		// Regression: a deleted succeeded Job (kubectl delete job, finished-Job
+		// TTL/cleanup) must not regress a previously-True MetadataInitialized
+		// to False/JobRunning or JobFailed - bootstrap is a permanent fact.
+		got := metadataInitializedCondition(generation, true, nil, true)
+		if got.Status != metav1.ConditionTrue || got.Reason != reasonMetadataInitJobSucceeded {
+			t.Errorf("got %+v, want True/%s", got, reasonMetadataInitJobSucceeded)
+		}
+	})
+
+	t.Run("already-initialized stays True even when oxia is not Ready and the Job is absent", func(t *testing.T) {
+		got := metadataInitializedCondition(generation, false, nil, true)
+		if got.Status != metav1.ConditionTrue || got.Reason != reasonMetadataInitJobSucceeded {
+			t.Errorf("got %+v, want True/%s", got, reasonMetadataInitJobSucceeded)
+		}
+	})
+
+	if got := metadataInitializedCondition(generation, true, nil, false).Type; got != conditionTypeMetadataInitialized {
 		t.Errorf("Type = %q, want %q", got, conditionTypeMetadataInitialized)
 	}
 }

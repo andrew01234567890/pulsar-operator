@@ -406,10 +406,11 @@ func brokerContainer(broker *clusterv1alpha1.Broker, ports brokerPorts) corev1.C
 			{Name: brokerPortName, ContainerPort: ports.binary},
 			{Name: httpPortName, ContainerPort: ports.http},
 		},
+		Env:       broker.Spec.Env,
 		Resources: broker.Spec.Resources,
-		VolumeMounts: []corev1.VolumeMount{
+		VolumeMounts: append([]corev1.VolumeMount{
 			{Name: configVolumeName, MountPath: brokerConfMountPath, SubPath: brokerConfFileName, ReadOnly: true},
-		},
+		}, broker.Spec.VolumeMounts...),
 		ReadinessProbe: brokerProbe(ports.http, 10, 10, 3),
 		LivenessProbe:  brokerProbe(ports.http, 30, 30, 5),
 		Lifecycle: &corev1.Lifecycle{
@@ -461,7 +462,7 @@ func desiredBrokerStatefulSetSpec(broker *clusterv1alpha1.Broker, name string, s
 				Affinity:                      brokerAffinity(broker.Spec.Antiaffinity, selectorLabels),
 				TopologySpreadConstraints:     builder.ZoneTopologySpreadConstraints(selectorLabels),
 				Containers:                    []corev1.Container{brokerContainer(broker, ports)},
-				Volumes: []corev1.Volume{
+				Volumes: append([]corev1.Volume{
 					{
 						Name: configVolumeName,
 						VolumeSource: corev1.VolumeSource{
@@ -470,7 +471,7 @@ func desiredBrokerStatefulSetSpec(broker *clusterv1alpha1.Broker, name string, s
 							},
 						},
 					},
-				},
+				}, broker.Spec.Volumes...),
 			},
 		},
 	}
