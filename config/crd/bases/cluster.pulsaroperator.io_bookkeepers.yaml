@@ -68,6 +68,17 @@ spec:
               autoscaler:
                 description: autoscaler configures the disk-watermark-driven autoscaler.
                 properties:
+                  decommissionTimeoutSeconds:
+                    default: 1800
+                    description: |-
+                      decommissionTimeoutSeconds bounds how long the guarded scale-down state
+                      machine waits, once a bookie is marked read-only, for re-replication to
+                      finish (zero ledgers on the target bookie and zero cluster-wide
+                      under-replicated ledgers) before auto-reverting the bookie to writable,
+                      clearing the decommission state, and raising a Warning condition.
+                    format: int32
+                    minimum: 60
+                    type: integer
                   diskUsageToleranceHwm:
                     default: 92
                     description: |-
@@ -335,6 +346,47 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              decommission:
+                description: |-
+                  decommission tracks the guarded, resumable bookie scale-down state
+                  machine's progress when one is in flight (triggered automatically or via
+                  AnnotationDrainBookieOrdinal). Persisting this on status, rather than
+                  holding it only in memory, is what lets the state machine resume after
+                  an operator restart instead of starting the decommission over. Absent
+                  when no decommission is running.
+                properties:
+                  manual:
+                    description: |-
+                      manual is true when this decommission was requested via
+                      AnnotationDrainBookieOrdinal rather than triggered automatically by the
+                      disk-watermark/under-replication guard.
+                    type: boolean
+                  message:
+                    description: |-
+                      message is a human-readable summary of the current phase, or of why the
+                      decommission was aborted/reverted/completed.
+                    type: string
+                  phase:
+                    description: phase is the state machine's current step.
+                    type: string
+                  startedAt:
+                    description: |-
+                      startedAt is when the state machine began. DecommissionTimeoutSeconds
+                      is measured from this timestamp.
+                    format: date-time
+                    type: string
+                  targetBookieId:
+                    description: |-
+                      targetBookieId is the BookKeeper bookie ID (host:port form) of the
+                      bookie being decommissioned.
+                    type: string
+                  targetOrdinal:
+                    description: |-
+                      targetOrdinal is the StatefulSet ordinal of the bookie being
+                      decommissioned.
+                    format: int32
+                    type: integer
+                type: object
               lastScaleTime:
                 description: |-
                   lastScaleTime is when the disk-watermark autoscaler last changed
