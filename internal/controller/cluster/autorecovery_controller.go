@@ -23,6 +23,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -90,6 +91,7 @@ type AutoRecoveryReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile drives an AutoRecovery toward its desired state for the
 // configured mode and reports readiness on its status.
@@ -145,6 +147,10 @@ func (r *AutoRecoveryReconciler) reconcileDedicated(ctx context.Context, autoRec
 		return metav1.Condition{}, err
 	}
 
+	if err := r.reconcilePDB(ctx, autoRecovery, labels, selector); err != nil {
+		return metav1.Condition{}, err
+	}
+
 	autoRecovery.Status.Replicas = deploy.Status.Replicas
 	autoRecovery.Status.ReadyReplicas = deploy.Status.ReadyReplicas
 
@@ -162,6 +168,11 @@ func (r *AutoRecoveryReconciler) reconcileEmbedded(ctx context.Context, autoReco
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: autoRecoveryConfigMapName(autoRecovery), Namespace: autoRecovery.Namespace}}
 	if err := deleteChildIfExists(ctx, r.Client, cm); err != nil {
 		return metav1.Condition{}, fmt.Errorf("deleting stale dedicated ConfigMap: %w", err)
+	}
+
+	pdb := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: autoRecovery.Name, Namespace: autoRecovery.Namespace}}
+	if err := deleteChildIfExists(ctx, r.Client, pdb); err != nil {
+		return metav1.Condition{}, fmt.Errorf("deleting stale dedicated PodDisruptionBudget: %w", err)
 	}
 
 	autoRecovery.Status.Replicas = 0
@@ -205,6 +216,14 @@ func (r *AutoRecoveryReconciler) reconcileDeployment(
 				Annotations: builder.WithConfigChecksum(deploy.Spec.Template.Annotations, renderedConf),
 			},
 			Spec: corev1.PodSpec{
+				// Dedicated autorecovery's Auditor performs quorum-sensitive
+				// leader election through the metadata store: co-locating
+				// two replicas on one node would let a single node loss take
+				// out enough of that group to disrupt the election, so
+				// anti-affinity here is hard, matching the other
+				// stateful/quorum tiers (bookie, oxia-server).
+				Affinity:                  builder.PodAntiAffinity(true, selector),
+				TopologySpreadConstraints: builder.ZoneTopologySpreadConstraints(selector),
 				Containers: []corev1.Container{{
 					Name:    autoRecoveryComponent,
 					Image:   autoRecoveryImage(autoRecovery.Spec.Image),
@@ -237,6 +256,25 @@ func (r *AutoRecoveryReconciler) reconcileDeployment(
 		return nil, err
 	}
 	return deploy, nil
+}
+
+// reconcilePDB bounds voluntary disruption of the dedicated autorecovery
+// replicas to a flat 1, NOT quorum math: the BookKeeper AutoRecovery Auditor
+// is leader-elected through the metadata store (ZooKeeper/Oxia), so exactly
+// one replica is the active auditor and the rest are idle standbys - there is
+// no peer majority-vote among the replicas to protect. Quorum math would
+// yield floor((replicas-1)/2)=0 at the default replica count (1) and at 2,
+// and a maxUnavailable=0 PDB denies every voluntary eviction, hanging
+// kubectl drain / cluster-autoscaler on any node hosting an auditor pod.
+func (r *AutoRecoveryReconciler) reconcilePDB(ctx context.Context, autoRecovery *clusterv1alpha1.AutoRecovery, labels, selector map[string]string) error {
+	pdb := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: autoRecovery.Name, Namespace: autoRecovery.Namespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
+		desired := builder.PodDisruptionBudget(pdb.Name, autoRecovery.Namespace, labels, selector, intstr.FromInt32(1))
+		pdb.Labels = desired.Labels
+		pdb.Spec = desired.Spec
+		return controllerutil.SetControllerReference(autoRecovery, pdb, r.Scheme)
+	})
+	return err
 }
 
 // deleteChildIfExists deletes obj (identified by the Name/Namespace
@@ -314,6 +352,7 @@ func (r *AutoRecoveryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&clusterv1alpha1.AutoRecovery{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
 		Named("cluster-autorecovery").
 		Complete(r)
 }

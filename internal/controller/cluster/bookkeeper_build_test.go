@@ -218,31 +218,40 @@ func TestResolveWriteQuorum(t *testing.T) {
 	}
 }
 
+// TestResolvePDBMaxUnavailable is the regression test for the bookie quorum
+// PDB math: maxUnavailable = max(writeQuorum-ackQuorum, 1), clamped to at
+// most replicas-1. It fails without the ackQuorum-aware formula - e.g. the
+// old replicas-writeQuorum formula returned 2 for the "3-AZ ensemble" case
+// below instead of the ack-quorum-safe 1.
 func TestResolvePDBMaxUnavailable(t *testing.T) {
 	tests := []struct {
 		name               string
 		replicas           int32
 		writeQuorum        int32
+		ackQuorum          int32
 		wantMaxUnavailable int32
 	}{
-		{name: "typical ensemble tolerates replicas-writeQuorum", replicas: 4, writeQuorum: 2, wantMaxUnavailable: 2},
-		{name: "replicas equal to writeQuorum tolerates none", replicas: 2, writeQuorum: 2, wantMaxUnavailable: 0},
-		{name: "replicas below writeQuorum never goes negative", replicas: 1, writeQuorum: 2, wantMaxUnavailable: 0},
+		{name: "prod default 2/2/2 ensemble has zero ack-quorum slack, clamped to 1", replicas: 4, writeQuorum: 2, ackQuorum: 2, wantMaxUnavailable: 1},
+		{name: "3-AZ recommended 3/3/2 ensemble has one bookie of ack-quorum slack", replicas: 4, writeQuorum: 3, ackQuorum: 2, wantMaxUnavailable: 1},
+		{name: "wide write quorum widens the safe slack", replicas: 6, writeQuorum: 5, ackQuorum: 2, wantMaxUnavailable: 3},
+		{name: "slack is capped at replicas-1, never evicting every bookie", replicas: 2, writeQuorum: 2, ackQuorum: 2, wantMaxUnavailable: 1},
+		{name: "single bookie blocks all voluntary disruption", replicas: 1, writeQuorum: 2, ackQuorum: 2, wantMaxUnavailable: 0},
+		{name: "zero replicas never goes negative", replicas: 0, writeQuorum: 2, ackQuorum: 2, wantMaxUnavailable: 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := resolvePDBMaxUnavailable(tt.replicas, tt.writeQuorum)
+			got := resolvePDBMaxUnavailable(tt.replicas, tt.writeQuorum, tt.ackQuorum)
 			want := intstr.FromInt32(tt.wantMaxUnavailable)
 			if got != want {
-				t.Errorf("resolvePDBMaxUnavailable(%d, %d) = %v, want %v", tt.replicas, tt.writeQuorum, got, want)
+				t.Errorf("resolvePDBMaxUnavailable(%d, %d, %d) = %v, want %v", tt.replicas, tt.writeQuorum, tt.ackQuorum, got, want)
 			}
 		})
 	}
 }
 
 // TestDesiredPDB_MaxUnavailable pins the quorum-derived maxUnavailable for the
-// default (unset) spec: 4 default replicas minus the default write quorum of 2
-// leaves a bookie loss budget of 2.
+// default (unset) spec: default write/ack quorum are both 2, so the ack-quorum
+// slack is 0, clamped up to the practical floor of 1.
 func TestDesiredPDB_MaxUnavailable(t *testing.T) {
 	bk := &clusterv1alpha1.BookKeeper{
 		ObjectMeta: metav1.ObjectMeta{Name: testBookieName, Namespace: testNamespaceDefault},
@@ -253,8 +262,8 @@ func TestDesiredPDB_MaxUnavailable(t *testing.T) {
 	if pdb.Spec.MaxUnavailable == nil {
 		t.Fatalf("desiredPDB().Spec.MaxUnavailable = nil, want set")
 	}
-	if got := *pdb.Spec.MaxUnavailable; got != intstr.FromInt32(2) {
-		t.Errorf("desiredPDB() maxUnavailable = %v, want 2 (defaultReplicas 4 - defaultWriteQuorum 2)", got)
+	if got := *pdb.Spec.MaxUnavailable; got != intstr.FromInt32(1) {
+		t.Errorf("desiredPDB() maxUnavailable = %v, want 1 (defaultWriteQuorum 2 - defaultAckQuorum 2 clamped to 1)", got)
 	}
 }
 

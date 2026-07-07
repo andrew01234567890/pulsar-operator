@@ -458,6 +458,8 @@ func desiredBrokerStatefulSetSpec(broker *clusterv1alpha1.Broker, name string, s
 			},
 			Spec: corev1.PodSpec{
 				TerminationGracePeriodSeconds: &gracePeriod,
+				Affinity:                      brokerAffinity(broker.Spec.Antiaffinity, selectorLabels),
+				TopologySpreadConstraints:     builder.ZoneTopologySpreadConstraints(selectorLabels),
 				Containers:                    []corev1.Container{brokerContainer(broker, ports)},
 				Volumes: []corev1.Volume{
 					{
@@ -472,6 +474,20 @@ func desiredBrokerStatefulSetSpec(broker *clusterv1alpha1.Broker, name string, s
 			},
 		},
 	}
+}
+
+// brokerAffinity returns the broker's pod anti-affinity, honoring
+// BrokerSpec.Antiaffinity when set. Brokers are stateless (losing a broker
+// only migrates its bundles, not data), so the operator default is soft
+// (host=false); a caller can opt into hard node anti-affinity via
+// antiaffinity.host, or turn anti-affinity off entirely via
+// antiaffinity.enabled=false.
+func brokerAffinity(spec *clusterv1alpha1.AntiAffinityConfig, selectorLabels map[string]string) *corev1.Affinity {
+	if spec != nil && spec.Enabled != nil && !*spec.Enabled {
+		return nil
+	}
+	hard := spec != nil && spec.Host != nil && *spec.Host
+	return builder.PodAntiAffinity(hard, selectorLabels)
 }
 
 // SetupWithManager sets up the controller with the Manager.
