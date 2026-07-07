@@ -28,6 +28,7 @@ import (
 
 const (
 	testMetadataClusterName = "test-cluster"
+	testMetadataNamespace   = "pulsar-ns"
 
 	// testWantOxiaURL is the oxia:// metadataStoreUrl/configurationMetadataStoreUrl
 	// the umbrella reconciler injects for testMetadataClusterName's Oxia child.
@@ -169,7 +170,7 @@ func TestMetadataInitJobName(t *testing.T) {
 
 func TestBuildMetadataInitJob(t *testing.T) {
 	cluster := &clusterv1alpha1.PulsarCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: testMetadataClusterName, Namespace: "pulsar-ns"},
+		ObjectMeta: metav1.ObjectMeta{Name: testMetadataClusterName, Namespace: testMetadataNamespace},
 		Spec:       clusterv1alpha1.PulsarClusterSpec{Image: testClusterImage},
 	}
 
@@ -178,11 +179,14 @@ func TestBuildMetadataInitJob(t *testing.T) {
 	if job.Name != "test-cluster-metadata-init" {
 		t.Errorf("Name = %q, want %q", job.Name, "test-cluster-metadata-init")
 	}
-	if job.Namespace != "pulsar-ns" {
-		t.Errorf("Namespace = %q, want %q", job.Namespace, "pulsar-ns")
+	if job.Namespace != testMetadataNamespace {
+		t.Errorf("Namespace = %q, want %q", job.Namespace, testMetadataNamespace)
 	}
 	if job.Spec.Template.Spec.RestartPolicy != corev1.RestartPolicyOnFailure {
 		t.Errorf("RestartPolicy = %q, want %q", job.Spec.Template.Spec.RestartPolicy, corev1.RestartPolicyOnFailure)
+	}
+	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != metadataInitBackoffLimit {
+		t.Errorf("BackoffLimit = %v, want %d", job.Spec.BackoffLimit, metadataInitBackoffLimit)
 	}
 	if len(job.Spec.Template.Spec.Containers) != 1 {
 		t.Fatalf("Containers = %d, want 1", len(job.Spec.Template.Spec.Containers))
@@ -212,6 +216,44 @@ func TestBuildMetadataInitJob(t *testing.T) {
 			t.Errorf("Args[%d] = %q, want %q", i, container.Args[i], want)
 		}
 	}
+}
+
+// Regression: initialize-cluster-metadata PERSISTS the advertised broker/web
+// URLs in Oxia, so the Job must build them from the broker's real (possibly
+// overridden) ports - the same brokerServicePort/webServicePort the Broker
+// reconciler binds - not the hardcoded defaults.
+func TestBuildMetadataInitJobHonorsBrokerPortOverrides(t *testing.T) {
+	cluster := &clusterv1alpha1.PulsarCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetadataClusterName, Namespace: testMetadataNamespace},
+		Spec: clusterv1alpha1.PulsarClusterSpec{
+			Image: testClusterImage,
+			Broker: &clusterv1alpha1.BrokerSpec{
+				Config: map[string]string{
+					confKeyBrokerServicePort: "7650",
+					confKeyWebServicePort:    "9090",
+				},
+			},
+		},
+	}
+
+	args := buildMetadataInitJob(cluster).Spec.Template.Spec.Containers[0].Args
+
+	assertArgValue(t, args, "--web-service-url", "http://test-cluster-broker:9090")
+	assertArgValue(t, args, "--broker-service-url", "pulsar://test-cluster-broker:7650")
+}
+
+// assertArgValue asserts that flag appears in args immediately followed by want.
+func assertArgValue(t *testing.T, args []string, flag, want string) {
+	t.Helper()
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag {
+			if args[i+1] != want {
+				t.Errorf("%s = %q, want %q", flag, args[i+1], want)
+			}
+			return
+		}
+	}
+	t.Errorf("flag %q not found in args %v", flag, args)
 }
 
 func TestMetadataInitializedCondition(t *testing.T) {
@@ -264,6 +306,17 @@ func TestMetadataInitializedCondition(t *testing.T) {
 		got := metadataInitializedCondition(generation, true, job)
 		if got.Status != metav1.ConditionFalse || got.Reason != reasonMetadataInitJobFailed {
 			t.Errorf("got %+v, want False/%s", got, reasonMetadataInitJobFailed)
+		}
+	})
+
+	t.Run("succeeded job stays True even when oxia is not Ready (monotonic)", func(t *testing.T) {
+		// Regression: cluster-metadata bootstrap is a permanent one-time fact.
+		// A transient Oxia readiness blip (oxiaReady=false) must NOT flip a
+		// previously-succeeded MetadataInitialized back to False/WaitingForOxia.
+		job := &batchv1.Job{Status: batchv1.JobStatus{Succeeded: 1}}
+		got := metadataInitializedCondition(generation, false, job)
+		if got.Status != metav1.ConditionTrue || got.Reason != reasonMetadataInitJobSucceeded {
+			t.Errorf("got %+v, want True/%s", got, reasonMetadataInitJobSucceeded)
 		}
 	})
 

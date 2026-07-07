@@ -146,7 +146,7 @@ func (r *PulsarClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	cluster.Status.OxiaPhase = componentPhase(oxiaReport)
 	reports = append(reports, oxiaReport)
 
-	metadataInitReport, err := r.reconcileMetadataInit(ctx, cluster, oxiaReport.ready)
+	metadataInitReport, requeueMetadataInit, err := r.reconcileMetadataInit(ctx, cluster, oxiaReport.ready)
 	if err != nil {
 		log.Error(err, "failed to reconcile cluster-metadata-init Job")
 		return ctrl.Result{}, err
@@ -160,6 +160,9 @@ func (r *PulsarClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("updating PulsarCluster status: %w", err)
 	}
 
+	if requeueMetadataInit {
+		return ctrl.Result{RequeueAfter: metadataInitRetryInterval}, nil
+	}
 	return ctrl.Result{}, nil
 }
 

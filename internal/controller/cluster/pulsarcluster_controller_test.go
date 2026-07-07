@@ -363,6 +363,70 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(apimeta.IsStatusConditionTrue(pulsarCluster.Status.Conditions, conditionTypeReady)).To(BeTrue())
 		Expect(apimeta.IsStatusConditionTrue(pulsarCluster.Status.Conditions, conditionTypeMetadataInitialized)).To(BeTrue())
 	})
+
+	It("reports a terminally-failed metadata-init Job and retries it instead of wedging the cluster", func() {
+		pulsarCluster := &clusterv1alpha1.PulsarCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: namespace.Name,
+			},
+			Spec: clusterv1alpha1.PulsarClusterSpec{
+				Broker: &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(1))},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
+
+		By("reconciling, marking Oxia Ready, and reconciling again to create the Job")
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		oxia := &metadatav1alpha1.OxiaCluster{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-oxia", Namespace: namespace.Name}, oxia)).To(Succeed())
+		oxia.Status.Conditions = []metav1.Condition{readyConditionForGeneration(oxia.Generation, "all oxia pods ready")}
+		Expect(k8sClient.Status().Update(ctx, oxia)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		metadataInitJob := &batchv1.Job{}
+		jobKey := types.NamespacedName{Name: clusterName + "-metadata-init", Namespace: namespace.Name}
+		Expect(k8sClient.Get(ctx, jobKey, metadataInitJob)).To(Succeed())
+
+		By("marking the Job terminally Failed")
+		// The apiserver validates Job status transitions: Failed=True requires
+		// a FailureTarget=true condition and a startTime for a finished Job.
+		startTime := metav1.Now()
+		metadataInitJob.Status.StartTime = &startTime
+		metadataInitJob.Status.Conditions = []batchv1.JobCondition{
+			{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"},
+			{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"},
+		}
+		Expect(k8sClient.Status().Update(ctx, metadataInitJob)).To(Succeed())
+
+		By("re-reconciling and observing MetadataInitialized=False/JobFailed and Ready still False")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		initCond := apimeta.FindStatusCondition(pulsarCluster.Status.Conditions, conditionTypeMetadataInitialized)
+		Expect(initCond).NotTo(BeNil())
+		Expect(initCond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(initCond.Reason).To(Equal(reasonMetadataInitJobFailed))
+		Expect(apimeta.IsStatusConditionFalse(pulsarCluster.Status.Conditions, conditionTypeReady)).To(BeTrue())
+
+		By("retrying rather than wedging: the failed Job is deleted and recreated fresh on the next reconcile")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		retried := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, jobKey, retried)).To(Succeed())
+		Expect(jobFailedPermanently(retried)).To(BeFalse())
+
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		retriedCond := apimeta.FindStatusCondition(pulsarCluster.Status.Conditions, conditionTypeMetadataInitialized)
+		Expect(retriedCond).NotTo(BeNil())
+		Expect(retriedCond.Reason).To(Equal(reasonMetadataInitJobRunning))
+	})
 })
 
 // readyConditionForGeneration builds a Ready=True metav1.Condition observed

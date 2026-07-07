@@ -19,6 +19,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -26,10 +27,12 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	clusterv1alpha1 "github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1"
 	"github.com/andrew01234567890/pulsar-operator/internal/builder"
+	"github.com/andrew01234567890/pulsar-operator/internal/config"
 	oxiaurl "github.com/andrew01234567890/pulsar-operator/internal/metadata"
 )
 
@@ -54,6 +57,18 @@ const (
 
 	metadataInitComponentName = "metadata-init"
 	metadataInitContainerName = "initialize-cluster-metadata"
+
+	// metadataInitBackoffLimit bounds the Job's own pod-level retries (the pod
+	// RestartPolicy is OnFailure) before the Job is marked Failed. Once it
+	// exhausts these, the operator deletes and recreates the Job for a fresh
+	// attempt, so a transient dependency (e.g. Oxia not yet accepting writes)
+	// never wedges the cluster on a terminally-Failed Job.
+	metadataInitBackoffLimit int32 = 6
+
+	// metadataInitRetryInterval spaces out the operator-level recreate of a
+	// terminally-Failed init Job so a hard misconfiguration doesn't spin in a
+	// tight delete/recreate loop.
+	metadataInitRetryInterval = 30 * time.Second
 )
 
 // oxiaPublicServiceName returns the Service name Pulsar/BookKeeper/
@@ -114,6 +129,26 @@ func metadataInitJobName(clusterName string) string {
 	return clusterName + "-metadata-init"
 }
 
+// metadataInitBrokerServiceURLs derives the broker's advertised web and
+// binary service URLs the same way the Broker reconciler binds its ports:
+// from the merged broker.conf, so a user override of webServicePort/
+// brokerServicePort is honored here too. This matters because
+// initialize-cluster-metadata PERSISTS these URLs in Oxia as the cluster's
+// advertised addresses (used for cross-cluster lookup / geo-replication);
+// hardcoding the defaults would silently register the wrong ports whenever a
+// user overrides them. When no Broker is configured, the CRD-default ports
+// are used (the Service name is still deterministic).
+func metadataInitBrokerServiceURLs(cluster *clusterv1alpha1.PulsarCluster) (web, broker string) {
+	svc := childName(cluster.Name, brokerComponent)
+	ports := brokerPorts{binary: defaultBrokerServicePort, http: defaultWebServicePort}
+	if cluster.Spec.Broker != nil {
+		ports = resolveBrokerPorts(config.Merge(defaultBrokerConfig(*cluster.Spec.Broker), cluster.Spec.Broker.Config))
+	}
+	web = fmt.Sprintf("http://%s:%d", svc, ports.http)
+	broker = fmt.Sprintf("pulsar://%s:%d", svc, ports.binary)
+	return web, broker
+}
+
 // buildMetadataInitJob renders the Job that runs `bin/pulsar
 // initialize-cluster-metadata` once against the cluster's Oxia metadata
 // store, registering the cluster's name and its broker/web service URLs -
@@ -124,9 +159,7 @@ func buildMetadataInitJob(cluster *clusterv1alpha1.PulsarCluster) *batchv1.Job {
 	labels := builder.Labels(cluster.Name, metadataInitComponentName)
 
 	storeURL := oxiaurl.MetadataStoreURL(oxiaPublicServiceName(cluster.Name), oxiaurl.DefaultNamespace)
-	brokerSvc := childName(cluster.Name, brokerComponent)
-	webServiceURL := fmt.Sprintf("http://%s:%d", brokerSvc, defaultWebServicePort)
-	brokerServiceURL := fmt.Sprintf("pulsar://%s:%d", brokerSvc, defaultBrokerServicePort)
+	webServiceURL, brokerServiceURL := metadataInitBrokerServiceURLs(cluster)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -135,6 +168,7 @@ func buildMetadataInitJob(cluster *clusterv1alpha1.PulsarCluster) *batchv1.Job {
 			Labels:    labels,
 		},
 		Spec: batchv1.JobSpec{
+			BackoffLimit: ptrInt32(metadataInitBackoffLimit),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
@@ -163,19 +197,21 @@ func buildMetadataInitJob(cluster *clusterv1alpha1.PulsarCluster) *batchv1.Job {
 // reconcileMetadataInit reconciles the cluster-metadata-init Job and reports
 // it as a componentReport so it participates in the umbrella Ready rollup
 // exactly like a child component: the cluster is not Ready until the Job has
-// succeeded. When a non-Oxia metadata store is ever selected, the Job (like
-// the OxiaCluster child) is pruned instead.
-func (r *PulsarClusterReconciler) reconcileMetadataInit(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, oxiaReady bool) (componentReport, error) {
+// succeeded. It also returns whether the caller should requeue (set when a
+// terminally-Failed Job was deleted to be retried). When a non-Oxia metadata
+// store is ever selected, the Job (like the OxiaCluster child) is pruned.
+func (r *PulsarClusterReconciler) reconcileMetadataInit(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, oxiaReady bool) (componentReport, bool, error) {
 	if !oxiaSelected(cluster.Spec) {
 		job := &batchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{Name: metadataInitJobName(cluster.Name), Namespace: cluster.Namespace},
 		}
-		return pruneChild(ctx, r, metadataInitComponentName, job)
+		report, err := pruneChild(ctx, r, metadataInitComponentName, job)
+		return report, false, err
 	}
 
-	job, err := r.reconcileMetadataInitJob(ctx, cluster, oxiaReady)
+	job, requeue, err := r.reconcileMetadataInitJob(ctx, cluster, oxiaReady)
 	if err != nil {
-		return componentReport{}, fmt.Errorf("%s: %w", metadataInitComponentName, err)
+		return componentReport{}, false, fmt.Errorf("%s: %w", metadataInitComponentName, err)
 	}
 
 	cond := metadataInitializedCondition(cluster.Generation, oxiaReady, job)
@@ -187,52 +223,61 @@ func (r *PulsarClusterReconciler) reconcileMetadataInit(ctx context.Context, clu
 		ready:   cond.Status == metav1.ConditionTrue,
 		reason:  cond.Reason,
 		message: cond.Message,
-	}, nil
+	}, requeue, nil
 }
 
 // reconcileMetadataInitJob creates the cluster-metadata-init Job once the
-// OxiaCluster child is Ready, and never mutates it afterwards: a Job's pod
-// template is immutable, and initialize-cluster-metadata is meant to run
-// exactly once per cluster. A nil Job with a nil error means the Job hasn't
-// been created yet (Oxia isn't Ready).
-func (r *PulsarClusterReconciler) reconcileMetadataInitJob(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, oxiaReady bool) (*batchv1.Job, error) {
+// OxiaCluster child is Ready, and otherwise leaves a running/succeeded Job
+// untouched: a Job's pod template is immutable, and initialize-cluster-metadata
+// is meant to run exactly once per cluster. A nil Job with a nil error means
+// the Job hasn't been created yet (Oxia isn't Ready). A terminally-Failed Job
+// is deleted so a fresh attempt is recreated on the next reconcile - it must
+// never wedge the cluster forever - and the still-Failed Job is returned so
+// this cycle's status truthfully reports the failure; the returned bool then
+// asks the caller to requeue the retry.
+func (r *PulsarClusterReconciler) reconcileMetadataInitJob(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, oxiaReady bool) (*batchv1.Job, bool, error) {
 	job := &batchv1.Job{}
 	key := types.NamespacedName{Name: metadataInitJobName(cluster.Name), Namespace: cluster.Namespace}
 	err := r.Get(ctx, key, job)
 	switch {
 	case err == nil:
-		return job, nil
+		if jobFailedPermanently(job) {
+			if delErr := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(delErr) != nil {
+				return nil, false, fmt.Errorf("deleting failed cluster-metadata-init job: %w", delErr)
+			}
+			return job, true, nil
+		}
+		return job, false, nil
 	case !apierrors.IsNotFound(err):
-		return nil, fmt.Errorf("getting cluster-metadata-init job: %w", err)
+		return nil, false, fmt.Errorf("getting cluster-metadata-init job: %w", err)
 	case !oxiaReady:
-		return nil, nil
+		return nil, false, nil
 	}
 
 	desired := buildMetadataInitJob(cluster)
 	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
-		return nil, fmt.Errorf("setting owner reference on cluster-metadata-init job: %w", err)
+		return nil, false, fmt.Errorf("setting owner reference on cluster-metadata-init job: %w", err)
 	}
 	if err := r.Create(ctx, desired); err != nil {
-		return nil, fmt.Errorf("creating cluster-metadata-init job: %w", err)
+		return nil, false, fmt.Errorf("creating cluster-metadata-init job: %w", err)
 	}
-	return desired, nil
+	return desired, false, nil
 }
 
 // metadataInitializedCondition computes the MetadataInitialized condition
 // from whether Oxia is Ready and the observed state of the
 // cluster-metadata-init Job (nil until it has been created).
+//
+// A succeeded Job is checked FIRST so the condition is monotonic: cluster
+// metadata bootstrap is a permanent one-time fact, so a later transient Oxia
+// readiness blip (e.g. an Oxia pod restart) must never flip
+// MetadataInitialized True->False and flap the umbrella's Ready. A
+// terminally-Failed Job is likewise reported regardless of Oxia readiness so
+// the real failure isn't masked as "waiting for Oxia".
 func metadataInitializedCondition(generation int64, oxiaReady bool, job *batchv1.Job) metav1.Condition {
 	base := metav1.Condition{Type: conditionTypeMetadataInitialized, ObservedGeneration: generation}
 
 	switch {
-	case !oxiaReady:
-		base.Status = metav1.ConditionFalse
-		base.Reason = reasonMetadataInitWaitingForOxia
-		base.Message = "waiting for the OxiaCluster metadata store to become Ready before initializing cluster metadata"
-	case job == nil:
-		base.Status = metav1.ConditionFalse
-		base.Reason = reasonMetadataInitJobRunning
-		base.Message = "cluster-metadata-init job has not been created yet"
 	case jobSucceeded(job):
 		base.Status = metav1.ConditionTrue
 		base.Reason = reasonMetadataInitJobSucceeded
@@ -241,6 +286,14 @@ func metadataInitializedCondition(generation int64, oxiaReady bool, job *batchv1
 		base.Status = metav1.ConditionFalse
 		base.Reason = reasonMetadataInitJobFailed
 		base.Message = fmt.Sprintf("cluster-metadata-init job %s failed", job.Name)
+	case !oxiaReady:
+		base.Status = metav1.ConditionFalse
+		base.Reason = reasonMetadataInitWaitingForOxia
+		base.Message = "waiting for the OxiaCluster metadata store to become Ready before initializing cluster metadata"
+	case job == nil:
+		base.Status = metav1.ConditionFalse
+		base.Reason = reasonMetadataInitJobRunning
+		base.Message = "cluster-metadata-init job has not been created yet"
 	default:
 		base.Status = metav1.ConditionFalse
 		base.Reason = reasonMetadataInitJobRunning
@@ -251,6 +304,9 @@ func metadataInitializedCondition(generation int64, oxiaReady bool, job *batchv1
 }
 
 func jobSucceeded(job *batchv1.Job) bool {
+	if job == nil {
+		return false
+	}
 	if c := findJobCondition(job, batchv1.JobComplete); c != nil {
 		return c.Status == corev1.ConditionTrue
 	}
@@ -258,6 +314,9 @@ func jobSucceeded(job *batchv1.Job) bool {
 }
 
 func jobFailedPermanently(job *batchv1.Job) bool {
+	if job == nil {
+		return false
+	}
 	c := findJobCondition(job, batchv1.JobFailed)
 	return c != nil && c.Status == corev1.ConditionTrue
 }
