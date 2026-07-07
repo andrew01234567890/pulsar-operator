@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+jobs:
+  release:
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    name: release
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/andrew01234567890/pulsar-operator
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup ko
+        uses: ko-build/setup-ko@61b4d1d396f5b2e7d6bb6fefdce3dc38d1a13445 # v0.10
+        with:
+          version: v0.19.1
+        env:
+          KO_DOCKER_REPO: ${{ env.IMAGE }}
+
+      - name: Build and push multi-arch image
+        id: image
+        env:
+          KO_DOCKER_REPO: ${{ env.IMAGE }}
+        run: |
+          ko build ./cmd --bare \
+            --platform=linux/amd64,linux/arm64 \
+            --tags="${GITHUB_REF_NAME}" \
+            --image-refs=image-refs.txt
+          echo "digest=$(head -n1 image-refs.txt | cut -d'@' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate install.yaml
+        run: make build-installer IMG="${{ env.IMAGE }}:${{ github.ref_name }}"
+
+      - name: Setup Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: 'v4.0.4'
+
+      - name: Package Helm chart
+        run: |
+          chart_version="${GITHUB_REF_NAME#v}"
+          helm package dist/chart --version "$chart_version" --app-version "$GITHUB_REF_NAME" --destination dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/install.yaml
+            dist/*.tgz

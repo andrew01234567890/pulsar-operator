@@ -1,0 +1,10 @@
+defaultBaseImage: gcr.io/distroless/static:nonroot
+builds:
+  - id: pulsar-operator
+    dir: .
+    main: ./cmd
+    env:
+      - CGO_ENABLED=0
+    platforms:
+      - linux/amd64
+      - linux/arm64
