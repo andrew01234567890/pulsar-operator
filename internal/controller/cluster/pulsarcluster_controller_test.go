@@ -20,6 +20,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -88,18 +89,24 @@ var _ = Describe("PulsarCluster Controller", func() {
 		_, err := reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 
-		By("creating the Broker child with an owner reference and the propagated image")
+		wantOxiaURL := "oxia://" + clusterName + "-oxia-oxia:6648/default"
+
+		By("creating the Broker child with an owner reference, the propagated image, and the injected oxia:// metadata URLs")
 		broker := &clusterv1alpha1.Broker{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
 		Expect(broker.Spec.Image).To(Equal(clusterImage))
 		Expect(broker.Spec.Replicas).To(HaveValue(Equal(int32(3))))
 		Expect(metav1.IsControlledBy(broker, pulsarCluster)).To(BeTrue())
+		Expect(broker.Spec.Config).To(HaveKeyWithValue("metadataStoreUrl", wantOxiaURL))
+		Expect(broker.Spec.Config).To(HaveKeyWithValue("configurationMetadataStoreUrl", wantOxiaURL))
 
-		By("creating the BookKeeper child with the propagated global storage class")
+		By("creating the BookKeeper child with the propagated global storage class and the injected metadataServiceUri")
 		bookKeeper := &clusterv1alpha1.BookKeeper{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-bookkeeper", Namespace: namespace.Name}, bookKeeper)).To(Succeed())
 		Expect(bookKeeper.Spec.Volumes.Journal.StorageClassName).To(HaveValue(Equal(storageClass)))
 		Expect(metav1.IsControlledBy(bookKeeper, pulsarCluster)).To(BeTrue())
+		Expect(bookKeeper.Spec.Config).To(HaveKeyWithValue(
+			"metadataServiceUri", "metadata-store:oxia://"+clusterName+"-oxia-oxia:6648/bookkeeper"))
 
 		By("creating the OxiaCluster child with the propagated image and storage class")
 		oxia := &metadatav1alpha1.OxiaCluster{}
@@ -133,6 +140,24 @@ var _ = Describe("PulsarCluster Controller", func() {
 		oxia.Status.Conditions = []metav1.Condition{readyConditionForGeneration(oxia.Generation, "all oxia pods ready")}
 		Expect(k8sClient.Status().Update(ctx, oxia)).To(Succeed())
 
+		By("re-reconciling now that Oxia is Ready to create the cluster-metadata-init Job")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("creating the cluster-metadata-init Job with an owner reference")
+		metadataInitJob := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-metadata-init", Namespace: namespace.Name}, metadataInitJob)).To(Succeed())
+		Expect(metav1.IsControlledBy(metadataInitJob, pulsarCluster)).To(BeTrue())
+
+		By("still reporting Ready=False: the metadata-init Job hasn't succeeded yet")
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		Expect(apimeta.IsStatusConditionFalse(pulsarCluster.Status.Conditions, conditionTypeReady)).To(BeTrue())
+		Expect(apimeta.IsStatusConditionFalse(pulsarCluster.Status.Conditions, conditionTypeMetadataInitialized)).To(BeTrue())
+
+		By("marking the cluster-metadata-init Job Succeeded (envtest has no real Job controller to run it)")
+		metadataInitJob.Status.Succeeded = 1
+		Expect(k8sClient.Status().Update(ctx, metadataInitJob)).To(Succeed())
+
 		By("re-reconciling and observing the aggregated Ready=True condition")
 		_, err = reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
@@ -142,6 +167,7 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(readyCond).NotTo(BeNil())
 		Expect(readyCond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(readyCond.Reason).To(Equal(reasonAllComponentsReady))
+		Expect(apimeta.IsStatusConditionTrue(pulsarCluster.Status.Conditions, conditionTypeMetadataInitialized)).To(BeTrue())
 		Expect(pulsarCluster.Status.BrokerPhase).To(Equal(phaseReady))
 		Expect(pulsarCluster.Status.BookKeeperPhase).To(Equal(phaseReady))
 		Expect(pulsarCluster.Status.OxiaPhase).To(Equal(phaseReady))
@@ -241,6 +267,15 @@ var _ = Describe("PulsarCluster Controller", func() {
 		oxia.Status.Conditions = []metav1.Condition{readyConditionForGeneration(oxia.Generation, "all oxia pods ready")}
 		Expect(k8sClient.Status().Update(ctx, oxia)).To(Succeed())
 
+		By("re-reconciling to create the cluster-metadata-init Job now that Oxia is Ready, then marking it Succeeded")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		metadataInitJob := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-metadata-init", Namespace: namespace.Name}, metadataInitJob)).To(Succeed())
+		metadataInitJob.Status.Succeeded = 1
+		Expect(k8sClient.Status().Update(ctx, metadataInitJob)).To(Succeed())
+
 		_, err = reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 
@@ -262,6 +297,135 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(readyCond.Message).To(ContainSubstring(reasonComponentProgressing))
 		Expect(pulsarCluster.Status.BrokerPhase).To(Equal(phaseNotReady))
+	})
+
+	It("gates the cluster-metadata-init Job on OxiaCluster readiness and blocks overall Ready until it succeeds", func() {
+		pulsarCluster := &clusterv1alpha1.PulsarCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: namespace.Name,
+			},
+			Spec: clusterv1alpha1.PulsarClusterSpec{
+				Broker: &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(1))},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
+
+		By("reconciling before Oxia is Ready")
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("not creating the Job yet")
+		metadataInitJob := &batchv1.Job{}
+		err = k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-metadata-init", Namespace: namespace.Name}, metadataInitJob)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		initCond := apimeta.FindStatusCondition(pulsarCluster.Status.Conditions, conditionTypeMetadataInitialized)
+		Expect(initCond).NotTo(BeNil())
+		Expect(initCond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(initCond.Reason).To(Equal(reasonMetadataInitWaitingForOxia))
+
+		By("marking Oxia Ready")
+		oxia := &metadatav1alpha1.OxiaCluster{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-oxia", Namespace: namespace.Name}, oxia)).To(Succeed())
+		oxia.Status.Conditions = []metav1.Condition{readyConditionForGeneration(oxia.Generation, "all oxia pods ready")}
+		Expect(k8sClient.Status().Update(ctx, oxia)).To(Succeed())
+
+		By("reconciling again to create the Job")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-metadata-init", Namespace: namespace.Name}, metadataInitJob)).To(Succeed())
+		Expect(metav1.IsControlledBy(metadataInitJob, pulsarCluster)).To(BeTrue())
+		Expect(metadataInitJob.Spec.Template.Spec.Containers[0].Args).To(ContainElement(clusterName))
+
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		readyCond := apimeta.FindStatusCondition(pulsarCluster.Status.Conditions, conditionTypeReady)
+		Expect(readyCond).NotTo(BeNil())
+		Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(readyCond.Message).To(ContainSubstring(metadataInitComponentName))
+
+		By("marking the Job Succeeded and the Broker Ready")
+		metadataInitJob.Status.Succeeded = 1
+		Expect(k8sClient.Status().Update(ctx, metadataInitJob)).To(Succeed())
+
+		broker := &clusterv1alpha1.Broker{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
+		broker.Status.Conditions = []metav1.Condition{readyConditionForGeneration(broker.Generation, "all broker pods ready")}
+		Expect(k8sClient.Status().Update(ctx, broker)).To(Succeed())
+
+		By("re-reconciling and observing overall Ready=True")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		Expect(apimeta.IsStatusConditionTrue(pulsarCluster.Status.Conditions, conditionTypeReady)).To(BeTrue())
+		Expect(apimeta.IsStatusConditionTrue(pulsarCluster.Status.Conditions, conditionTypeMetadataInitialized)).To(BeTrue())
+	})
+
+	It("reports a terminally-failed metadata-init Job and retries it instead of wedging the cluster", func() {
+		pulsarCluster := &clusterv1alpha1.PulsarCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: namespace.Name,
+			},
+			Spec: clusterv1alpha1.PulsarClusterSpec{
+				Broker: &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(1))},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
+
+		By("reconciling, marking Oxia Ready, and reconciling again to create the Job")
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		oxia := &metadatav1alpha1.OxiaCluster{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-oxia", Namespace: namespace.Name}, oxia)).To(Succeed())
+		oxia.Status.Conditions = []metav1.Condition{readyConditionForGeneration(oxia.Generation, "all oxia pods ready")}
+		Expect(k8sClient.Status().Update(ctx, oxia)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		metadataInitJob := &batchv1.Job{}
+		jobKey := types.NamespacedName{Name: clusterName + "-metadata-init", Namespace: namespace.Name}
+		Expect(k8sClient.Get(ctx, jobKey, metadataInitJob)).To(Succeed())
+
+		By("marking the Job terminally Failed")
+		// The apiserver validates Job status transitions: Failed=True requires
+		// a FailureTarget=true condition and a startTime for a finished Job.
+		startTime := metav1.Now()
+		metadataInitJob.Status.StartTime = &startTime
+		metadataInitJob.Status.Conditions = []batchv1.JobCondition{
+			{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"},
+			{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"},
+		}
+		Expect(k8sClient.Status().Update(ctx, metadataInitJob)).To(Succeed())
+
+		By("re-reconciling and observing MetadataInitialized=False/JobFailed and Ready still False")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		initCond := apimeta.FindStatusCondition(pulsarCluster.Status.Conditions, conditionTypeMetadataInitialized)
+		Expect(initCond).NotTo(BeNil())
+		Expect(initCond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(initCond.Reason).To(Equal(reasonMetadataInitJobFailed))
+		Expect(apimeta.IsStatusConditionFalse(pulsarCluster.Status.Conditions, conditionTypeReady)).To(BeTrue())
+
+		By("retrying rather than wedging: the failed Job is deleted and recreated fresh on the next reconcile")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		retried := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, jobKey, retried)).To(Succeed())
+		Expect(jobFailedPermanently(retried)).To(BeFalse())
+
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		retriedCond := apimeta.FindStatusCondition(pulsarCluster.Status.Conditions, conditionTypeMetadataInitialized)
+		Expect(retriedCond).NotTo(BeNil())
+		Expect(retriedCond.Reason).To(Equal(reasonMetadataInitJobRunning))
 	})
 })
 
