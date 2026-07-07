@@ -4041,6 +4041,15 @@ spec:
                   across components.
                 type: string
             type: object
+            x-kubernetes-validations:
+            - message: 'offload requires spec.image or spec.broker.image to be set
+                explicitly: the offloader jars ship only in apachepulsar/pulsar-all,
+                and apachepulsar/pulsar-all:<pulsarVersion> is not guaranteed to be
+                published (e.g. milestone releases like 5.0.0-M1), so the operator
+                will not synthesize it automatically - set spec.image or spec.broker.image
+                to an offloader-capable image yourself'
+              rule: '!has(self.offload) || size(self.image) > 0 || (has(self.broker)
+                && size(self.broker.image) > 0)'
           status:
             description: status defines the observed state of PulsarCluster
             properties:

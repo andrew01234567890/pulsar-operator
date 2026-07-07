@@ -74,7 +74,9 @@ is expected to go through the umbrella resource.
   ordered rolling upgrades.
 - **Tiered storage** (S3/GCS/Azure/filesystem offload) configured via CRD —
   this is retention tiering, not a backup mechanism; see
-  [Backup & DR](./backup-and-dr.md).
+  [Backup & DR](./backup-and-dr.md). Requires an explicit
+  offloader-capable image (`spec.image` or `spec.broker.image`) — see
+  [Backup & DR](./backup-and-dr.md#offload-requires-an-explicit-offloader-capable-image).
 
 Explicitly out of scope for v1: geo-replication and automated backup (see
 [Backup & DR](./backup-and-dr.md) for why that matters and how to mitigate

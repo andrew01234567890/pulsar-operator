@@ -511,8 +511,14 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(initCond.Reason).To(Equal(reasonMetadataInitJobSucceeded))
 	})
 
-	It("wires tiered-storage offload into the Broker child, and leaves it untouched when unconfigured", func() {
-		By("reconciling a cluster with s3 offload configured")
+	It("wires tiered-storage offload config into the Broker child, and leaves it untouched when unconfigured", func() {
+		By("reconciling a cluster with s3 offload configured and an explicit offloader-capable image")
+		// spec.image must be set explicitly: the PulsarClusterSpec CEL rule
+		// rejects offload without one, since the offloader jars ship only in
+		// apachepulsar/pulsar-all and that tag isn't guaranteed to be
+		// published for every pulsarVersion (see cel_validation_test.go for
+		// the rejection itself).
+		const offloadImage = "apachepulsar/pulsar-all:" + testPulsarVersion
 		threshold := int64(1073741824)
 		pulsarCluster := &clusterv1alpha1.PulsarCluster{
 			ObjectMeta: metav1.ObjectMeta{
@@ -521,6 +527,7 @@ var _ = Describe("PulsarCluster Controller", func() {
 			},
 			Spec: clusterv1alpha1.PulsarClusterSpec{
 				PulsarVersion: testPulsarVersion,
+				Image:         offloadImage,
 				Broker:        &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(1))},
 				Offload: &clusterv1alpha1.OffloadSpec{
 					Driver:                offloadDriverAWSS3,
@@ -539,8 +546,8 @@ var _ = Describe("PulsarCluster Controller", func() {
 		broker := &clusterv1alpha1.Broker{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
 
-		By("selecting the pulsar-all image and setting the S3 offload keys")
-		Expect(broker.Spec.Image).To(Equal("apachepulsar/pulsar-all:" + testPulsarVersion))
+		By("using the explicitly-set image as-is (never fabricating a pulsar-all tag) and setting the S3 offload keys")
+		Expect(broker.Spec.Image).To(Equal(offloadImage))
 		Expect(broker.Spec.Config).To(HaveKeyWithValue("managedLedgerOffloadDriver", "aws-s3"))
 		Expect(broker.Spec.Config).To(HaveKeyWithValue("s3ManagedLedgerOffloadBucket", testOffloadBucket))
 		Expect(broker.Spec.Config).To(HaveKeyWithValue("s3ManagedLedgerOffloadRegion", testOffloadRegion))
@@ -562,7 +569,7 @@ var _ = Describe("PulsarCluster Controller", func() {
 		oxia.Status.Conditions = []metav1.Condition{readyConditionForGeneration(oxia.Generation, "all oxia pods ready")}
 		Expect(k8sClient.Status().Update(ctx, oxia)).To(Succeed())
 
-		By("removing offload leaves the broker on the base image with no offload keys")
+		By("removing offload leaves the explicit image untouched (image selection is independent of offload) and drops the offload keys")
 		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
 		pulsarCluster.Spec.Offload = nil
 		Expect(k8sClient.Update(ctx, pulsarCluster)).To(Succeed())
@@ -571,13 +578,16 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
-		Expect(broker.Spec.Image).To(Equal("apachepulsar/pulsar:" + testPulsarVersion))
+		Expect(broker.Spec.Image).To(Equal(offloadImage))
 		Expect(broker.Spec.Config).NotTo(HaveKey("managedLedgerOffloadDriver"))
 		Expect(broker.Spec.Env).To(BeEmpty())
 	})
 
 	It("mounts the GCS service-account key as a file, not an env var", func() {
-		By("reconciling a cluster with google-cloud-storage offload configured")
+		By("reconciling a cluster with google-cloud-storage offload configured and an explicit broker-level offloader image")
+		// Uses spec.broker.image rather than spec.image (covered by the s3
+		// case above) to exercise both explicit-image paths the CEL rule
+		// accepts.
 		pulsarCluster := &clusterv1alpha1.PulsarCluster{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      clusterName,
@@ -585,7 +595,7 @@ var _ = Describe("PulsarCluster Controller", func() {
 			},
 			Spec: clusterv1alpha1.PulsarClusterSpec{
 				PulsarVersion: testPulsarVersion,
-				Broker:        &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(1))},
+				Broker:        &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(1)), Image: "apachepulsar/pulsar-all:" + testPulsarVersion},
 				Offload: &clusterv1alpha1.OffloadSpec{
 					Driver:               offloadDriverGCS,
 					Bucket:               testOffloadBucket,
@@ -601,6 +611,9 @@ var _ = Describe("PulsarCluster Controller", func() {
 
 		broker := &clusterv1alpha1.Broker{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
+
+		By("using the explicitly-set broker-level image as-is")
+		Expect(broker.Spec.Image).To(Equal("apachepulsar/pulsar-all:" + testPulsarVersion))
 
 		By("setting the GCS offload keys, including the service-account key FILE path")
 		Expect(broker.Spec.Config).To(HaveKeyWithValue("managedLedgerOffloadDriver", "google-cloud-storage"))
