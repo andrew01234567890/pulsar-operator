@@ -336,8 +336,9 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&backupcontroller.BackupScheduleReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("backup-backupschedule"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "backup-backupschedule")
 		os.Exit(1)
