@@ -229,8 +229,17 @@ func (r *PulsarClusterReconciler) reconcileBroker(ctx context.Context, cluster *
 	desired.Config = withClusterNameDefault(desired.Config, cluster.Name)
 	desired.Config = withBrokerOffloadDefaults(desired.Config, cluster.Spec.Offload)
 
-	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
-		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled)
+	desiredSpec := any(desired)
+	liveSpec := func() any { return child.Spec }
+	var onExisting func()
+	if brokerAutoscalerEnabled(desired) {
+		desiredSpec = brokerHashSpec(desired)
+		liveSpec = func() any { return brokerLiveHashSpec(child.Spec) }
+		onExisting = func() { desired.Replicas = child.Spec.Replicas }
+	}
+
+	outcome, err := r.applyOrderedChild(ctx, cluster, child, desiredSpec,
+		liveSpec, func() { child.Spec = *desired }, upstreamSettled, onExisting)
 	if err != nil {
 		return componentReport{}, tierOutcome{}, fmt.Errorf("broker: %w", err)
 	}
@@ -256,8 +265,17 @@ func (r *PulsarClusterReconciler) reconcileBookKeeper(ctx context.Context, clust
 	desired := buildBookKeeperSpec(cluster.Spec)
 	desired.Config = withBookKeeperMetadataDefault(desired.Config, cluster.Name)
 
-	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
-		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled)
+	desiredSpec := any(desired)
+	liveSpec := func() any { return child.Spec }
+	var onExisting func()
+	if bookKeeperAutoscalerEnabled(desired) {
+		desiredSpec = bookKeeperHashSpec(desired)
+		liveSpec = func() any { return bookKeeperLiveHashSpec(child.Spec) }
+		onExisting = func() { desired.Replicas = child.Spec.Replicas }
+	}
+
+	outcome, err := r.applyOrderedChild(ctx, cluster, child, desiredSpec,
+		liveSpec, func() { child.Spec = *desired }, upstreamSettled, onExisting)
 	if err != nil {
 		return componentReport{}, tierOutcome{}, fmt.Errorf("bookkeeper: %w", err)
 	}
@@ -284,7 +302,7 @@ func (r *PulsarClusterReconciler) reconcileProxy(ctx context.Context, cluster *c
 	desired.Config = withClusterNameDefault(desired.Config, cluster.Name)
 
 	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
-		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled)
+		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled, nil)
 	if err != nil {
 		return componentReport{}, tierOutcome{}, fmt.Errorf("proxy: %w", err)
 	}
@@ -310,7 +328,7 @@ func (r *PulsarClusterReconciler) reconcileAutoRecovery(ctx context.Context, clu
 	desired := buildAutoRecoverySpec(cluster.Spec)
 
 	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
-		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled)
+		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled, nil)
 	if err != nil {
 		return componentReport{}, tierOutcome{}, fmt.Errorf("autorecovery: %w", err)
 	}
@@ -337,7 +355,7 @@ func (r *PulsarClusterReconciler) reconcileFunctionsWorker(ctx context.Context, 
 	desired.Config = withFunctionsWorkerMetadataDefault(desired.Config, cluster.Name)
 
 	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
-		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled)
+		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled, nil)
 	if err != nil {
 		return componentReport{}, tierOutcome{}, fmt.Errorf("functionsworker: %w", err)
 	}
@@ -368,7 +386,7 @@ func (r *PulsarClusterReconciler) reconcileOxia(ctx context.Context, cluster *cl
 	desired := buildOxiaSpec(cluster.Spec)
 
 	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
-		func() any { return child.Spec }, func() { child.Spec = *desired }, true)
+		func() any { return child.Spec }, func() { child.Spec = *desired }, true, nil)
 	if err != nil {
 		return componentReport{}, tierOutcome{}, fmt.Errorf("oxia: %w", err)
 	}
@@ -478,6 +496,55 @@ func buildBookKeeperSpec(spec clusterv1alpha1.PulsarClusterSpec) *clusterv1alpha
 		}
 	}
 	return out
+}
+
+// brokerAutoscalerEnabled reports whether the broker autoscaler is enabled on
+// the (already cluster-derived) desired spec - the same gate
+// BrokerAutoscalerReconciler itself checks before writing spec.replicas. When
+// true, spec.replicas is autoscaler-owned and reconcileBroker must neither
+// write nor revert it.
+func brokerAutoscalerEnabled(spec *clusterv1alpha1.BrokerSpec) bool {
+	return spec.Autoscaler != nil && spec.Autoscaler.Enabled
+}
+
+// bookKeeperAutoscalerEnabled is brokerAutoscalerEnabled's BookKeeper
+// counterpart, mirroring the gate BookKeeperAutoscalerReconciler checks.
+func bookKeeperAutoscalerEnabled(spec *clusterv1alpha1.BookKeeperSpec) bool {
+	return spec.Autoscaler != nil && spec.Autoscaler.Enabled
+}
+
+// brokerHashSpec and brokerLiveHashSpec clear Replicas before a Broker spec is
+// fed to specHash, for the desired and live sides of applyOrderedChild's hash
+// comparisons respectively. reconcileBroker only swaps these in once the
+// broker autoscaler is enabled: with the field hidden from both the
+// desired-vs-stored-desired and live-vs-stored-applied comparisons, the
+// autoscaler moving spec.replicas can never by itself register as a genuine
+// roll or as drift, so the umbrella never reverts it. The real, live-preserved
+// Replicas value is unaffected - it is set directly on the desired spec (see
+// reconcileBroker's onExisting hook) and is what actually gets written on any
+// roll or drift-correction triggered by some other field.
+func brokerHashSpec(spec *clusterv1alpha1.BrokerSpec) any {
+	out := spec.DeepCopy()
+	out.Replicas = nil
+	return out
+}
+
+func brokerLiveHashSpec(spec clusterv1alpha1.BrokerSpec) any {
+	spec.Replicas = nil
+	return spec
+}
+
+// bookKeeperHashSpec and bookKeeperLiveHashSpec are brokerHashSpec/
+// brokerLiveHashSpec's BookKeeper counterparts; see those for the rationale.
+func bookKeeperHashSpec(spec *clusterv1alpha1.BookKeeperSpec) any {
+	out := spec.DeepCopy()
+	out.Replicas = nil
+	return out
+}
+
+func bookKeeperLiveHashSpec(spec clusterv1alpha1.BookKeeperSpec) any {
+	spec.Replicas = nil
+	return spec
 }
 
 // buildProxySpec copies PulsarCluster.spec.proxy into the child Proxy spec,

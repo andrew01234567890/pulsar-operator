@@ -235,6 +235,21 @@ func tierSettled(ready, deferred bool) bool {
 // liveSpec returns the child's current .Spec (read after Get); setSpec writes
 // the desired spec onto child. Both are closures over the concrete child type,
 // since client.Object erases .Spec.
+//
+// onExisting, when non-nil, runs once - only when the child already exists,
+// right after the Get that confirms it and before any hash is computed - so
+// the caller can fold live state the umbrella does not own into desiredSpec
+// ahead of hashing/writing. It is nil for every child except Broker and
+// BookKeeper, whose reconcile funcs use it to copy an enabled autoscaler's
+// current live spec.replicas onto the desired spec (see
+// reconcileBroker/reconcileBookKeeper), so a genuine roll never resets the
+// field. Those same reconcile funcs also swap in a desiredSpec/liveSpec pair
+// that hides spec.replicas from the hash entirely in that case: onExisting
+// alone would stop a roll from resetting replicas, but the desired-spec hash
+// stamped on the PREVIOUS write still has last reconcile's replicas value
+// baked in, so without also hiding the field from the hash, every autoscaler
+// tick would still look like a "genuine roll" (the desired hash changed) and
+// spuriously flip the tier to Upgrading.
 func (r *PulsarClusterReconciler) applyOrderedChild(
 	ctx context.Context,
 	cluster *clusterv1alpha1.PulsarCluster,
@@ -243,16 +258,16 @@ func (r *PulsarClusterReconciler) applyOrderedChild(
 	liveSpec func() any,
 	setSpec func(),
 	upstreamSettled bool,
+	onExisting func(),
 ) (outcome tierOutcome, err error) {
-	desiredHash, err := specHash(desiredSpec)
-	if err != nil {
-		return tierOutcome{}, err
-	}
-
 	key := client.ObjectKeyFromObject(child)
 	getErr := r.Get(ctx, key, child)
 	switch {
 	case apierrors.IsNotFound(getErr):
+		desiredHash, err := specHash(desiredSpec)
+		if err != nil {
+			return tierOutcome{}, err
+		}
 		if err := r.writeOrderedChild(ctx, cluster, child, desiredHash, liveSpec, setSpec, true); err != nil {
 			return tierOutcome{}, err
 		}
@@ -261,6 +276,14 @@ func (r *PulsarClusterReconciler) applyOrderedChild(
 		return tierOutcome{}, fmt.Errorf("getting child: %w", getErr)
 	}
 
+	if onExisting != nil {
+		onExisting()
+	}
+
+	desiredHash, err := specHash(desiredSpec)
+	if err != nil {
+		return tierOutcome{}, err
+	}
 	actualHash, err := specHash(liveSpec())
 	if err != nil {
 		return tierOutcome{}, err
