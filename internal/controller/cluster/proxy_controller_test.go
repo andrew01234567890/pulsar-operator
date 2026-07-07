@@ -464,6 +464,78 @@ func TestProxyReconcileTLSMisconfiguredIsDegraded(t *testing.T) {
 	}
 }
 
+// TestProxyReconcileTLSMisconfiguredTearsDownExistingStatefulSet is the
+// update-path regression: a Proxy that already has a plaintext StatefulSet
+// running (created before tls.enabled=true, secretName="" was set) must have
+// that StatefulSet torn down when the reconciler flags it Degraded - the
+// "refusing to serve the proxy plaintext-only" message must be true, not just
+// aspirational. Covers the case TestProxyReconcileTLSMisconfiguredIsDegraded
+// does not: that test only proves no StatefulSet is *created* fresh.
+func TestProxyReconcileTLSMisconfiguredTearsDownExistingStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clusterv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(appsv1.AddToScheme(scheme))
+	utilruntime.Must(corev1.AddToScheme(scheme))
+
+	const (
+		name = "proxy-degraded-teardown"
+		ns   = "default"
+	)
+	proxy := &clusterv1alpha1.Proxy{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec:       clusterv1alpha1.ProxySpec{Tls: &clusterv1alpha1.ProxyTlsConfig{Enabled: true}},
+	}
+	existingSts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName: name,
+			Selector:    &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": name}},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: proxyComponent, Image: "apachepulsar/pulsar:5.0.0-M1"}},
+				},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(proxy, existingSts).
+		WithStatusSubresource(&clusterv1alpha1.Proxy{}).
+		Build()
+	rec := events.NewFakeRecorder(8)
+	r := &ProxyReconciler{Client: c, Scheme: scheme, Recorder: rec}
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: name, Namespace: ns}
+
+	// Sanity check: the pre-existing plaintext StatefulSet is really there
+	// before the reconcile that is supposed to tear it down.
+	if err := c.Get(ctx, key, &appsv1.StatefulSet{}); err != nil {
+		t.Fatalf("pre-existing StatefulSet not seeded: %v", err)
+	}
+
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("Reconcile returned error: %v", err)
+	}
+
+	if err := c.Get(ctx, key, &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
+		t.Errorf("expected pre-existing StatefulSet to be torn down, got err=%v", err)
+	}
+
+	got := &clusterv1alpha1.Proxy{}
+	if err := c.Get(ctx, key, got); err != nil {
+		t.Fatalf("get proxy: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(got.Status.Conditions, conditionTypeReady)
+	if cond == nil {
+		t.Fatal("no Ready condition set")
+	}
+	if cond.Status != metav1.ConditionFalse || cond.Reason != reasonTLSMisconfigured {
+		t.Errorf("Ready condition = %s/%s, want False/%s", cond.Status, cond.Reason, reasonTLSMisconfigured)
+	}
+}
+
 func TestProxyMergedConfig(t *testing.T) {
 	t.Run("defaults leave metadataStoreUrl blank", func(t *testing.T) {
 		got := proxyMergedConfig(clusterv1alpha1.ProxySpec{})

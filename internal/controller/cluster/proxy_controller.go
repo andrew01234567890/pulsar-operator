@@ -283,8 +283,10 @@ func proxyTLSMisconfigured(spec clusterv1alpha1.ProxySpec) bool {
 
 // reportTLSMisconfigured records the Degraded state for a TLS-requested Proxy
 // with no cert Secret: a Warning event plus a Ready=False/TLSMisconfigured
-// condition, without reconciling any workload (so no plaintext proxy is
-// created).
+// condition. It never reconciles a workload here, and it actively tears down
+// any plaintext StatefulSet a prior (pre-misconfiguration) reconcile already
+// created, so an update into this state stops serving plaintext rather than
+// leaving the old workload running behind a status that claims otherwise.
 func (r *ProxyReconciler) reportTLSMisconfigured(ctx context.Context, proxy *clusterv1alpha1.Proxy) (ctrl.Result, error) {
 	const msg = "tls.enabled=true but tls.secretName is empty; refusing to serve the proxy plaintext-only"
 
@@ -292,6 +294,11 @@ func (r *ProxyReconciler) reportTLSMisconfigured(ctx context.Context, proxy *clu
 		// events API: regarding=proxy, no related object, action describes what
 		// the controller did (refused to roll out), note is the human message.
 		r.Recorder.Eventf(proxy, nil, corev1.EventTypeWarning, reasonTLSMisconfigured, "RefusePlaintext", msg)
+	}
+
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: proxy.Name, Namespace: proxy.Namespace}}
+	if err := r.Delete(ctx, sts); client.IgnoreNotFound(err) != nil {
+		return ctrl.Result{}, fmt.Errorf("tearing down plaintext Proxy StatefulSet: %w", err)
 	}
 
 	proxy.Status.ObservedGeneration = proxy.Generation
