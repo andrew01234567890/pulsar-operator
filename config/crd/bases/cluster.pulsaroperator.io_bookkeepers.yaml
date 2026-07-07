@@ -335,6 +335,14 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              lastScaleTime:
+                description: |-
+                  lastScaleTime is when the disk-watermark autoscaler last changed
+                  spec.replicas. The autoscaler's stabilization window is measured from
+                  this timestamp, not from pod age, so it gates repeated scaling events
+                  directly rather than as a side effect of pod restarts.
+                format: date-time
+                type: string
               observedGeneration:
                 description: observedGeneration is the most recent generation observed
                   by the controller.
@@ -350,8 +358,9 @@ spec:
                 format: int32
                 type: integer
               writableBookies:
-                description: writableBookies is the observed number of writable (non-read-only)
-                  bookies.
+                description: |-
+                  writableBookies is the observed number of writable (non-read-only) bookies,
+                  as last polled by the disk-watermark autoscaler.
                 format: int32
                 type: integer
             type: object

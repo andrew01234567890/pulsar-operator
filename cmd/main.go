@@ -209,6 +209,14 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "cluster-bookkeeper")
 		os.Exit(1)
 	}
+	if err := (&clustercontroller.BookKeeperAutoscalerReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("cluster-bookkeeper-autoscaler"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "cluster-bookkeeper-autoscaler")
+		os.Exit(1)
+	}
 	if err := (&clustercontroller.ProxyReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
