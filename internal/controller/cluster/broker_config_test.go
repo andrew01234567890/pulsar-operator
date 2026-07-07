@@ -35,6 +35,11 @@ import (
 // doesn't matter here since defaultBrokerConfig must never hardcode one.
 const testMetadataStoreURL = "oxia://pulsar-oxia-coordinator:6648/default"
 
+// testConfigValFalse is an explicit spec.Config override value, standing in
+// for any boolean-typed broker.conf key a user might override away from an
+// operator default.
+const testConfigValFalse = "false"
+
 // TestDefaultBrokerConfig_Regression pins the exact operator-default
 // broker.conf keys/values. A silent change here (e.g. a typo'd class name)
 // would ship a broken load-manager default without any test failing
@@ -50,20 +55,24 @@ func TestDefaultBrokerConfig_Regression(t *testing.T) {
 			name:         "unset defaults to extensible",
 			loadBalancer: "",
 			want: map[string]string{
-				confKeyBrokerServicePort:       "6650",
-				confKeyWebServicePort:          "8080",
-				confKeyLoadManagerClassName:    extensibleLoadManagerClassName,
-				confKeyBrokerShutdownTimeoutMs: "60000",
+				confKeyBrokerServicePort:                "6650",
+				confKeyWebServicePort:                   "8080",
+				confKeyLoadManagerClassName:             extensibleLoadManagerClassName,
+				confKeyLoadBalancerLoadSheddingStrategy: transferShedderClassName,
+				confKeyLoadBalancerTransferEnabled:      configValTrue,
+				confKeyBrokerShutdownTimeoutMs:          "60000",
 			},
 		},
 		{
 			name:         "explicit extensible",
 			loadBalancer: "extensible",
 			want: map[string]string{
-				confKeyBrokerServicePort:       "6650",
-				confKeyWebServicePort:          "8080",
-				confKeyLoadManagerClassName:    extensibleLoadManagerClassName,
-				confKeyBrokerShutdownTimeoutMs: "60000",
+				confKeyBrokerServicePort:                "6650",
+				confKeyWebServicePort:                   "8080",
+				confKeyLoadManagerClassName:             extensibleLoadManagerClassName,
+				confKeyLoadBalancerLoadSheddingStrategy: transferShedderClassName,
+				confKeyLoadBalancerTransferEnabled:      configValTrue,
+				confKeyBrokerShutdownTimeoutMs:          "60000",
 			},
 		},
 		{
@@ -85,6 +94,50 @@ func TestDefaultBrokerConfig_Regression(t *testing.T) {
 				t.Errorf("defaultBrokerConfig(LoadBalancer=%q) = %v, want %v", tt.loadBalancer, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestDefaultBrokerConfig_TransferShedderNotSetForSimple guards that the
+// simple (legacy ModularLoadManagerImpl) load manager never gets the
+// ExtensibleLoadManagerImpl-only TransferShedder defaults: ThresholdShedder
+// (upstream broker.conf's own default for the simple load manager) is the
+// correct pairing there, and TransferShedder is extensions-package-specific.
+func TestDefaultBrokerConfig_TransferShedderNotSetForSimple(t *testing.T) {
+	got := defaultBrokerConfig(clusterv1alpha1.BrokerSpec{LoadBalancer: loadBalancerSimple})
+	if _, present := got[confKeyLoadBalancerLoadSheddingStrategy]; present {
+		t.Errorf("loadBalancerLoadSheddingStrategy must not be defaulted for the simple load manager, got %q", got[confKeyLoadBalancerLoadSheddingStrategy])
+	}
+	if _, present := got[confKeyLoadBalancerTransferEnabled]; present {
+		t.Errorf("loadBalancerTransferEnabled must not be defaulted for the simple load manager, got %q", got[confKeyLoadBalancerTransferEnabled])
+	}
+}
+
+// TestMergedBrokerConfig_TransferShedderUserOverrideWins guards Bug B's fix:
+// ExtensibleLoadManagerImpl requires a NamespaceUnloadStrategy shedder
+// (TransferShedder), which the operator now defaults alongside
+// loadBalancerTransferEnabled - but an explicit user override of either key
+// via spec.Config must still win, matching every other operator-managed
+// broker.conf default.
+func TestMergedBrokerConfig_TransferShedderUserOverrideWins(t *testing.T) {
+	broker := &clusterv1alpha1.Broker{
+		Spec: clusterv1alpha1.BrokerSpec{
+			Config: map[string]string{
+				confKeyLoadBalancerLoadSheddingStrategy: "com.example.CustomShedder",
+				confKeyLoadBalancerTransferEnabled:      testConfigValFalse,
+			},
+		},
+	}
+
+	got := mergedBrokerConfig(broker)
+
+	if got[confKeyLoadManagerClassName] != extensibleLoadManagerClassName {
+		t.Fatalf("loadManagerClassName = %q, want %q", got[confKeyLoadManagerClassName], extensibleLoadManagerClassName)
+	}
+	if got[confKeyLoadBalancerLoadSheddingStrategy] != "com.example.CustomShedder" {
+		t.Errorf("loadBalancerLoadSheddingStrategy = %q, want spec.Config override to win", got[confKeyLoadBalancerLoadSheddingStrategy])
+	}
+	if got[confKeyLoadBalancerTransferEnabled] != testConfigValFalse {
+		t.Errorf("loadBalancerTransferEnabled = %q, want spec.Config override to win", got[confKeyLoadBalancerTransferEnabled])
 	}
 }
 

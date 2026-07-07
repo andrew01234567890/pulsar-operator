@@ -72,9 +72,20 @@ const (
 	keyBookiePort         = "bookiePort"
 	keyHTTPServerEnabled  = "httpServerEnabled"
 	keyHTTPServerPort     = "httpServerPort"
+	keyHTTPServerClass    = "httpServerClass"
 	keyJournalDirectories = "journalDirectories"
 	keyLedgerDirectories  = "ledgerDirectories"
 	keyIndexDirectories   = "indexDirectories"
+
+	// bookieHTTPServerClass is the BookKeeper HTTP-server implementation the
+	// bookie admin API runs on. The operator renders a complete bookkeeper.conf
+	// and mounts it OVER the image's shipped conf/bookkeeper.conf (subPath
+	// mount), so the image default's own httpServerClass is masked: with
+	// httpServerEnabled forced on but no class set, the bookie aborts at
+	// startup with "httpServerClass is not configured" (a NullPointerException
+	// in HttpService). This is the same value Pulsar's own conf/bookkeeper.conf
+	// and BookKeeper's reference conf ship.
+	bookieHTTPServerClass = "org.apache.bookkeeper.http.vertx.VertxHttpServer"
 
 	// journalMountPath, ledgerMountPath, and indexMountPath are the operator's
 	// fixed, single-directory PVC mount paths, one per disk-role
@@ -289,14 +300,17 @@ func mergeConfig(spec clusterv1alpha1.BookKeeperSpec) (merged map[string]string,
 //     the headless Service port/targetPort.
 //   - httpServerEnabled is forced on (the operator needs the bookie admin API
 //     for readiness now and autoscaling later); httpServerPort matches the
-//     readiness HTTP probe port.
+//     readiness HTTP probe port; httpServerClass must be set whenever the HTTP
+//     server is on, and the operator's rendered conf masks the image default
+//     that would otherwise supply it (see bookieHTTPServerClass).
 //
 // Every other bookkeeper.conf key stays freely user-overridable via spec.config.
 func operatorManagedConfig() map[string]string {
 	return map[string]string{
 		keyBookiePort:         strconv.Itoa(bookiePort),
-		keyHTTPServerEnabled:  "true",
+		keyHTTPServerEnabled:  configValTrue,
 		keyHTTPServerPort:     strconv.Itoa(bookieAdminPort),
+		keyHTTPServerClass:    bookieHTTPServerClass,
 		keyJournalDirectories: journalMountPath,
 		keyLedgerDirectories:  ledgerMountPath,
 		keyIndexDirectories:   indexMountPath,

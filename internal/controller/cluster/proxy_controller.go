@@ -73,6 +73,18 @@ const (
 	proxyConfigMountPath = "/pulsar/conf/" + proxyConfigFileName
 	proxyConfigVolume    = "config"
 
+	// configKeyStatusFilePath is proxy.conf's key naming the file whose
+	// existence Pulsar's VipStatus serves at /status.html - the endpoint the
+	// operator's liveness/readiness probe hits. proxyStatusFilePath is where
+	// the operator points it and where the container's startup command writes
+	// the readiness marker; the two MUST agree, so this key is operator-managed
+	// (re-asserted over user config in proxyMergedConfig). Without it VipStatus
+	// logs "Status file doesn't exist" and returns not-ready, so the probe
+	// never passes and the otherwise-healthy proxy is liveness-killed in a
+	// crashloop.
+	configKeyStatusFilePath = "statusFilePath"
+	proxyStatusFilePath     = "/pulsar/logs/status"
+
 	proxyTLSVolume    = "tls-certs"
 	proxyTLSMountPath = "/pulsar/certs/proxy"
 	proxyTLSCertPath  = proxyTLSMountPath + "/tls.crt"
@@ -218,10 +230,14 @@ func (r *ProxyReconciler) reconcileStatefulSet(
 				Affinity:                  builder.PodAntiAffinity(false, selector),
 				TopologySpreadConstraints: builder.ZoneTopologySpreadConstraints(selector),
 				Containers: []corev1.Container{{
-					Name:           proxyComponent,
-					Image:          proxyImage(proxy.Spec.Image),
-					Command:        []string{cmdBinPulsar},
-					Args:           []string{"proxy"},
+					Name:  proxyComponent,
+					Image: proxyImage(proxy.Spec.Image),
+					// Write the /status.html readiness marker before starting so
+					// the VipStatus-backed liveness/readiness probe can pass once
+					// the web server is up (see configKeyStatusFilePath); exec so
+					// the proxy stays PID 1 and receives SIGTERM directly.
+					Command:        []string{"sh", "-c"},
+					Args:           []string{fmt.Sprintf("echo OK > %s && exec %s proxy", proxyStatusFilePath, cmdBinPulsar)},
 					Ports:          proxyContainerPorts(proxy.Spec.Tls),
 					Resources:      proxy.Spec.Resources,
 					LivenessProbe:  proxyProbe(),
@@ -347,7 +363,12 @@ func proxyTLSDefaultConfig(tls *clusterv1alpha1.ProxyTlsConfig) map[string]strin
 // spec.config, so a user override always wins.
 func proxyMergedConfig(spec clusterv1alpha1.ProxySpec) map[string]string {
 	merged := config.Merge(proxyDefaultConfig(), proxyTLSDefaultConfig(spec.Tls))
-	return config.Merge(merged, spec.Config)
+	merged = config.Merge(merged, spec.Config)
+	// Operator-managed: statusFilePath must match the readiness marker the
+	// container's startup command writes (see buildProxyContainer /
+	// configKeyStatusFilePath), so it is re-asserted over any user override.
+	merged[configKeyStatusFilePath] = proxyStatusFilePath
+	return merged
 }
 
 func proxyContainerPorts(tls *clusterv1alpha1.ProxyTlsConfig) []corev1.ContainerPort {

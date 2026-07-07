@@ -90,6 +90,7 @@ func TestMergeConfig_OperatorManagedKeysAreNotUserOverridable(t *testing.T) {
 			keyBookiePort:         "9999",
 			keyHTTPServerPort:     "1234",
 			keyHTTPServerEnabled:  "false",
+			keyHTTPServerClass:    "com.example.CustomHttpServer",
 			keyJournalDirectories: "/tmp/a,/tmp/b",
 			keyLedgerDirectories:  "",
 			keyIndexDirectories:   "/somewhere/else",
@@ -102,7 +103,8 @@ func TestMergeConfig_OperatorManagedKeysAreNotUserOverridable(t *testing.T) {
 	managed := map[string]string{
 		keyBookiePort:         "3181",
 		keyHTTPServerPort:     "8000",
-		keyHTTPServerEnabled:  "true",
+		keyHTTPServerEnabled:  configValTrue,
+		keyHTTPServerClass:    bookieHTTPServerClass,
 		keyJournalDirectories: journalMountPath,
 		keyLedgerDirectories:  ledgerMountPath,
 		keyIndexDirectories:   indexMountPath,
@@ -124,6 +126,7 @@ func TestMergeConfig_OperatorManagedKeysAreNotUserOverridable(t *testing.T) {
 // this must only change deliberately.
 func TestMergeConfig_Regression(t *testing.T) {
 	const want = "bookiePort=3181\n" +
+		"httpServerClass=org.apache.bookkeeper.http.vertx.VertxHttpServer\n" +
 		"httpServerEnabled=true\n" +
 		"httpServerPort=8000\n" +
 		"indexDirectories=/pulsar/data/bookkeeper/index\n" +

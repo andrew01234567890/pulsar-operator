@@ -90,8 +90,10 @@ var _ = Describe("Proxy Controller", func() {
 			Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
 			Expect(sts.Spec.ServiceName).To(Equal(resourceName))
 			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
-			Expect(sts.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{cmdBinPulsar}))
-			Expect(sts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"proxy"}))
+			Expect(sts.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"sh", "-c"}))
+			Expect(sts.Spec.Template.Spec.Containers[0].Args).To(HaveLen(1))
+			Expect(sts.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("echo OK > " + proxyStatusFilePath))
+			Expect(sts.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring(cmdBinPulsar + " proxy"))
 			Expect(sts.Spec.Template.Annotations).To(HaveKey(builder.ConfigChecksumAnnotation))
 
 			By("soft anti-affinity keyed on the proxy selector (stateless tier)")
@@ -568,6 +570,18 @@ func TestProxyMergedConfig(t *testing.T) {
 		}
 		if got["webServicePort"] != "18080" {
 			t.Errorf("webServicePort = %q, want user override 18080", got["webServicePort"])
+		}
+	})
+
+	t.Run("statusFilePath is operator-managed and matches the container's marker path", func(t *testing.T) {
+		// A user override must NOT win here: statusFilePath has to equal the
+		// path the container's startup command writes, or the /status.html
+		// probe never passes and the proxy crashloops.
+		got := proxyMergedConfig(clusterv1alpha1.ProxySpec{
+			Config: map[string]string{configKeyStatusFilePath: "/tmp/user-override"},
+		})
+		if got[configKeyStatusFilePath] != proxyStatusFilePath {
+			t.Errorf("statusFilePath = %q, want operator-managed %q", got[configKeyStatusFilePath], proxyStatusFilePath)
 		}
 	})
 }

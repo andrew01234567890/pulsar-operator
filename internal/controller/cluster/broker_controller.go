@@ -72,11 +72,22 @@ const (
 	simpleLoadManagerClassName = "org.apache.pulsar.broker.loadbalance.impl.ModularLoadManagerImpl"
 	loadBalancerSimple         = "simple"
 
+	// transferShedderClassName is the only loadBalancerLoadSheddingStrategy
+	// that implements NamespaceUnloadStrategy, the interface
+	// ExtensibleLoadManagerImpl requires of its shedder. Pulsar's own
+	// broker.conf default, ThresholdShedder, implements the older
+	// LoadSheddingStrategy interface instead, so pairing it with
+	// ExtensibleLoadManagerImpl makes the broker log "ThresholdShedder does
+	// not implement NamespaceUnloadStrategy" and never shed load.
+	transferShedderClassName = "org.apache.pulsar.broker.loadbalance.extensions.scheduler.TransferShedder"
+
 	// broker.conf keys the operator sets or reads back out of the merged config.
-	confKeyBrokerServicePort       = "brokerServicePort"
-	confKeyWebServicePort          = "webServicePort"
-	confKeyLoadManagerClassName    = "loadManagerClassName"
-	confKeyBrokerShutdownTimeoutMs = "brokerShutdownTimeoutMs"
+	confKeyBrokerServicePort                = "brokerServicePort"
+	confKeyWebServicePort                   = "webServicePort"
+	confKeyLoadManagerClassName             = "loadManagerClassName"
+	confKeyLoadBalancerLoadSheddingStrategy = "loadBalancerLoadSheddingStrategy"
+	confKeyLoadBalancerTransferEnabled      = "loadBalancerTransferEnabled"
+	confKeyBrokerShutdownTimeoutMs          = "brokerShutdownTimeoutMs"
 
 	// defaultBrokerShutdownTimeoutMs matches upstream broker.conf's own
 	// default: how long Pulsar's shutdown hook is given to unload bundles
@@ -289,12 +300,21 @@ func mergedBrokerConfig(broker *clusterv1alpha1.Broker) map[string]string {
 }
 
 func defaultBrokerConfig(spec clusterv1alpha1.BrokerSpec) map[string]string {
-	return map[string]string{
+	cfg := map[string]string{
 		confKeyBrokerServicePort:       strconv.Itoa(int(defaultBrokerServicePort)),
 		confKeyWebServicePort:          strconv.Itoa(int(defaultWebServicePort)),
 		confKeyLoadManagerClassName:    loadManagerClassName(spec.LoadBalancer),
 		confKeyBrokerShutdownTimeoutMs: strconv.FormatInt(defaultBrokerShutdownTimeoutMs, 10),
 	}
+	if cfg[confKeyLoadManagerClassName] == extensibleLoadManagerClassName {
+		// ExtensibleLoadManagerImpl needs a NamespaceUnloadStrategy shedder
+		// (TransferShedder) plus loadBalancerTransferEnabled to actually
+		// perform live bundle transfer during shedding; see
+		// transferShedderClassName above for why the upstream default breaks.
+		cfg[confKeyLoadBalancerLoadSheddingStrategy] = transferShedderClassName
+		cfg[confKeyLoadBalancerTransferEnabled] = configValTrue
+	}
+	return cfg
 }
 
 // loadManagerClassName maps BrokerSpec.LoadBalancer to the concrete Pulsar

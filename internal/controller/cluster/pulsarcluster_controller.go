@@ -92,6 +92,7 @@ const (
 // +kubebuilder:rbac:groups=metadata.pulsaroperator.io,resources=oxiaclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=metadata.pulsaroperator.io,resources=oxiaclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile decomposes a PulsarCluster into its per-component child CRs,
@@ -226,6 +227,7 @@ func (r *PulsarClusterReconciler) reconcileBroker(ctx context.Context, cluster *
 
 	desired := buildBrokerSpec(cluster.Spec)
 	desired.Config = withBrokerProxyMetadataDefaults(desired.Config, cluster.Name)
+	desired.Config = withBrokerBookkeeperMetadataDefault(desired.Config, cluster.Name)
 	desired.Config = withClusterNameDefault(desired.Config, cluster.Name)
 	desired.Config = withBrokerOffloadDefaults(desired.Config, cluster.Spec.Offload)
 
