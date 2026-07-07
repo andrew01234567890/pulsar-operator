@@ -209,7 +209,7 @@ func TestResolveRackPeriodSeconds(t *testing.T) {
 		cfg  *clusterv1alpha1.BookKeeperAutoRackConfig
 		want int32
 	}{
-		{name: "unset falls back to default", cfg: &clusterv1alpha1.BookKeeperAutoRackConfig{}, want: defaultRackSyncPeriodSeconds},
+		{name: testCaseUnsetFallsBackToDefault, cfg: &clusterv1alpha1.BookKeeperAutoRackConfig{}, want: defaultRackSyncPeriodSeconds},
 		{name: testCaseExplicitValueWins, cfg: &clusterv1alpha1.BookKeeperAutoRackConfig{PeriodSeconds: int32Ptr(30)}, want: 30},
 	}
 	for _, tt := range tests {
