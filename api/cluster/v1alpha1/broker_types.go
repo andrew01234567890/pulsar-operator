@@ -150,6 +150,13 @@ type BrokerStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// lastScaleTime is the last time the broker autoscaler changed
+	// spec.replicas. The stabilization window is measured from this
+	// timestamp, so it is left unset until the first autoscaler-driven
+	// scaling event.
+	// +optional
+	LastScaleTime *metav1.Time `json:"lastScaleTime,omitempty"`
+
 	// conditions represent the current state of the Broker resource.
 	// +listType=map
 	// +listMapKey=type

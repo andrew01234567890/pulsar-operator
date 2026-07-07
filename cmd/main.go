@@ -195,6 +195,13 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "cluster-broker")
 		os.Exit(1)
 	}
+	if err := (&clustercontroller.BrokerAutoscalerReconciler{
+		Client:   mgr.GetClient(),
+		Recorder: mgr.GetEventRecorder("broker-autoscaler"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "cluster-broker-autoscaler")
+		os.Exit(1)
+	}
 	if err := (&clustercontroller.BookKeeperReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),

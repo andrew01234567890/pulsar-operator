@@ -317,6 +317,14 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              lastScaleTime:
+                description: |-
+                  lastScaleTime is the last time the broker autoscaler changed
+                  spec.replicas. The stabilization window is measured from this
+                  timestamp, so it is left unset until the first autoscaler-driven
+                  scaling event.
+                format: date-time
+                type: string
               observedGeneration:
                 description: observedGeneration is the most recent generation observed
                   by the controller.
