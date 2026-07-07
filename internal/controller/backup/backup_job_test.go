@@ -95,6 +95,20 @@ func TestBuildExportJobCoreSpec(t *testing.T) {
 		t.Errorf("args[0] = %q, want backup-export", c.Args[0])
 	}
 
+	// The --result-path arg must match the container's TerminationMessagePath
+	// exactly (both are the terminationMessagePath constant), so the tool
+	// writes its result where the reconciler reads it.
+	resultPath, ok := argValue(c.Args, "--result-path")
+	if !ok {
+		t.Error("missing --result-path arg")
+	}
+	if resultPath != c.TerminationMessagePath {
+		t.Errorf("--result-path %q != TerminationMessagePath %q", resultPath, c.TerminationMessagePath)
+	}
+	if c.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
+		t.Errorf("TerminationMessagePolicy = %q, want FallbackToLogsOnError/ReadFile", c.TerminationMessagePolicy)
+	}
+
 	for flag, want := range map[string]string{
 		"--oxia":        "c1-oxia-oxia:6648",
 		"--dest-driver": testDriverAWSS3,

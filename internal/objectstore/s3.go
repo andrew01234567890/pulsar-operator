@@ -55,6 +55,16 @@ func newS3Store(ctx context.Context, cfg Config) (*s3Store, error) {
 			// <bucket>.<endpoint> virtual-host DNS rarely resolves there.
 			o.BaseEndpoint = aws.String(cfg.Endpoint)
 			o.UsePathStyle = true
+
+			// aws-sdk-go-v2 defaults to WhenSupported, which stamps a
+			// CRC32 checksum (x-amz-checksum-crc32 / x-amz-sdk-checksum-algorithm)
+			// on every request; many S3-compatible stores (older MinIO, Ceph
+			// RGW) reject those trailers with an XML/SignatureDoesNotMatch
+			// error. A custom endpoint implies such a store, so downgrade to
+			// WhenRequired - AWS proper never sets an endpoint, so this never
+			// weakens real-S3 uploads.
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		}
 	})
 	return &s3Store{cfg: cfg, client: client}, nil

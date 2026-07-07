@@ -19,6 +19,7 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -64,6 +65,14 @@ var _ = Describe("Backup Controller", func() {
 			NamespacedName: types.NamespacedName{Name: name, Namespace: resourceNamespace},
 		})
 		Expect(err).NotTo(HaveOccurred())
+	}
+
+	reconcileResult := func(r *BackupReconciler, name string) reconcile.Result {
+		res, err := r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: resourceNamespace},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		return res
 	}
 
 	getBackup := func(name string) *backupv1alpha1.Backup {
@@ -205,8 +214,8 @@ var _ = Describe("Backup Controller", func() {
 			Expect(rec.Events).To(Receive(ContainSubstring("Warning")))
 		})
 
-		It("marks Failed and emits a Warning when the Job's pod is stuck on an image pull", func() {
-			const name = "backup-s3-imgpull"
+		It("surfaces a Warning and requeues (does not fail) while an image pull is within the grace window", func() {
+			const name = "backup-s3-imgpull-grace"
 			createS3Backup(name)
 			rec := events.NewFakeRecorder(8)
 			r := newReconciler(rec)
@@ -214,18 +223,66 @@ var _ = Describe("Backup Controller", func() {
 
 			job := getJob(name)
 			createStuckImagePullPod(ctx, name, job)
-
-			// The pod is stuck Pending on ImagePullBackOff; the Job itself never
-			// trips Failed, so this exercises the direct image-pull detection.
 			job.Status.Active = 1
+			Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+
+			// Default clock: the pod was just created, so the grace period has
+			// not elapsed - the Backup must self-heal-eligible (requeue), not
+			// be failed. This is the transient-registry-429 case.
+			res := reconcileResult(r, name)
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+
+			backup := getBackup(name)
+			Expect(backup.Status.Phase).To(Equal(backupv1alpha1.BackupPhasePending))
+			Expect(findCondition(backup).Reason).To(Equal(reasonImagePullError))
+			Expect(rec.Events).To(Receive(ContainSubstring("Warning")))
+		})
+
+		It("marks Failed and emits a Warning once the image-pull grace period elapses", func() {
+			const name = "backup-s3-imgpull-expired"
+			createS3Backup(name)
+			rec := events.NewFakeRecorder(8)
+			r := newReconciler(rec)
+			reconcileOnce(r, name)
+
+			job := getJob(name)
+			pod := createStuckImagePullPod(ctx, name, job)
+			job.Status.Active = 1
+			Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+
+			// Advance the reconciler clock past the grace period, measured from
+			// the stuck pod's creation.
+			r.Now = func() time.Time { return pod.CreationTimestamp.Add(exportStuckGracePeriod + time.Minute) }
+
+			reconcileOnce(r, name)
+
+			backup := getBackup(name)
+			Expect(backup.Status.Phase).To(Equal(backupv1alpha1.BackupPhaseFailed))
+			Expect(findCondition(backup).Reason).To(Equal(reasonImagePullError))
+			Expect(rec.Events).To(Receive(ContainSubstring("Warning")))
+		})
+
+		It("marks Failed when the Job reports success but its result is unreadable", func() {
+			const name = "backup-s3-noresult"
+			createS3Backup(name)
+			rec := events.NewFakeRecorder(8)
+			r := newReconciler(rec)
+			reconcileOnce(r, name)
+
+			job := getJob(name)
+			// A succeeded Job whose pod carries no parseable ExportResult must
+			// never be reported as a zeroed Completed - the backup is
+			// unverifiable, so it is a failure.
+			createTerminatedExportPodNoResult(ctx, name, job)
+			job.Status.Succeeded = 1
 			Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
 
 			reconcileOnce(r, name)
 
 			backup := getBackup(name)
 			Expect(backup.Status.Phase).To(Equal(backupv1alpha1.BackupPhaseFailed))
-			cond := findCondition(backup)
-			Expect(cond.Reason).To(Equal(reasonImagePullError))
+			Expect(backup.Status.OxiaKeysCaptured).To(Equal(int64(0)))
+			Expect(findCondition(backup).Reason).To(Equal(reasonExportResultUnreadable))
 			Expect(rec.Events).To(Receive(ContainSubstring("Warning")))
 		})
 	})
@@ -302,8 +359,8 @@ func createTerminatedExportPod(ctx context.Context, backupName string, job *batc
 			Namespace: job.Namespace,
 			Labels:    builder.SelectorLabels(backupName, backupComponentName),
 			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: "batch/v1",
-				Kind:       "Job",
+				APIVersion: testJobOwnerAPIVer,
+				Kind:       testJobOwnerKind,
 				Name:       job.Name,
 				UID:        job.UID,
 				Controller: &controller,
@@ -328,10 +385,11 @@ func createTerminatedExportPod(ctx context.Context, backupName string, job *batc
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
 
-// createStuckImagePullPod creates a pod controlled by job whose export
-// container is Waiting on ImagePullBackOff - the kubelet state that leaves the
-// pod Pending forever without ever tripping the Job's Failed condition.
-func createStuckImagePullPod(ctx context.Context, backupName string, job *batchv1.Job) {
+// createTerminatedExportPodNoResult creates a controlled pod whose export
+// container terminated with an EMPTY message - a succeeded Job with no readable
+// ExportResult, which the reconciler must treat as a failure, not a zeroed
+// Completed.
+func createTerminatedExportPodNoResult(ctx context.Context, backupName string, job *batchv1.Job) {
 	controller := true
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -339,8 +397,47 @@ func createStuckImagePullPod(ctx context.Context, backupName string, job *batchv
 			Namespace: job.Namespace,
 			Labels:    builder.SelectorLabels(backupName, backupComponentName),
 			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: "batch/v1",
-				Kind:       "Job",
+				APIVersion: testJobOwnerAPIVer,
+				Kind:       testJobOwnerKind,
+				Name:       job.Name,
+				UID:        job.UID,
+				Controller: &controller,
+			}},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers:    []corev1.Container{{Name: exportContainerName, Image: "img"}},
+		},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+
+	pod.Status = corev1.PodStatus{
+		Phase: corev1.PodSucceeded,
+		ContainerStatuses: []corev1.ContainerStatus{{
+			Name: exportContainerName,
+			State: corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{Reason: "Completed", Message: ""},
+			},
+		}},
+	}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
+// createStuckImagePullPod creates a pod controlled by job whose export
+// container is Waiting on ImagePullBackOff - the kubelet state that leaves the
+// pod Pending forever without ever tripping the Job's Failed condition. It
+// returns the created pod so callers can anchor a fake clock to its
+// CreationTimestamp.
+func createStuckImagePullPod(ctx context.Context, backupName string, job *batchv1.Job) *corev1.Pod {
+	controller := true
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      backupJobName(backupName) + "-pod",
+			Namespace: job.Namespace,
+			Labels:    builder.SelectorLabels(backupName, backupComponentName),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: testJobOwnerAPIVer,
+				Kind:       testJobOwnerKind,
 				Name:       job.Name,
 				UID:        job.UID,
 				Controller: &controller,
@@ -364,6 +461,7 @@ func createStuckImagePullPod(ctx context.Context, backupName string, job *batchv
 		}},
 	}
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+	return pod
 }
 
 func findCondition(backup *backupv1alpha1.Backup) *metav1.Condition {

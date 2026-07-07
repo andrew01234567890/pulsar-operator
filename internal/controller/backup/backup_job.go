@@ -46,6 +46,13 @@ const (
 	// absorb a transient Oxia/object-store blip without spinning forever.
 	exportJobBackoffLimit int32 = 3
 
+	// exportJobActiveDeadlineSeconds is a hard backstop: the kubelet/job
+	// controller terminates the Job with DeadlineExceeded if it hasn't
+	// finished within this window. It bounds a pod that never starts (e.g. a
+	// volume that can never mount) even in cases the reconciler's own
+	// stuck-pod detection might miss, so a Backup can never hang forever.
+	exportJobActiveDeadlineSeconds int64 = 3600
+
 	// manifestKeySuffix is appended to a Backup's name to form the object key
 	// the manifest is written to (under destination.prefix).
 	manifestKeySuffix = ".manifest"
@@ -53,6 +60,13 @@ const (
 	// managerBinary is the operator image's entrypoint; the export Job runs it
 	// with the `backup-export` subcommand.
 	managerBinary = "/manager"
+
+	// terminationMessagePath is the single source of truth for WHERE the
+	// export tool writes its ExportResult and WHERE the kubelet reads the
+	// container's termination message from: it is both the container's
+	// TerminationMessagePath and the value passed to `--result-path`, so the
+	// two can never drift out of sync.
+	terminationMessagePath = "/dev/termination-log"
 )
 
 // Object-store credential env vars, wired from destination.credentialsSecretRef
@@ -127,6 +141,10 @@ func buildExportJob(backup *backupv1alpha1.Backup, cluster *clusterv1alpha1.Puls
 		"--oxia", oxiaExportAddress(cluster),
 		"--dest-driver", dest.Driver,
 		"--dest-key", manifestObjectKey(backup),
+		// Pass the result path explicitly (rather than relying on the CLI's
+		// own default matching this container's TerminationMessagePath) so the
+		// two are provably the same constant.
+		"--result-path", terminationMessagePath,
 	}
 	args = appendFlagIfSet(args, "--dest-bucket", dest.Bucket)
 	args = appendFlagIfSet(args, "--dest-region", dest.Region)
@@ -140,7 +158,8 @@ func buildExportJob(backup *backupv1alpha1.Backup, cluster *clusterv1alpha1.Puls
 			Labels:    labels,
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit: &[]int32{exportJobBackoffLimit}[0],
+			BackoffLimit:          &[]int32{exportJobBackoffLimit}[0],
+			ActiveDeadlineSeconds: &[]int64{exportJobActiveDeadlineSeconds}[0],
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
@@ -155,7 +174,7 @@ func buildExportJob(backup *backupv1alpha1.Backup, cluster *clusterv1alpha1.Puls
 							// The export tool writes its ExportResult here; the
 							// reconciler reads it back from the pod's
 							// terminated-container Message.
-							TerminationMessagePath:   "/dev/termination-log",
+							TerminationMessagePath:   terminationMessagePath,
 							TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 							VolumeMounts:             destCredentialVolumeMounts(dest),
 						},

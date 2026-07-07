@@ -47,25 +47,45 @@ const (
 	// False (with a describing reason) while pending/running or on any failure.
 	conditionTypeExportSucceeded = "ExportSucceeded"
 
-	reasonPending          = "Pending"
-	reasonRunning          = "Running"
-	reasonCompleted        = "Completed"
-	reasonExportJobFailed  = "ExportJobFailed"
-	reasonImagePullError   = "ImagePullError"
-	reasonClusterNotFound  = "ClusterNotFound"
-	reasonOperatorImage    = "OperatorImageNotConfigured"
-	reasonConsistencyUnsup = "ApplicationConsistencyNotImplemented"
+	reasonPending                = "Pending"
+	reasonRunning                = "Running"
+	reasonCompleted              = "Completed"
+	reasonExportJobFailed        = "ExportJobFailed"
+	reasonImagePullError         = "ImagePullError"
+	reasonContainerConfigError   = "ContainerConfigError"
+	reasonPodStartTimeout        = "PodStartTimeout"
+	reasonExportResultUnreadable = "ExportResultUnreadable"
+	reasonClusterNotFound        = "ClusterNotFound"
+	reasonOperatorImage          = "OperatorImageNotConfigured"
+	reasonConsistencyUnsup       = "ApplicationConsistencyNotImplemented"
 
 	// exportPollInterval backstops the Owns(&Job{}) watch: a Job whose pod is
 	// stuck Waiting on an image pull never changes the Job object, so nothing
 	// else re-triggers reconciliation - this keeps re-checking until it does.
 	exportPollInterval = 15 * time.Second
 
-	// Container Waiting reasons for an unpullable image; such a pod sits
-	// Pending forever and never trips the Job's own Failed condition, so it is
-	// surfaced explicitly (mirrors the metadata-init ImagePullBackOff fix).
-	containerWaitingReasonImagePullBackOff = "ImagePullBackOff"
-	containerWaitingReasonErrImagePull     = "ErrImagePull"
+	// exportStuckGracePeriod is how long a wedged pod (see podStuck) is
+	// tolerated - surfaced as a Warning + requeue so it can self-heal if the
+	// wedge clears (e.g. a transient Docker Hub 429 during the image pull) -
+	// before the Backup is failed. A backup's spec is immutable, so failing
+	// too eagerly would make a recoverable blip permanently unrecoverable;
+	// this mirrors the metadata-init recreate grace.
+	exportStuckGracePeriod = 5 * time.Minute
+
+	// Container Waiting reasons that never trip a Job's own Failed condition
+	// (BackoffLimit is never consumed), so the reconciler must detect them
+	// directly. The image-pull pair is a hard, immediately-reported wedge; the
+	// CreateContainer* pair is a hard credential/config wedge (a missing
+	// secretKeyRef, an unmountable secret); ContainerCreating/PodInitializing
+	// are soft, normal-at-first waits that only count as wedged once they
+	// outlast exportStuckGracePeriod (e.g. a GCS secret whose JSON is stored
+	// under a data key other than the required key.json can never mount).
+	containerWaitingReasonImagePullBackOff     = "ImagePullBackOff"
+	containerWaitingReasonErrImagePull         = "ErrImagePull"
+	containerWaitingReasonCreateConfigError    = "CreateContainerConfigError"
+	containerWaitingReasonCreateContainerError = "CreateContainerError"
+	containerWaitingReasonContainerCreating    = "ContainerCreating"
+	containerWaitingReasonPodInitializing      = "PodInitializing"
 )
 
 // BackupReconciler reconciles a Backup object: it captures the cluster's Oxia
@@ -82,6 +102,18 @@ type BackupReconciler struct {
 	// the OPERATOR_IMAGE env in cmd/main.go; an empty value fails the Backup
 	// with a clear condition rather than launching an unrunnable Job.
 	OperatorImage string
+
+	// Now returns the current time; nil defaults to time.Now. Tests override
+	// it so the exportStuckGracePeriod-gated fail logic needs no real sleep.
+	Now func() time.Time
+}
+
+// now returns the current time, honoring an injected clock for tests.
+func (r *BackupReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 // +kubebuilder:rbac:groups=backup.pulsaroperator.io,resources=backups,verbs=get;list;watch;create;update;patch;delete
@@ -158,9 +190,11 @@ func (r *BackupReconciler) advance(ctx context.Context, backup *backupv1alpha1.B
 
 // reconcileExportJob ensures the export Job exists and maps its observed state
 // onto the Backup's phase/status. A missing Job is created (phase Pending); a
-// running Job advances Pending->Running; a succeeded Job is read back into
-// Completed; a terminally-failed Job, or one wedged on an image pull, becomes
-// Failed with a Warning event.
+// running Job advances Pending->Running; a succeeded Job whose result is
+// readable becomes Completed (an unreadable result is a failure, never a
+// zeroed "success"); a terminally-failed Job becomes Failed; a wedged pod is
+// tolerated for exportStuckGracePeriod (Warning + requeue so it can self-heal)
+// and only then failed.
 func (r *BackupReconciler) reconcileExportJob(ctx context.Context, backup *backupv1alpha1.Backup, cluster *clusterv1alpha1.PulsarCluster) (ctrl.Result, error) {
 	name := backupJobName(backup.Name)
 	var job batchv1.Job
@@ -174,24 +208,21 @@ func (r *BackupReconciler) reconcileExportJob(ctx context.Context, backup *backu
 
 	switch {
 	case jobSucceeded(&job):
-		r.complete(ctx, backup, &job)
-		return ctrl.Result{}, nil
+		return r.completeFromJob(ctx, backup, &job)
 	case jobFailedPermanently(&job):
 		r.fail(backup, reasonExportJobFailed, fmt.Sprintf("export job %q failed", name))
 		return ctrl.Result{}, nil
 	}
 
-	stuck, err := r.imagePullStuck(ctx, backup, &job)
+	stuck, err := r.podStuck(ctx, backup, &job)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if stuck.stuck {
-		r.fail(backup, reasonImagePullError,
-			fmt.Sprintf("export job %q cannot pull image %q: %s", name, stuck.image, stuck.reason))
-		return ctrl.Result{}, nil
+		return r.handleStuck(backup, name, stuck), nil
 	}
 
-	// Job exists but is neither done nor failed: Pending until its pod is
+	// Job exists, neither done nor failed nor wedged: Pending until its pod is
 	// Active, Running once it is.
 	if job.Status.Active > 0 {
 		r.setInProgress(backup, backupv1alpha1.BackupPhaseRunning, reasonRunning,
@@ -201,6 +232,32 @@ func (r *BackupReconciler) reconcileExportJob(ctx context.Context, backup *backu
 			fmt.Sprintf("export job %q is starting", name))
 	}
 	return ctrl.Result{RequeueAfter: exportPollInterval}, nil
+}
+
+// handleStuck decides what to do about a wedged export pod (see podStuck): a
+// hard wedge (image pull, container config) is surfaced as a Warning + requeue
+// immediately so it can self-heal, and failed only once it has outlasted
+// exportStuckGracePeriod; a soft wait (ContainerCreating) is reported as plain
+// Pending until it outlasts the grace period, then failed as a start timeout.
+func (r *BackupReconciler) handleStuck(backup *backupv1alpha1.Backup, jobName string, stuck podStuckInfo) ctrl.Result {
+	elapsed := r.now().Sub(stuck.since)
+	message := fmt.Sprintf("export job %q %s", jobName, stuck.message)
+
+	switch {
+	case stuck.hard && elapsed >= exportStuckGracePeriod:
+		r.fail(backup, stuck.reason, message)
+		return ctrl.Result{}
+	case stuck.hard:
+		r.reportStuck(backup, stuck.reason, message)
+		return ctrl.Result{RequeueAfter: exportPollInterval}
+	case elapsed >= exportStuckGracePeriod:
+		r.fail(backup, reasonPodStartTimeout, message)
+		return ctrl.Result{}
+	default:
+		r.setInProgress(backup, backupv1alpha1.BackupPhasePending, reasonPending,
+			fmt.Sprintf("export job %q pod is starting", jobName))
+		return ctrl.Result{RequeueAfter: exportPollInterval}
+	}
 }
 
 // createExportJob builds and creates the owner-ref'd export Job, records the
@@ -225,18 +282,32 @@ func (r *BackupReconciler) createExportJob(ctx context.Context, backup *backupv1
 	return ctrl.Result{RequeueAfter: exportPollInterval}, nil
 }
 
-// complete reads the ExportResult back from the succeeded Job's pod
+// completeFromJob reads the ExportResult back from the succeeded Job's pod
 // termination message and moves the Backup to Completed with the captured
-// key/instanceId/size populated truthfully.
-func (r *BackupReconciler) complete(ctx context.Context, backup *backupv1alpha1.Backup, job *batchv1.Job) {
-	if result, ok := r.readExportResult(ctx, backup, job); ok {
-		if result.ArtifactURI != "" {
-			backup.Status.ArtifactURI = result.ArtifactURI
-		}
-		backup.Status.OxiaKeysCaptured = result.OxiaKeysCaptured
-		backup.Status.CapturedInstanceID = result.CapturedInstanceID
-		backup.Status.SizeBytes = result.SizeBytes
+// key/instanceId/size populated truthfully. A Job that reports success but
+// whose result cannot be read (missing/empty/unparsable termination message)
+// is a FAILURE, not a zeroed Completed: reporting an unverifiable backup as
+// good is worse than reporting it failed, and Restore's lineage gate depends
+// on a real capturedInstanceId. A transient error listing the pod requeues
+// rather than failing.
+func (r *BackupReconciler) completeFromJob(ctx context.Context, backup *backupv1alpha1.Backup, job *batchv1.Job) (ctrl.Result, error) {
+	result, ok, err := r.readExportResult(ctx, backup, job)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
+	if !ok {
+		r.fail(backup, reasonExportResultUnreadable, fmt.Sprintf(
+			"export job %q reported success but no readable result was found in its pod termination message; the backup's contents cannot be verified",
+			job.Name))
+		return ctrl.Result{}, nil
+	}
+
+	if result.ArtifactURI != "" {
+		backup.Status.ArtifactURI = result.ArtifactURI
+	}
+	backup.Status.OxiaKeysCaptured = result.OxiaKeysCaptured
+	backup.Status.CapturedInstanceID = result.CapturedInstanceID
+	backup.Status.SizeBytes = result.SizeBytes
 
 	backup.Status.Phase = backupv1alpha1.BackupPhaseCompleted
 	if backup.Status.CompletionTime == nil {
@@ -252,6 +323,7 @@ func (r *BackupReconciler) complete(ctx context.Context, backup *backupv1alpha1.
 	})
 	r.recorder().Eventf(backup, nil, corev1.EventTypeNormal, reasonCompleted, "Backup",
 		"captured %d Oxia key(s) to %s", backup.Status.OxiaKeysCaptured, backup.Status.ArtifactURI)
+	return ctrl.Result{}, nil
 }
 
 // setInProgress sets a non-terminal phase (Pending/Running) and its matching
@@ -265,6 +337,19 @@ func (r *BackupReconciler) setInProgress(backup *backupv1alpha1.Backup, phase, r
 		Reason:             reason,
 		Message:            message,
 	})
+}
+
+// reportStuck records a still-recoverable wedge as a Pending/False condition
+// and emits a Warning event, but only the first reconcile the wedge's reason
+// is observed (deduped against the current condition) so a stuck pod doesn't
+// re-fire the Warning on every exportPollInterval requeue.
+func (r *BackupReconciler) reportStuck(backup *backupv1alpha1.Backup, reason, message string) {
+	prior := apimeta.FindStatusCondition(backup.Status.Conditions, conditionTypeExportSucceeded)
+	changed := prior == nil || prior.Reason != reason
+	r.setInProgress(backup, backupv1alpha1.BackupPhasePending, reason, message)
+	if changed {
+		r.recorder().Eventf(backup, nil, corev1.EventTypeWarning, reason, "Backup", "%s", message)
+	}
 }
 
 // fail moves the Backup to Failed with a describing condition, stamps
@@ -288,18 +373,19 @@ func (r *BackupReconciler) fail(backup *backupv1alpha1.Backup, reason, message s
 
 // readExportResult recovers the ExportResult the export tool wrote to its
 // container termination message. Pods are matched via the component selector
-// and filtered to ones this Job controls. A missing/unparsable result is not
-// fatal - the Backup still completes (the manifest was uploaded), just with
-// zeroed metrics - so it is logged rather than errored.
-func (r *BackupReconciler) readExportResult(ctx context.Context, backup *backupv1alpha1.Backup, job *batchv1.Job) (backuptool.ExportResult, bool) {
+// and filtered to ones this Job controls. The bool is false when the result is
+// definitively absent (no controlled pod, no terminated export container, an
+// empty message, or an unparsable one) - the caller treats that as a failed
+// backup. A non-nil error is a transient infrastructure failure (the pod List)
+// that the caller should requeue on, NOT a verdict on the backup.
+func (r *BackupReconciler) readExportResult(ctx context.Context, backup *backupv1alpha1.Backup, job *batchv1.Job) (backuptool.ExportResult, bool, error) {
 	log := logf.FromContext(ctx)
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods,
 		client.InNamespace(backup.Namespace),
 		client.MatchingLabels(builder.SelectorLabels(backup.Name, backupComponentName)),
 	); err != nil {
-		log.Error(err, "listing export job pods to read result")
-		return backuptool.ExportResult{}, false
+		return backuptool.ExportResult{}, false, fmt.Errorf("listing export job pods to read result: %w", err)
 	}
 
 	for i := range pods.Items {
@@ -318,52 +404,105 @@ func (r *BackupReconciler) readExportResult(ctx context.Context, backup *backupv
 			result, err := backuptool.ParseExportResult([]byte(msg))
 			if err != nil {
 				log.Error(err, "parsing export job termination message", "pod", pod.Name)
-				return backuptool.ExportResult{}, false
+				return backuptool.ExportResult{}, false, nil
 			}
-			return result, true
+			return result, true, nil
 		}
 	}
 	log.Info("export job succeeded but no result termination message was found", "job", job.Name)
-	return backuptool.ExportResult{}, false
+	return backuptool.ExportResult{}, false, nil
 }
 
-// imagePullInfo is the export Job's pod stuck Waiting on an image it cannot
-// pull. The zero value means "not stuck".
-type imagePullInfo struct {
-	stuck  bool
-	image  string
-	reason string
+// podStuckInfo describes an export pod wedged before it can run. The zero value
+// means "not stuck". hard distinguishes a genuine error (image pull, container
+// config) that is surfaced immediately from a soft ContainerCreating wait that
+// only counts as wedged once it outlasts the grace period. since is the stuck
+// pod's CreationTimestamp - stable across reconciles (the pod is not recreated
+// while wedged), so the caller can rate-limit the fail without persisting a
+// timestamp of its own.
+type podStuckInfo struct {
+	stuck   bool
+	hard    bool
+	reason  string
+	message string
+	since   time.Time
 }
 
-// imagePullStuck inspects the export Job's pod(s) for the single container
-// Waiting on ImagePullBackOff/ErrImagePull - a state that never trips the
-// Job's Failed condition, so it must be detected directly to avoid a silent
-// wedge (mirrors the metadata-init fix).
-func (r *BackupReconciler) imagePullStuck(ctx context.Context, backup *backupv1alpha1.Backup, job *batchv1.Job) (imagePullInfo, error) {
+// podStuck inspects the export Job's pod(s) for a container wedged in a state
+// that never trips the Job's own Failed condition, so it must be detected
+// directly (mirrors the metadata-init fix). Hard wedges (image pull, container
+// config) win over soft ones; among pods, the first hard wedge found is
+// returned, else the last soft wait.
+func (r *BackupReconciler) podStuck(ctx context.Context, backup *backupv1alpha1.Backup, job *batchv1.Job) (podStuckInfo, error) {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods,
 		client.InNamespace(backup.Namespace),
 		client.MatchingLabels(builder.SelectorLabels(backup.Name, backupComponentName)),
 	); err != nil {
-		return imagePullInfo{}, fmt.Errorf("listing export job pods: %w", err)
+		return podStuckInfo{}, fmt.Errorf("listing export job pods: %w", err)
 	}
 
+	var soft podStuckInfo
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if !metav1.IsControlledBy(pod, job) {
 			continue
 		}
-		for _, cs := range pod.Status.ContainerStatuses {
-			if cs.Name != exportContainerName || cs.State.Waiting == nil {
-				continue
-			}
-			switch cs.State.Waiting.Reason {
-			case containerWaitingReasonImagePullBackOff, containerWaitingReasonErrImagePull:
-				return imagePullInfo{stuck: true, image: cs.Image, reason: cs.State.Waiting.Reason}, nil
-			}
+		info, ok := exportPodWedge(pod)
+		if !ok {
+			continue
+		}
+		if info.hard {
+			return info, nil
+		}
+		soft = info
+	}
+	return soft, nil
+}
+
+// exportPodWedge classifies a single pod's export container as a hard wedge, a
+// soft start wait, or not stuck (running/terminated, or no status yet).
+func exportPodWedge(pod *corev1.Pod) (podStuckInfo, bool) {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name != exportContainerName || cs.State.Waiting == nil {
+			continue
+		}
+		reason := cs.State.Waiting.Reason
+		switch reason {
+		case containerWaitingReasonImagePullBackOff, containerWaitingReasonErrImagePull:
+			return podStuckInfo{
+				stuck:   true,
+				hard:    true,
+				reason:  reasonImagePullError,
+				message: fmt.Sprintf("cannot pull image %q: %s", cs.Image, reason),
+				since:   pod.CreationTimestamp.Time,
+			}, true
+		case containerWaitingReasonCreateConfigError, containerWaitingReasonCreateContainerError:
+			return podStuckInfo{
+				stuck:   true,
+				hard:    true,
+				reason:  reasonContainerConfigError,
+				message: fmt.Sprintf("container cannot be created (%s); check destination.credentialsSecretRef", reason),
+				since:   pod.CreationTimestamp.Time,
+			}, true
+		case containerWaitingReasonContainerCreating, containerWaitingReasonPodInitializing, "":
+			return podStuckInfo{
+				stuck:   true,
+				hard:    false,
+				reason:  reasonPodStartTimeout,
+				message: fmt.Sprintf("pod has not started (%s); check the destination volume/secret can be mounted", waitingReasonOrUnknown(reason)),
+				since:   pod.CreationTimestamp.Time,
+			}, true
 		}
 	}
-	return imagePullInfo{}, nil
+	return podStuckInfo{}, false
+}
+
+func waitingReasonOrUnknown(reason string) string {
+	if reason == "" {
+		return "ContainerCreating"
+	}
+	return reason
 }
 
 // patchStatus persists the Backup's status subresource only when it changed,
