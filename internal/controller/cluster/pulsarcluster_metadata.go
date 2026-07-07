@@ -43,6 +43,12 @@ const (
 	// declared in proxy_controller.go and shared package-wide).
 	configKeyMetadataServiceURI = "metadataServiceUri"
 
+	// configKeyClusterName is broker.conf/proxy.conf's key naming the Pulsar
+	// cluster a component belongs to. Pulsar 5.0.0-M1 refuses to start
+	// without it: the broker errors "Required clusterName is null" and the
+	// proxy "Cluster name cannot be empty".
+	configKeyClusterName = "clusterName"
+
 	// conditionTypeMetadataInitialized tracks the one-time bin/pulsar
 	// initialize-cluster-metadata Job that bootstraps the cluster's root
 	// metadata in Oxia (cluster name, default namespace, broker/web service
@@ -92,6 +98,13 @@ func withBrokerProxyMetadataDefaults(cfg map[string]string, clusterName string) 
 	cfg = setConfigDefault(cfg, configKeyMetadataStoreURL, url)
 	cfg = setConfigDefault(cfg, configKeyConfigurationMetadataStoreURL, url)
 	return cfg
+}
+
+// withClusterNameDefault sets clusterName to the PulsarCluster's own name,
+// unless the user already set it. See configKeyClusterName for why this is
+// required, not cosmetic.
+func withClusterNameDefault(cfg map[string]string, clusterName string) map[string]string {
+	return setConfigDefault(cfg, configKeyClusterName, clusterName)
 }
 
 // withBookKeeperMetadataDefault sets metadataServiceUri to the cluster's Oxia

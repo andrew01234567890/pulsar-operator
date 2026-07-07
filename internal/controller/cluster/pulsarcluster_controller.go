@@ -177,6 +177,7 @@ func (r *PulsarClusterReconciler) reconcileBroker(ctx context.Context, cluster *
 
 	desired := buildBrokerSpec(cluster.Spec)
 	desired.Config = withBrokerProxyMetadataDefaults(desired.Config, cluster.Name)
+	desired.Config = withClusterNameDefault(desired.Config, cluster.Name)
 	desired.Config = withBrokerOffloadDefaults(desired.Config, cluster.Spec.Offload)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
@@ -220,6 +221,7 @@ func (r *PulsarClusterReconciler) reconcileProxy(ctx context.Context, cluster *c
 
 	desired := buildProxySpec(cluster.Spec)
 	desired.Config = withBrokerProxyMetadataDefaults(desired.Config, cluster.Name)
+	desired.Config = withClusterNameDefault(desired.Config, cluster.Name)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
 		return nil
@@ -458,21 +460,28 @@ func oxiaSelected(spec clusterv1alpha1.PulsarClusterSpec) bool {
 	return spec.MetadataStore.Type == metadataStoreOxia
 }
 
-// buildOxiaSpec derives the child OxiaCluster spec, applying the cluster-wide
-// image and global storage class defaults. When spec.oxia is omitted a default
-// (empty) OxiaClusterSpec is used so CRD defaults (coordinator 2, server 3)
-// provision a working metadata store. It never returns nil.
+// buildOxiaSpec derives the child OxiaCluster spec, applying the global
+// storage class default. When spec.oxia is omitted a default (empty)
+// OxiaClusterSpec is used so CRD defaults (coordinator 2, server 3) provision
+// a working metadata store. It never returns nil.
+//
+// Unlike the other buildXSpec helpers, it deliberately never applies
+// clusterDefaultImage (PulsarCluster.spec.image / an image derived from
+// spec.pulsarVersion, e.g. apachepulsar/pulsar:5.0.0-M1): Oxia ships in a
+// wholly different image family (oxia/oxia) with no oxia binary in the
+// apachepulsar/pulsar image, so stamping the Pulsar default onto an unset
+// Coordinator/Server image would replace a working image with one that can't
+// run oxia at all. Leaving Coordinator.Image/Server.Image untouched when the
+// user hasn't set them lets the OxiaCluster reconciler's own default
+// (defaultOxiaImage) apply instead; an explicit user-set oxia image is
+// preserved as-is via the DeepCopy above.
 func buildOxiaSpec(spec clusterv1alpha1.PulsarClusterSpec) *metadatav1alpha1.OxiaClusterSpec {
 	out := spec.Oxia.DeepCopy()
 	if out == nil {
 		out = &metadatav1alpha1.OxiaClusterSpec{}
 	}
 
-	if out.Coordinator != nil {
-		out.Coordinator.Image = effectiveImage(out.Coordinator.Image, clusterDefaultImage(spec))
-	}
 	if out.Server != nil {
-		out.Server.Image = effectiveImage(out.Server.Image, clusterDefaultImage(spec))
 		if sc := globalStorageClassName(spec); sc != nil && out.Server.StorageClassName == nil {
 			out.Server.StorageClassName = sc
 		}

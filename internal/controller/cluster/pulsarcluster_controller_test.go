@@ -100,6 +100,7 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(metav1.IsControlledBy(broker, pulsarCluster)).To(BeTrue())
 		Expect(broker.Spec.Config).To(HaveKeyWithValue("metadataStoreUrl", wantOxiaURL))
 		Expect(broker.Spec.Config).To(HaveKeyWithValue("configurationMetadataStoreUrl", wantOxiaURL))
+		Expect(broker.Spec.Config).To(HaveKeyWithValue("clusterName", clusterName))
 
 		By("creating the BookKeeper child with the propagated global storage class and the injected metadataServiceUri")
 		bookKeeper := &clusterv1alpha1.BookKeeper{}
@@ -109,10 +110,15 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(bookKeeper.Spec.Config).To(HaveKeyWithValue(
 			"metadataServiceUri", "metadata-store:oxia://"+clusterName+"-oxia-oxia:6648/bookkeeper"))
 
-		By("creating the OxiaCluster child with the propagated image and storage class")
+		By("creating the OxiaCluster child with the propagated storage class but NOT the cluster-wide pulsar image")
 		oxia := &metadatav1alpha1.OxiaCluster{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-oxia", Namespace: namespace.Name}, oxia)).To(Succeed())
-		Expect(oxia.Spec.Server.Image).To(Equal(clusterImage))
+		// Regression: apachepulsar/pulsar has no oxia binary, so the umbrella
+		// must never stamp its own image onto the OxiaCluster child - only the
+		// OxiaCluster reconciler's own oxia/oxia default (or an explicit
+		// user-set oxia image) may apply.
+		Expect(oxia.Spec.Server.Image).NotTo(Equal(clusterImage))
+		Expect(oxia.Spec.Server.Image).To(BeEmpty())
 		Expect(oxia.Spec.Server.StorageClassName).To(HaveValue(Equal(storageClass)))
 		Expect(metav1.IsControlledBy(oxia, pulsarCluster)).To(BeTrue())
 
@@ -593,6 +599,52 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(broker.Spec.VolumeMounts).To(HaveLen(1))
 		Expect(broker.Spec.VolumeMounts[0].MountPath).To(Equal(gcsOffloadKeyDir))
 		Expect(broker.Spec.VolumeMounts[0].Name).To(Equal(broker.Spec.Volumes[0].Name))
+	})
+
+	It("injects clusterName into the Broker and Proxy child config, without overwriting a user-set value", func() {
+		// Regression: Pulsar 5.0.0-M1 refuses to start without clusterName -
+		// the broker errors "Required clusterName is null" and the proxy
+		// "Cluster name cannot be empty" - so the umbrella must inject it the
+		// same way it injects metadataStoreUrl.
+		pulsarCluster := &clusterv1alpha1.PulsarCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: namespace.Name,
+			},
+			Spec: clusterv1alpha1.PulsarClusterSpec{
+				Broker: &clusterv1alpha1.BrokerSpec{},
+				Proxy:  &clusterv1alpha1.ProxySpec{},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("setting clusterName on the Broker child to the PulsarCluster's own name")
+		broker := &clusterv1alpha1.Broker{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
+		Expect(broker.Spec.Config).To(HaveKeyWithValue("clusterName", clusterName))
+
+		By("setting clusterName on the Proxy child too")
+		proxy := &clusterv1alpha1.Proxy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-proxy", Namespace: namespace.Name}, proxy)).To(Succeed())
+		Expect(proxy.Spec.Config).To(HaveKeyWithValue("clusterName", clusterName))
+
+		By("not overwriting a user-set clusterName on either child")
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		pulsarCluster.Spec.Broker.Config = map[string]string{"clusterName": "user-broker-cluster"}
+		pulsarCluster.Spec.Proxy.Config = map[string]string{"clusterName": "user-proxy-cluster"}
+		Expect(k8sClient.Update(ctx, pulsarCluster)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
+		Expect(broker.Spec.Config).To(HaveKeyWithValue("clusterName", "user-broker-cluster"))
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-proxy", Namespace: namespace.Name}, proxy)).To(Succeed())
+		Expect(proxy.Spec.Config).To(HaveKeyWithValue("clusterName", "user-proxy-cluster"))
 	})
 })
 
