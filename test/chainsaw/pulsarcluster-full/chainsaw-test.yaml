@@ -1,0 +1,163 @@
+# Declarative reconcile-contract case: a full PulsarCluster (Broker,
+# BookKeeper, Proxy, Oxia). Asserts the child CRs and their StatefulSets are
+# stamped out with the requested (deliberately uneven, to prove they're each
+# read independently) replica counts, the injected oxia:// metadata URLs, the
+# operator-injected clusterName, and owner references - all reachable without
+# waiting for any pod to actually become Ready (see test/e2e's Ginkgo suite
+# for the full end-to-end path).
+#
+# The Broker/Proxy config assertions include clusterName=<cluster name>, which
+# the PulsarCluster reconciler injects (withClusterNameDefault, added in #26):
+# Pulsar 5.0.0-M1 requires it to start the broker ("Required clusterName is
+# null") and to build the proxy's OpenTelemetryService ("Cluster name cannot
+# be empty"). Asserting it here is the declarative regression guard for that
+# fix.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: pulsarcluster-full
+spec:
+  steps:
+  - try:
+    - apply:
+        resource:
+          apiVersion: cluster.pulsaroperator.io/v1alpha1
+          kind: PulsarCluster
+          metadata:
+            name: full
+          spec:
+            pulsarVersion: "5.0.0-M1"
+            broker:
+              replicas: 2
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 512Mi
+            bookKeeper:
+              replicas: 1
+              ensemble:
+                ensembleSize: 1
+                writeQuorum: 1
+                ackQuorum: 1
+              volumes:
+                journal:
+                  size: 1Gi
+                ledgers:
+                  size: 2Gi
+                index:
+                  size: 1Gi
+            proxy:
+              replicas: 1
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 256Mi
+            oxia:
+              coordinator:
+                replicas: 1
+                resources:
+                  requests:
+                    cpu: 25m
+                    memory: 128Mi
+              server:
+                replicas: 1
+                storageSize: 1Gi
+                dbCacheSizeMb: 64
+              namespaces:
+              - name: default
+                initialShardCount: 1
+                replicationFactor: 1
+              - name: bookkeeper
+                initialShardCount: 1
+                replicationFactor: 1
+              allowExtraAuthorities: true
+
+    - assert:
+        resource:
+          apiVersion: cluster.pulsaroperator.io/v1alpha1
+          kind: Broker
+          metadata:
+            name: full-broker
+            ownerReferences:
+            - apiVersion: cluster.pulsaroperator.io/v1alpha1
+              kind: PulsarCluster
+              name: full
+              controller: true
+          spec:
+            replicas: 2
+            config:
+              metadataStoreUrl: oxia://full-oxia-oxia:6648/default
+              configurationMetadataStoreUrl: oxia://full-oxia-oxia:6648/default
+              clusterName: full
+
+    - assert:
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: full-broker
+          spec:
+            replicas: 2
+
+    - assert:
+        resource:
+          apiVersion: cluster.pulsaroperator.io/v1alpha1
+          kind: BookKeeper
+          metadata:
+            name: full-bookkeeper
+            ownerReferences:
+            - apiVersion: cluster.pulsaroperator.io/v1alpha1
+              kind: PulsarCluster
+              name: full
+              controller: true
+          spec:
+            replicas: 1
+            config:
+              metadataServiceUri: metadata-store:oxia://full-oxia-oxia:6648/bookkeeper
+
+    - assert:
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: full-bookkeeper
+          spec:
+            replicas: 1
+
+    - assert:
+        resource:
+          apiVersion: cluster.pulsaroperator.io/v1alpha1
+          kind: Proxy
+          metadata:
+            name: full-proxy
+            ownerReferences:
+            - apiVersion: cluster.pulsaroperator.io/v1alpha1
+              kind: PulsarCluster
+              name: full
+              controller: true
+          spec:
+            replicas: 1
+            config:
+              metadataStoreUrl: oxia://full-oxia-oxia:6648/default
+              clusterName: full
+
+    - assert:
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: full-proxy
+          spec:
+            replicas: 1
+
+    - assert:
+        resource:
+          apiVersion: cluster.pulsaroperator.io/v1alpha1
+          kind: PulsarCluster
+          metadata:
+            name: full
+          status:
+            brokerPhase: NotReady
+            bookKeeperPhase: NotReady
+            proxyPhase: NotReady
+            oxiaPhase: NotReady

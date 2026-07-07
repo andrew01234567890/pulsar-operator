@@ -70,6 +70,12 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
 KIND_CLUSTER ?= pulsar-operator-test-e2e
+# KIND_NODE_IMAGE optionally pins the Kind node image (and therefore the
+# Kubernetes minor version) the e2e cluster runs, e.g.
+# kindest/node:v1.34.0@sha256:.... Left empty, Kind uses its own built-in
+# default. Used by the test-e2e CI matrix (.github/workflows/test-e2e.yml) to
+# run the same suite across a few recent Kubernetes minors.
+KIND_NODE_IMAGE ?=
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -82,17 +88,43 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
 		*) \
 			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
+			$(KIND) create cluster --name $(KIND_CLUSTER) $(if $(KIND_NODE_IMAGE),--image $(KIND_NODE_IMAGE),) ;; \
 	esac
+
+# E2E_TIMEOUT bounds the whole `go test` binary. It MUST exceed Go's 10m
+# default: the suite builds/loads images, installs CertManager, stands up a
+# full Oxia+Pulsar PulsarCluster, and includes a multi-minute best-effort
+# data-plane wait (see test/e2e/pulsarcluster_test.go), which together run
+# ~14-16m on a 2-CPU CI runner - past the default, which would panic with
+# "test timed out after 10m0s".
+E2E_TIMEOUT ?= 30m
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_TIMEOUT)
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+
+# CHAINSAW_IMG intentionally shadows the generic IMG default (controller:latest)
+# for this target: Kubernetes defaults imagePullPolicy to Always for a
+# ":latest"-tagged image, so kubelet would ignore the image `kind load`
+# already placed on the node and try (and fail) to pull "controller:latest"
+# from a real registry. A versioned tag defaults to IfNotPresent instead, the
+# same reason test/e2e's Ginkgo suite's own managerImage isn't "latest" either.
+CHAINSAW_IMG ?= example.com/pulsar-operator:chainsaw-test
+
+.PHONY: chainsaw-test
+chainsaw-test: chainsaw setup-test-e2e manifests generate kustomize ## Run the declarative Chainsaw e2e tests. Expects an isolated environment using Kind.
+	$(CONTAINER_TOOL) build -t $(CHAINSAW_IMG) .
+	$(KIND) load docker-image $(CHAINSAW_IMG) --name $(KIND_CLUSTER)
+	$(MAKE) install
+	$(MAKE) deploy IMG=$(CHAINSAW_IMG)
+	"$(CHAINSAW)" test ./test/chainsaw --config ./test/chainsaw/.chainsaw.yaml
+	$(MAKE) undeploy uninstall
+	$(MAKE) cleanup-test-e2e
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -199,11 +231,13 @@ CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 KO ?= $(LOCALBIN)/ko
+CHAINSAW ?= $(LOCALBIN)/chainsaw
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.1
 CONTROLLER_TOOLS_VERSION ?= v0.21.0
 KO_VERSION ?= v0.19.1
+CHAINSAW_VERSION ?= v0.2.15
 
 #ENVTEST_VERSION is the controller-runtime version to use for setup-envtest, derived from go.mod
 ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
@@ -230,6 +264,11 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 ko: $(KO) ## Download ko locally if necessary.
 $(KO): $(LOCALBIN)
 	$(call go-install-tool,$(KO),github.com/google/ko,$(KO_VERSION))
+
+.PHONY: chainsaw
+chainsaw: $(CHAINSAW) ## Download chainsaw locally if necessary.
+$(CHAINSAW): $(LOCALBIN)
+	$(call go-install-tool,$(CHAINSAW),github.com/kyverno/chainsaw,$(CHAINSAW_VERSION))
 
 .PHONY: setup-envtest
 setup-envtest: envtest ## Download the binaries required for ENVTEST in the local bin directory.

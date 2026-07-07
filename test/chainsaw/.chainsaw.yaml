@@ -1,0 +1,34 @@
+apiVersion: chainsaw.kyverno.io/v1alpha2
+kind: Configuration
+metadata:
+  name: pulsar-operator
+spec:
+  execution:
+    failFast: false
+    # Cases are independent PulsarClusters; each gets its own ephemeral
+    # namespace, so running them side by side is safe and halves wall time.
+    parallel: 2
+    # The broker alone waits up to ~65s for its shutdown hook
+    # (brokerShutdownTimeoutMs + the preStop drain sleep, see
+    # internal/controller/cluster/broker_controller.go) before its real
+    # terminationGracePeriodSeconds elapses; forcing a short grace period on
+    # cleanup deletes keeps case teardown fast without needing that.
+    forceTerminationGracePeriod: 5s
+  timeouts:
+    apply: 10s
+    assert: 60s
+    # Generous: namespace cleanup cascades through real StatefulSet pods and
+    # their PVCs (reclaimed via the Kind default StorageClass's
+    # local-path-provisioner, not instantly), and forceTerminationGracePeriod
+    # above doesn't help until the pod has actually started, which itself
+    # depends on the Kind node's own (uncached, unlike test/e2e's Ginkgo
+    # suite) pull of the Pulsar/Oxia images.
+    delete: 3m
+    cleanup: 3m
+  namespace:
+    # Random ephemeral namespace per case; deleting it at cleanup sweeps up
+    # every object the case created (including PVCs, which the operator
+    # deliberately leaves un-owned - see buildVolumeClaimTemplates's Retain
+    # comment - so namespace deletion, not owner-reference GC, is what
+    # reclaims them here).
+    name: ""
