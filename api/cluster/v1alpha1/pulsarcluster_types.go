@@ -59,6 +59,7 @@ type GlobalSpec struct {
 // storage. This is cost/retention tiering, not backup: offloaded objects are
 // orphaned if metadata is lost, and are deleted when their topic is deleted.
 // Requires the apachepulsar/pulsar-all image (offloader jars).
+// +kubebuilder:validation:XValidation:rule="self.driver == 'filesystem' || size(self.bucket) > 0",message="bucket is required for object-store offload drivers (aws-s3, google-cloud-storage, azureblob)"
 type OffloadSpec struct {
 	// driver selects the tiered-storage backend.
 	// +required
