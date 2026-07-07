@@ -36,8 +36,10 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	backupv1alpha1 "github.com/andrew01234567890/pulsar-operator/api/backup/v1alpha1"
 	clusterv1alpha1 "github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1"
 	metadatav1alpha1 "github.com/andrew01234567890/pulsar-operator/api/metadata/v1alpha1"
+	backupcontroller "github.com/andrew01234567890/pulsar-operator/internal/controller/backup"
 	clustercontroller "github.com/andrew01234567890/pulsar-operator/internal/controller/cluster"
 	metadatacontroller "github.com/andrew01234567890/pulsar-operator/internal/controller/metadata"
 	// +kubebuilder:scaffold:imports
@@ -53,6 +55,7 @@ func init() {
 
 	utilruntime.Must(clusterv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(metadatav1alpha1.AddToScheme(scheme))
+	utilruntime.Must(backupv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -273,6 +276,27 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "metadata-oxiacluster")
+		os.Exit(1)
+	}
+	if err := (&backupcontroller.BackupReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "backup-backup")
+		os.Exit(1)
+	}
+	if err := (&backupcontroller.RestoreReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "backup-restore")
+		os.Exit(1)
+	}
+	if err := (&backupcontroller.BackupScheduleReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "backup-backupschedule")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

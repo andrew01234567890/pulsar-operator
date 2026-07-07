@@ -22,6 +22,15 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the pulsar-operator itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- backup_backupschedule_admin_role.yaml
+- backup_backupschedule_editor_role.yaml
+- backup_backupschedule_viewer_role.yaml
+- backup_restore_admin_role.yaml
+- backup_restore_editor_role.yaml
+- backup_restore_viewer_role.yaml
+- backup_backup_admin_role.yaml
+- backup_backup_editor_role.yaml
+- backup_backup_viewer_role.yaml
 - metadata_oxiacluster_admin_role.yaml
 - metadata_oxiacluster_editor_role.yaml
 - metadata_oxiacluster_viewer_role.yaml
