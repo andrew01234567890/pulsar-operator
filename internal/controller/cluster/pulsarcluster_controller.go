@@ -100,6 +100,7 @@ const (
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile decomposes a PulsarCluster into its per-component child CRs,
@@ -237,6 +238,9 @@ func (r *PulsarClusterReconciler) reconcileBroker(ctx context.Context, cluster *
 	desired.Config = withBrokerBookkeeperMetadataDefault(desired.Config, cluster.Name)
 	desired.Config = withClusterNameDefault(desired.Config, cluster.Name)
 	desired.Config = withBrokerOffloadDefaults(desired.Config, cluster.Spec.Offload)
+	if err := r.wireFunctionsWorkerColocated(ctx, cluster, desired); err != nil {
+		return componentReport{}, tierOutcome{}, fmt.Errorf("broker: %w", err)
+	}
 
 	desiredSpec := any(desired)
 	liveSpec := func() any { return child.Spec }
@@ -368,6 +372,7 @@ func (r *PulsarClusterReconciler) reconcileFunctionsWorker(ctx context.Context, 
 
 	desired := buildFunctionsWorkerSpec(cluster.Spec)
 	desired.Config = withFunctionsWorkerMetadataDefault(desired.Config, cluster.Name)
+	desired.Config = withFunctionsWorkerClusterDefault(desired.Config, cluster.Name)
 
 	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
 		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled, nil)

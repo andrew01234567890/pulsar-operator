@@ -50,7 +50,7 @@ PulsarCluster (cluster.pulsaroperator.io)
 ├── Broker          — broker StatefulSet + CPU/throughput autoscaler
 ├── Proxy           — optional stateless gateway
 ├── AutoRecovery    — Auditor + ReplicationWorker
-└── FunctionsWorker — Pulsar Functions (co-located or standalone)
+└── FunctionsWorker — Pulsar Functions (colocated inside broker pods; standalone is rejected, see below)
 ```
 
 A `PulsarCluster` reconciler reads the umbrella spec, decomposes global and
@@ -77,6 +77,24 @@ is expected to go through the umbrella resource.
   [Backup & DR](./backup-and-dr.md). Requires an explicit
   offloader-capable image (`spec.image` or `spec.broker.image`) — see
   [Backup & DR](./backup-and-dr.md#offload-requires-an-explicit-offloader-capable-image).
+- **Pulsar Functions and IO connectors**, colocated inside broker pods (the
+  default and only supported `FunctionsWorker` mode on this Oxia-only
+  operator). The operator turns on the broker's Packages Management Service
+  with `FileSystemPackagesStorage` and mounts a shared volume for it, which
+  is what actually makes functions/connectors work without ZooKeeper —
+  Pulsar's default (BookKeeper/DistributedLog-backed) package storage
+  requires a ZooKeeper-backed metadata store and cannot be initialized
+  against Oxia. Sinks/Sources ride the identical code path
+  (`SinksImpl`/`SourcesImpl` extend `ComponentImpl`), so cluster-managed
+  `pulsar-admin sources/sinks create` works the same way, with no separate
+  wiring. Standalone `FunctionsWorker` mode is rejected outright by CRD
+  validation: Pulsar's standalone functions-worker startup unconditionally
+  requires a ZooKeeper-backed metadata store for its own package storage,
+  with no config workaround, so it cannot run on this operator today. A
+  single broker replica gets a `ReadWriteOnce` PersistentVolumeClaim by
+  default; more than one broker replica needs a `ReadWriteMany` volume,
+  which you must pre-provision yourself (see the `FunctionsWorker` CRD's
+  `packageStorageVolume` field).
 
 Explicitly out of scope for v1: geo-replication and automated backup (see
 [Backup & DR](./backup-and-dr.md) for why that matters and how to mitigate

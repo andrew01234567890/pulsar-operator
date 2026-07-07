@@ -180,9 +180,9 @@ func TestRenderBrokerConfigDeterministic(t *testing.T) {
 		},
 	}
 
-	first := brokerPodAnnotations(renderConfig(broker))
+	first := brokerPodAnnotations(renderConfig(broker), "")
 	for range 20 {
-		got := brokerPodAnnotations(renderConfig(broker))
+		got := brokerPodAnnotations(renderConfig(broker), "")
 		if got[builder.ConfigChecksumAnnotation] != first[builder.ConfigChecksumAnnotation] {
 			t.Fatalf("checksum annotation is not deterministic across repeated renders: %q != %q", got[builder.ConfigChecksumAnnotation], first[builder.ConfigChecksumAnnotation])
 		}
@@ -335,7 +335,7 @@ func TestDesiredBrokerStatefulSetSpec_DrainWiring(t *testing.T) {
 	rendered := renderConfig(broker)
 	ports := resolveBrokerPorts(mergedConfig)
 
-	spec := desiredBrokerStatefulSetSpec(broker, broker.Name, map[string]string{"k": "v"}, map[string]string{"k": "v"}, mergedConfig, rendered, ports)
+	spec := desiredBrokerStatefulSetSpec(broker, broker.Name, map[string]string{"k": "v"}, map[string]string{"k": "v"}, mergedConfig, rendered, "", ports)
 
 	wantGrace := 30 + preStopDrainSeconds
 	if spec.Template.Spec.TerminationGracePeriodSeconds == nil || *spec.Template.Spec.TerminationGracePeriodSeconds != wantGrace {
@@ -465,14 +465,36 @@ func TestBrokerConfigChecksumChangesWithConfig(t *testing.T) {
 		},
 	}
 
-	baseSum := brokerPodAnnotations(renderConfig(base))[builder.ConfigChecksumAnnotation]
-	changedSum := brokerPodAnnotations(renderConfig(changed))[builder.ConfigChecksumAnnotation]
+	baseSum := brokerPodAnnotations(renderConfig(base), "")[builder.ConfigChecksumAnnotation]
+	changedSum := brokerPodAnnotations(renderConfig(changed), "")[builder.ConfigChecksumAnnotation]
 
 	if baseSum == "" || changedSum == "" {
 		t.Fatalf("checksum annotations must be non-empty: base=%q changed=%q", baseSum, changedSum)
 	}
 	if baseSum == changedSum {
 		t.Errorf("checksum did not change when spec.config changed: %q", baseSum)
+	}
+}
+
+// TestBrokerConfigChecksumChangesWithFunctionsWorkerConfig proves the SECOND
+// checksum contribution (the colocated functions_worker.yml render) also
+// forces a rolling restart: with broker.conf held constant, changing only the
+// functions_worker.yml contribution must still change the pod-template
+// checksum, or a colocated-functions config change would silently never roll
+// out to the broker pods.
+func TestBrokerConfigChecksumChangesWithFunctionsWorkerConfig(t *testing.T) {
+	broker := &clusterv1alpha1.Broker{}
+	rendered := renderConfig(broker)
+
+	none := brokerPodAnnotations(rendered, "")[builder.ConfigChecksumAnnotation]
+	withA := brokerPodAnnotations(rendered, "pulsarFunctionsCluster: a\n")[builder.ConfigChecksumAnnotation]
+	withB := brokerPodAnnotations(rendered, "pulsarFunctionsCluster: b\n")[builder.ConfigChecksumAnnotation]
+
+	if none == withA {
+		t.Errorf("checksum did not change when a colocated functions_worker.yml was added: %q", none)
+	}
+	if withA == withB {
+		t.Errorf("checksum did not change when only the functions_worker.yml contribution changed: %q", withA)
 	}
 }
 
