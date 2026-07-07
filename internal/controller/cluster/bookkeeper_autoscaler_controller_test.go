@@ -28,7 +28,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -210,7 +210,7 @@ var _ = Describe("BookKeeper Autoscaler Controller", func() {
 		createBookiePods(ctx, namespace, bk.Name, 2, 2)
 		DeferCleanup(func() { deleteBookiePods(ctx, namespace, bk.Name, 2) })
 
-		recorder := record.NewFakeRecorder(5)
+		recorder := events.NewFakeRecorder(5)
 		reconciler := &BookKeeperAutoscalerReconciler{
 			Client:      k8sClient,
 			Scheme:      k8sClient.Scheme(),
@@ -270,7 +270,7 @@ var _ = Describe("BookKeeper Autoscaler Controller", func() {
 		createBookiePods(ctx, namespace, bk.Name, 3, 3)
 		DeferCleanup(func() { deleteBookiePods(ctx, namespace, bk.Name, 3) })
 
-		recorder := record.NewFakeRecorder(5)
+		recorder := events.NewFakeRecorder(5)
 		reconciler := &BookKeeperAutoscalerReconciler{
 			Client:   k8sClient,
 			Scheme:   k8sClient.Scheme(),
@@ -290,17 +290,20 @@ var _ = Describe("BookKeeper Autoscaler Controller", func() {
 	})
 
 	It("flags an invalid configuration instead of scaling when minWritableBookies is below the ensemble size", func() {
-		bk := createBookKeeper("autoscaler-invalid-config", 3, &clusterv1alpha1.BookKeeperAutoscalerSpec{
+		// Replicas must be >= ensembleSize to satisfy the BookKeeper CRD's
+		// "ensembleSize cannot exceed replicas" rule; the misconfiguration
+		// under test is instead minWritableBookies (2) < ensembleSize (5).
+		bk := createBookKeeper("autoscaler-invalid-config", 5, &clusterv1alpha1.BookKeeperAutoscalerSpec{
 			Enabled: true, MinWritableBookies: int32Ptr(2), ScaleUpBy: int32Ptr(1), ScaleUpMaxLimit: int32Ptr(10),
 		}, &clusterv1alpha1.BookKeeperEnsembleSpec{EnsembleSize: int32Ptr(5)})
 
-		recorder := record.NewFakeRecorder(5)
+		recorder := events.NewFakeRecorder(5)
 		reconciler := &BookKeeperAutoscalerReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: recorder}
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: bk.Name, Namespace: namespace}})
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(bk), bk)).To(Succeed())
-		Expect(*bk.Spec.Replicas).To(Equal(int32(3)))
+		Expect(*bk.Spec.Replicas).To(Equal(int32(5)))
 
 		cond := findCondition(bk.Status.Conditions, conditionTypeAutoscaling)
 		Expect(cond).NotTo(BeNil())

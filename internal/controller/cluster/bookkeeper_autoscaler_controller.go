@@ -25,7 +25,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -76,9 +76,9 @@ type BookKeeperAutoscalerReconciler struct {
 	Scheme *runtime.Scheme
 
 	// Recorder emits Events for scale actions and configuration problems.
-	// SetupWithManager defaults it to mgr.GetEventRecorderFor(...); a
-	// nil Recorder is treated as a no-op sink so tests may leave it unset.
-	Recorder record.EventRecorder
+	// cmd/main.go wires it to mgr.GetEventRecorder(...); a nil Recorder is
+	// treated as a no-op sink so tests may leave it unset.
+	Recorder events.EventRecorder
 
 	// AdminClient polls each bookie's admin REST API. Nil defaults to
 	// bkautoscaler.NewHTTPBookieAdminClient(), letting tests inject a mock
@@ -168,7 +168,7 @@ func (r *BookKeeperAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	decision, err := bkautoscaler.Evaluate(ctx, r.adminClient(), addrs, params)
 	if err != nil {
 		log.Error(err, "failed to poll bookie admin API")
-		r.recorder().Eventf(bk, corev1.EventTypeWarning, reasonBookieAdminPollFailed, "failed to poll bookie admin API: %v", err)
+		r.recorder().Eventf(bk, nil, corev1.EventTypeWarning, reasonBookieAdminPollFailed, "PollBookieAdmin", "failed to poll bookie admin API: %v", err)
 		return result, nil
 	}
 
@@ -194,11 +194,13 @@ func (r *BookKeeperAutoscalerReconciler) adminClient() bkautoscaler.BookieAdminC
 	return bkautoscaler.NewHTTPBookieAdminClient()
 }
 
-func (r *BookKeeperAutoscalerReconciler) recorder() record.EventRecorder {
+func (r *BookKeeperAutoscalerReconciler) recorder() events.EventRecorder {
 	if r.Recorder != nil {
 		return r.Recorder
 	}
-	return &record.FakeRecorder{}
+	// A zero-value FakeRecorder has a nil Events channel and discards every
+	// event, so it is a safe no-op sink when no recorder was wired in.
+	return &events.FakeRecorder{}
 }
 
 func (r *BookKeeperAutoscalerReconciler) now() time.Time {
@@ -301,7 +303,7 @@ func (r *BookKeeperAutoscalerReconciler) scaleUp(ctx context.Context, bk *cluste
 	}
 
 	log.Info("bookie autoscaler scaled up", "from", previousReplicas, "to", target, "reason", decision.Reason)
-	r.recorder().Eventf(bk, corev1.EventTypeNormal, decision.Reason, "scaled bookies from %d to %d: %s", previousReplicas, target, decision.Message)
+	r.recorder().Eventf(bk, nil, corev1.EventTypeNormal, decision.Reason, "ScaleUp", "scaled bookies from %d to %d: %s", previousReplicas, target, decision.Message)
 	return nil
 }
 
@@ -329,7 +331,7 @@ func (r *BookKeeperAutoscalerReconciler) recordInvalidConfig(ctx context.Context
 	if err := r.Status().Patch(ctx, bk, patch); err != nil {
 		return fmt.Errorf("update bookkeeper %s/%s autoscaler status: %w", bk.Namespace, bk.Name, err)
 	}
-	r.recorder().Event(bk, corev1.EventTypeWarning, reasonInvalidAutoscalerConfig, msg)
+	r.recorder().Eventf(bk, nil, corev1.EventTypeWarning, reasonInvalidAutoscalerConfig, "RejectConfig", "%s", msg)
 	return nil
 }
 
@@ -387,9 +389,6 @@ func resolveAutoscalerPeriodSeconds(autoscaler *clusterv1alpha1.BookKeeperAutosc
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *BookKeeperAutoscalerReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.Recorder == nil {
-		r.Recorder = mgr.GetEventRecorderFor("bookkeeper-autoscaler")
-	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&clusterv1alpha1.BookKeeper{}).
 		Named("cluster-bookkeeper-autoscaler").
