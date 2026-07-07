@@ -57,6 +57,7 @@ const (
 	reasonDecommissionComplete               = "DecommissionComplete"
 	reasonDecommissionTimedOut               = "DecommissionTimedOut"
 	reasonDecommissionFailed                 = "DecommissionFailed"
+	reasonDecommissionAbortedTopologyChanged = "DecommissionAbortedTopologyChanged"
 	reasonManualDrainRejected                = "ManualDrainOrdinalMismatch"
 
 	// eventAction is the events API "action" field for every Event this
@@ -200,7 +201,7 @@ func (r *BookKeeperDecommissionReconciler) resume(ctx context.Context, bk *clust
 	case clusterv1alpha1.BookKeeperDecommissionPhaseInvalidatingCookie:
 		return r.phaseInvalidateCookie(ctx, bk, admin, podName)
 	case clusterv1alpha1.BookKeeperDecommissionPhaseScalingDown:
-		return r.phaseScaleDown(ctx, bk, ordinal)
+		return r.phaseScaleDown(ctx, bk, admin, ordinal)
 	case clusterv1alpha1.BookKeeperDecommissionPhaseDeletingPVCs:
 		return r.phaseDeletePVCs(ctx, bk, ordinal)
 	default:
@@ -325,39 +326,78 @@ func (r *BookKeeperDecommissionReconciler) phaseInvalidateCookie(ctx context.Con
 
 // --- Phase 6: ScalingDown ---
 
-// phaseScaleDown decrements BookKeeper.spec.replicas by exactly one -- never
-// the StatefulSet directly, which BookKeeperReconciler (unmodified) owns and
-// continuously reconciles from this same field.
+// phaseScaleDown removes exactly the recorded target bookie by decrementing
+// BookKeeper.spec.replicas to the target ordinal -- never the StatefulSet
+// directly, which BookKeeperReconciler (unmodified) owns and continuously
+// reconciles from this same field.
 //
-// target is derived from the persisted target ordinal -- fixed for the
-// lifetime of this decommission -- rather than from "whatever spec.replicas
-// currently holds minus one". That distinction matters for idempotency: the
-// ordinal was the highest one when this decommission started, so the
-// replica count after removing it is exactly that ordinal. Recomputing
-// "current - 1" on every call would instead keep decrementing further on
-// every resumed retry of this phase, which is exactly the kind of bug this
-// state machine exists to prevent. Checking the current value before writing
-// still makes the Kubernetes API call itself idempotent: resuming mid-phase
-// after the spec write already landed (but before the phase advanced) is a
-// no-op patch.
-func (r *BookKeeperDecommissionReconciler) phaseScaleDown(ctx context.Context, bk *clusterv1alpha1.BookKeeper, ordinal int32) (ctrl.Result, error) {
+// It writes an ABSOLUTE replica count (spec.replicas = ordinal), not a
+// relative "current - 1", and only ever does so from the single safe state
+// where the recorded ordinal is still the StatefulSet's top ordinal
+// (current == ordinal+1). This guards the operation's most dangerous failure
+// mode: the AwaitingReplication wait can run up to decommissionTimeoutSeconds
+// (~30 min), and if the cluster scales UP during that window (e.g. the
+// disk-watermark autoscaler, or a human), the recorded ordinal becomes a
+// MIDDLE bookie. Writing spec.replicas = ordinal in that state would make the
+// StatefulSet delete every bookie above the target -- none of which were
+// drained, re-replicated, or cookie-invalidated -- causing exactly the
+// permanent data loss this controller exists to prevent. So:
+//   - current == ordinal+1: the safe state. Shrink by one (remove the top,
+//     which is precisely the bookie we drained). Idempotent: a resumed retry
+//     after the spec write already landed re-enters the current<=ordinal case
+//     below and no-ops rather than shrinking further.
+//   - current <= ordinal: the scale-down already took effect (idempotent
+//     resume of this phase), or replicas dropped further via another actor.
+//     Either way the target ordinal is already gone -- advance without ever
+//     scaling the StatefulSet back UP.
+//   - current > ordinal+1: topology changed under us. Abort (never shrink).
+func (r *BookKeeperDecommissionReconciler) phaseScaleDown(ctx context.Context, bk *clusterv1alpha1.BookKeeper, admin bkadmin.AdminClient, ordinal int32) (ctrl.Result, error) {
 	latest := &clusterv1alpha1.BookKeeper{}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(bk), latest); err != nil {
 		return ctrl.Result{}, fmt.Errorf("re-fetching BookKeeper before scaling down: %w", err)
 	}
 
+	current := resolveReplicas(latest.Spec)
 	target := ordinal
+	podName := bookiePodName(bk, ordinal)
 
-	if latest.Spec.Replicas == nil || *latest.Spec.Replicas != target {
+	switch {
+	case current > ordinal+1:
+		// A concurrent scale-up during the decommission moved the top ordinal
+		// above the recorded target, so the target is now a middle bookie.
+		// Shrinking to it would delete undrained bookies -> data loss. Abort.
+		return r.abortTopologyChanged(ctx, bk, admin, podName, current, ordinal)
+
+	case current == ordinal+1:
 		latest.Spec.Replicas = &target
 		if err := r.Update(ctx, latest); err != nil {
 			return ctrl.Result{}, fmt.Errorf("scaling BookKeeper %s replicas to %d: %w", latest.Name, target, err)
 		}
-	}
+		return r.advancePhase(ctx, bk, clusterv1alpha1.BookKeeperDecommissionPhaseDeletingPVCs,
+			fmt.Sprintf("scaled BookKeeper %s replicas to %d", latest.Name, target))
 
-	bk.ResourceVersion = latest.ResourceVersion
-	return r.advancePhase(ctx, bk, clusterv1alpha1.BookKeeperDecommissionPhaseDeletingPVCs,
-		fmt.Sprintf("scaled BookKeeper %s replicas to %d", latest.Name, target))
+	default: // current <= ordinal: already satisfied, never scale back up
+		return r.advancePhase(ctx, bk, clusterv1alpha1.BookKeeperDecommissionPhaseDeletingPVCs,
+			fmt.Sprintf("BookKeeper %s replicas already at %d (target ordinal %d already removed)", latest.Name, current, ordinal))
+	}
+}
+
+// abortTopologyChanged aborts an in-flight decommission whose target ordinal
+// is no longer the StatefulSet's top ordinal (a concurrent scale-up happened
+// during the AwaitingReplication wait). It NEVER shrinks the StatefulSet --
+// that is the whole point -- and best-effort reverts the already-drained
+// target bookie to writable ("if still possible" cleanup: its cookie was
+// already invalidated, so a SetReadOnly failure here must not block the
+// abort), then clears the decommission state with a Warning condition.
+func (r *BookKeeperDecommissionReconciler) abortTopologyChanged(ctx context.Context, bk *clusterv1alpha1.BookKeeper, admin bkadmin.AdminClient, podName string, current, ordinal int32) (ctrl.Result, error) {
+	if err := admin.SetReadOnly(ctx, podName, false); err != nil {
+		logf.FromContext(ctx).Error(err, "best-effort revert of decommission target to writable failed during topology-change abort", "pod", podName)
+	}
+	message := fmt.Sprintf(
+		"aborting decommission of bookie %s: replicas grew to %d after this decommission began at top ordinal %d; "+
+			"shrinking now would delete undrained bookies, so the StatefulSet is left untouched and must be resolved manually",
+		podName, current, ordinal)
+	return r.finish(ctx, bk, corev1.EventTypeWarning, reasonDecommissionAbortedTopologyChanged, message)
 }
 
 // --- Phase 7: DeletingPVCs ---

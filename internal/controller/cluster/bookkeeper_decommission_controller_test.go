@@ -18,7 +18,9 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -226,6 +228,15 @@ func reconcileOnce(t *testing.T, r *BookKeeperDecommissionReconciler, name strin
 	return res
 }
 
+func reconcileExpectErr(t *testing.T, r *BookKeeperDecommissionReconciler, name string) error {
+	t.Helper()
+	_, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: decommTestNamespace}})
+	if err == nil {
+		t.Fatalf("Reconcile() expected an error, got nil")
+	}
+	return err
+}
+
 func getBookKeeper(t *testing.T, cl client.Client, name string) *clusterv1alpha1.BookKeeper {
 	t.Helper()
 	bk := &clusterv1alpha1.BookKeeper{}
@@ -233,6 +244,30 @@ func getBookKeeper(t *testing.T, cl client.Client, name string) *clusterv1alpha1
 		t.Fatalf("Get(%s) failed: %v", name, err)
 	}
 	return bk
+}
+
+// readyPodsOnNodes builds one Ready bookie pod per ordinal, each pinned to a
+// distinct node "node-<ord>", plus the matching cluster-scoped Node object
+// carrying the given topology zone label. It backs the rack/zone placement
+// guard tests, which need real pod->node->zone lookups.
+func readyPodsOnNodes(bk *clusterv1alpha1.BookKeeper, zones []string, readySince time.Time) []client.Object {
+	objs := make([]client.Object, 0, len(zones)*2)
+	for ord, zone := range zones {
+		nodeName := fmt.Sprintf("node-%d", ord)
+		objs = append(objs, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: bookiePodName(bk, int32(ord)), Namespace: bk.Namespace},
+			Spec:       corev1.PodSpec{NodeName: nodeName},
+			Status: corev1.PodStatus{
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(readySince)},
+				},
+			},
+		})
+		objs = append(objs, &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Labels: map[string]string{labelTopologyZone: zone}},
+		})
+	}
+	return objs
 }
 
 func decommissioningCond(bk *clusterv1alpha1.BookKeeper) *metav1.Condition {
@@ -703,6 +738,306 @@ func TestBookKeeperDecommission_ScaleDown_IdempotentAcrossResume(t *testing.T) {
 	got = getBookKeeper(t, cl, name)
 	if *got.Spec.Replicas != 2 {
 		t.Fatalf("Spec.Replicas = %d after a resumed retry of ScalingDown, want still 2 (not decremented again to 1)", *got.Spec.Replicas)
+	}
+}
+
+// --- CRITICAL regression: concurrent scale-up during a decommission must
+// ABORT ScalingDown, never shrink the StatefulSet past the target ordinal ---
+
+// TestBookKeeperDecommission_ScaleDown_ConcurrentScaleUp_Aborts covers the
+// highest-severity data-loss bug in this controller: the AwaitingReplication
+// wait can run for up to decommissionTimeoutSeconds (~30 min), during which
+// the cluster can scale UP (the disk-watermark autoscaler, or a human). If
+// that happens, the recorded target ordinal is no longer the StatefulSet's
+// top ordinal, so writing spec.replicas = ordinal would make the StatefulSet
+// delete EVERY bookie between the target and the new top -- none of which
+// were drained, re-replicated, or cookie-invalidated -> permanent data loss.
+// ScalingDown must instead abort and leave the StatefulSet untouched.
+func TestBookKeeperDecommission_ScaleDown_ConcurrentScaleUp_Aborts(t *testing.T) {
+	const name = "bk-topology"
+	now := time.Now()
+
+	// This decommission began when the top ordinal was 2 (replicas were 3),
+	// but replicas have since grown to 5 (bookies 0..4 now exist).
+	bk := newDecommTestBookKeeper(name, 5)
+	ordinal := int32(2)
+	started := metav1.NewTime(now.Add(-time.Minute))
+	bk.Status.Decommission = &clusterv1alpha1.BookKeeperDecommissionStatus{
+		Phase:          clusterv1alpha1.BookKeeperDecommissionPhaseScalingDown,
+		TargetOrdinal:  &ordinal,
+		TargetBookieID: bookieIDFor(bk, ordinal),
+		StartedAt:      &started,
+	}
+
+	admin := newMockAdmin()
+	admin.writable["bk-topology-2"] = false // drained + read-only mid-decommission
+
+	r, cl := newDecommTestReconciler(t, admin, now, bk)
+
+	reconcileOnce(t, r, name)
+
+	got := getBookKeeper(t, cl, name)
+
+	// The load-bearing assertion: the StatefulSet's replica count is NOT
+	// shrunk. Bookies 3 and 4 (never drained) are never deleted.
+	if got.Spec.Replicas == nil || *got.Spec.Replicas != 5 {
+		t.Fatalf("Spec.Replicas = %v, want unchanged 5 -- a concurrent scale-up must abort the decommission, never shrink past the target", got.Spec.Replicas)
+	}
+	if got.Status.Decommission != nil {
+		t.Fatalf("Status.Decommission = %+v, want nil after a topology-change abort", got.Status.Decommission)
+	}
+	cond := decommissioningCond(got)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonDecommissionAbortedTopologyChanged {
+		t.Fatalf("Decommissioning condition = %+v, want False/%s", cond, reasonDecommissionAbortedTopologyChanged)
+	}
+	// Best-effort revert of the already-drained target to writable.
+	if len(admin.setReadOnlyCalls) != 1 || admin.setReadOnlyCalls[0] != (setReadOnlyCall{"bk-topology-2", false}) {
+		t.Fatalf("setReadOnlyCalls = %v, want exactly one best-effort readOnly=false revert of the target", admin.setReadOnlyCalls)
+	}
+}
+
+// TestBookKeeperDecommission_ScaleDown_ReplicasAlreadyBelowTarget_NoScaleUp
+// covers the other side of the guard: if replicas are already at or below the
+// target ordinal (the scale-down already landed, or another actor shrank
+// further), ScalingDown must advance without ever scaling the StatefulSet
+// back UP.
+func TestBookKeeperDecommission_ScaleDown_ReplicasAlreadyBelowTarget_NoScaleUp(t *testing.T) {
+	const name = "bk-belowtarget"
+	now := time.Now()
+
+	// target ordinal 2, but replicas are already 2 (target removed).
+	bk := newDecommTestBookKeeper(name, 2)
+	ordinal := int32(2)
+	bk.Status.Decommission = &clusterv1alpha1.BookKeeperDecommissionStatus{
+		Phase:         clusterv1alpha1.BookKeeperDecommissionPhaseScalingDown,
+		TargetOrdinal: &ordinal,
+	}
+
+	admin := newMockAdmin()
+	r, cl := newDecommTestReconciler(t, admin, now, bk)
+
+	reconcileOnce(t, r, name)
+
+	got := getBookKeeper(t, cl, name)
+	if got.Spec.Replicas == nil || *got.Spec.Replicas != 2 {
+		t.Fatalf("Spec.Replicas = %v, want unchanged 2 -- never scale the StatefulSet back up", got.Spec.Replicas)
+	}
+	if got.Status.Decommission == nil || got.Status.Decommission.Phase != clusterv1alpha1.BookKeeperDecommissionPhaseDeletingPVCs {
+		t.Fatalf("phase = %+v, want advanced to DeletingPVCs", got.Status.Decommission)
+	}
+}
+
+// --- revert-on-failure path: a failed revert must NOT clear state ---
+
+// TestBookKeeperDecommission_Timeout_RevertFails_KeepsStateAndRetries proves
+// the safety-critical contract that if the auto-revert-to-writable itself
+// fails, the controller surfaces the error and leaves the decommission state
+// intact in the SAME phase, so the next reconcile retries the revert rather
+// than abandoning a bookie stuck read-only.
+func TestBookKeeperDecommission_Timeout_RevertFails_KeepsStateAndRetries(t *testing.T) {
+	const name = "bk-revertfail"
+	now := time.Now()
+	started := metav1.NewTime(now.Add(-2 * time.Hour)) // past the default 1800s timeout
+
+	bk := newDecommTestBookKeeper(name, 3)
+	ordinal := int32(2)
+	bk.Status.Decommission = &clusterv1alpha1.BookKeeperDecommissionStatus{
+		Phase:          clusterv1alpha1.BookKeeperDecommissionPhaseAwaitingReplication,
+		TargetOrdinal:  &ordinal,
+		TargetBookieID: bookieIDFor(bk, ordinal),
+		StartedAt:      &started,
+	}
+
+	admin := newMockAdmin()
+	admin.writable["bk-revertfail-2"] = false
+	admin.hasLedgers["bk-revertfail-2"] = true
+	admin.setReadOnlyRevertErr = errors.New("bookie admin API unreachable")
+
+	r, cl := newDecommTestReconciler(t, admin, now, bk)
+
+	err := reconcileExpectErr(t, r, name)
+	if !strings.Contains(err.Error(), "reverting bookie") {
+		t.Fatalf("error = %v, want it to wrap the revert failure", err)
+	}
+
+	got := getBookKeeper(t, cl, name)
+	if got.Status.Decommission == nil {
+		t.Fatalf("Status.Decommission = nil, want state PRESERVED when the revert fails")
+	}
+	if got.Status.Decommission.Phase != clusterv1alpha1.BookKeeperDecommissionPhaseAwaitingReplication {
+		t.Fatalf("phase = %s, want it unchanged at AwaitingReplication so the next reconcile retries the revert", got.Status.Decommission.Phase)
+	}
+	if len(admin.setReadOnlyCalls) != 1 || admin.setReadOnlyCalls[0] != (setReadOnlyCall{"bk-revertfail-2", false}) {
+		t.Fatalf("setReadOnlyCalls = %v, want exactly one attempted readOnly=false revert", admin.setReadOnlyCalls)
+	}
+
+	// The revert now succeeds on the follow-up reconcile: state is cleared.
+	admin.setReadOnlyRevertErr = nil
+	reconcileOnce(t, r, name)
+
+	got = getBookKeeper(t, cl, name)
+	if got.Status.Decommission != nil {
+		t.Fatalf("Status.Decommission = %+v, want nil once the retried revert succeeds", got.Status.Decommission)
+	}
+	if len(admin.setReadOnlyCalls) != 2 {
+		t.Fatalf("setReadOnlyCalls = %v, want a second (successful) revert call", admin.setReadOnlyCalls)
+	}
+	if !admin.writable["bk-revertfail-2"] {
+		t.Errorf("bookie must be writable again after the retried revert succeeds")
+	}
+}
+
+// --- placement (rack/zone) guard at the controller level ---
+
+func TestBookKeeperDecommission_PlacementGuard(t *testing.T) {
+	// ensembleSize=2 so removing one of three bookies still satisfies the
+	// capacity guard (2 writable remain), leaving zone placement as the sole
+	// deciding factor. Target is ordinal 2.
+	two := int32(2)
+	const zoneA, zoneB, zoneC = "zone-a", "zone-b", "zone-c"
+
+	tests := []struct {
+		name      string
+		zones     []string // zone label per ordinal 0,1,2 (2 is the target)
+		wantAbort bool
+	}{
+		{"remaining bookies collapse to a single zone -> abort", []string{zoneA, zoneA, zoneB}, true},
+		{"remaining bookies span two zones -> proceed", []string{zoneA, zoneB, zoneC}, false},
+		// If the target's own zone were (wrongly) counted, {a,b} would be two
+		// zones and this would proceed; it must abort, proving the target's
+		// zone is excluded from the remaining-zone count.
+		{"target's own zone excluded from the count -> abort", []string{zoneA, zoneA, zoneB}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const name = "bk-placement"
+			now := time.Now()
+
+			bk := newDecommTestBookKeeper(name, 3)
+			bk.Spec.Ensemble = &clusterv1alpha1.BookKeeperEnsembleSpec{EnsembleSize: &two, WriteQuorum: &two, AckQuorum: &two}
+			ordinal := int32(2)
+			bk.Status.Decommission = &clusterv1alpha1.BookKeeperDecommissionStatus{
+				Phase:          clusterv1alpha1.BookKeeperDecommissionPhaseVerifying,
+				TargetOrdinal:  &ordinal,
+				TargetBookieID: bookieIDFor(bk, ordinal),
+				StartedAt:      &metav1.Time{Time: now.Add(-time.Minute)},
+			}
+
+			objs := append([]client.Object{bk}, readyPodsOnNodes(bk, tt.zones, now.Add(-time.Hour))...)
+
+			admin := newMockAdmin()
+			admin.writable["bk-placement-0"] = true
+			admin.writable["bk-placement-1"] = true
+			admin.writable["bk-placement-2"] = true
+
+			r, cl := newDecommTestReconciler(t, admin, now, objs...)
+
+			reconcileOnce(t, r, name)
+
+			got := getBookKeeper(t, cl, name)
+			if tt.wantAbort {
+				if got.Status.Decommission != nil {
+					t.Fatalf("Status.Decommission = %+v, want nil (placement guard aborted)", got.Status.Decommission)
+				}
+				cond := decommissioningCond(got)
+				if cond == nil || cond.Reason != reasonDecommissionPlacementUnsatisfiable {
+					t.Fatalf("condition = %+v, want reason %s", cond, reasonDecommissionPlacementUnsatisfiable)
+				}
+				if len(admin.setReadOnlyCalls) != 0 {
+					t.Errorf("setReadOnlyCalls = %v, want none -- a pre-flight guard failure must not touch any bookie", admin.setReadOnlyCalls)
+				}
+			} else {
+				if got.Status.Decommission == nil || got.Status.Decommission.Phase != clusterv1alpha1.BookKeeperDecommissionPhaseMarkingReadOnly {
+					t.Fatalf("phase = %+v, want advanced to MarkingReadOnly (placement satisfied)", got.Status.Decommission)
+				}
+			}
+		})
+	}
+}
+
+// --- failure contracts for TriggeringRecovery and InvalidatingCookie ---
+
+// TestBookKeeperDecommission_TriggerRecovery_ErrorRetries proves a failed
+// decommissionbookie/recover trigger surfaces the error and stays in
+// TriggeringRecovery (retried by the controller's normal backoff), without
+// reverting.
+func TestBookKeeperDecommission_TriggerRecovery_ErrorRetries(t *testing.T) {
+	const name = "bk-triggererr"
+	now := time.Now()
+
+	bk := newDecommTestBookKeeper(name, 3)
+	ordinal := int32(2)
+	bk.Status.Decommission = &clusterv1alpha1.BookKeeperDecommissionStatus{
+		Phase:          clusterv1alpha1.BookKeeperDecommissionPhaseTriggeringRecovery,
+		TargetOrdinal:  &ordinal,
+		TargetBookieID: bookieIDFor(bk, ordinal),
+		StartedAt:      &metav1.Time{Time: now.Add(-time.Minute)}, // not timed out
+	}
+
+	admin := newMockAdmin()
+	admin.writable["bk-triggererr-2"] = false
+	admin.triggerErr = errors.New("decommissionbookie and recover both failed")
+
+	r, cl := newDecommTestReconciler(t, admin, now, bk)
+
+	err := reconcileExpectErr(t, r, name)
+	if !strings.Contains(err.Error(), "triggering decommission") {
+		t.Fatalf("error = %v, want it to wrap the trigger failure", err)
+	}
+
+	got := getBookKeeper(t, cl, name)
+	if got.Status.Decommission == nil || got.Status.Decommission.Phase != clusterv1alpha1.BookKeeperDecommissionPhaseTriggeringRecovery {
+		t.Fatalf("phase = %+v, want unchanged at TriggeringRecovery", got.Status.Decommission)
+	}
+	if len(admin.triggerCalls) != 1 {
+		t.Errorf("triggerCalls = %v, want exactly one attempt", admin.triggerCalls)
+	}
+	if len(admin.setReadOnlyCalls) != 0 {
+		t.Errorf("setReadOnlyCalls = %v, want none -- a trigger failure is retried, not reverted", admin.setReadOnlyCalls)
+	}
+}
+
+// TestBookKeeperDecommission_InvalidateCookie_ErrorRetriesNeverReverts proves
+// the critical post-cookie-rename contract: once the cookie has been
+// invalidated, a subsequent failure is retried indefinitely and NEVER
+// triggers a revert to writable (which would be unsafe -- the bookie's
+// on-disk identity is already gone).
+func TestBookKeeperDecommission_InvalidateCookie_ErrorRetriesNeverReverts(t *testing.T) {
+	const name = "bk-renameerr"
+	now := time.Now()
+
+	bk := newDecommTestBookKeeper(name, 3)
+	ordinal := int32(2)
+	// Deliberately far past the timeout, to prove that even a timed-out
+	// decommission is NOT reverted once past cookie invalidation.
+	bk.Status.Decommission = &clusterv1alpha1.BookKeeperDecommissionStatus{
+		Phase:          clusterv1alpha1.BookKeeperDecommissionPhaseInvalidatingCookie,
+		TargetOrdinal:  &ordinal,
+		TargetBookieID: bookieIDFor(bk, ordinal),
+		StartedAt:      &metav1.Time{Time: now.Add(-3 * time.Hour)},
+	}
+
+	admin := newMockAdmin()
+	admin.writable["bk-renameerr-2"] = false
+	admin.renameErr = errors.New("pod exec failed renaming cookie")
+
+	r, cl := newDecommTestReconciler(t, admin, now, bk)
+
+	err := reconcileExpectErr(t, r, name)
+	if !strings.Contains(err.Error(), "invalidating cookie") {
+		t.Fatalf("error = %v, want it to wrap the cookie-rename failure", err)
+	}
+
+	got := getBookKeeper(t, cl, name)
+	if got.Status.Decommission == nil || got.Status.Decommission.Phase != clusterv1alpha1.BookKeeperDecommissionPhaseInvalidatingCookie {
+		t.Fatalf("phase = %+v, want unchanged at InvalidatingCookie", got.Status.Decommission)
+	}
+	if len(admin.renameCalls) != 1 {
+		t.Errorf("renameCalls = %v, want exactly one attempt", admin.renameCalls)
+	}
+	if len(admin.setReadOnlyCalls) != 0 {
+		t.Fatalf("setReadOnlyCalls = %v, want NONE -- failures after the cookie rename must never revert to writable", admin.setReadOnlyCalls)
 	}
 }
 
