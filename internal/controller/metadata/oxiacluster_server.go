@@ -22,6 +22,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -43,6 +44,9 @@ func (r *OxiaClusterReconciler) reconcileServer(ctx context.Context, oxia *metad
 	}
 	if err := r.reconcileServerStatefulSet(ctx, oxia); err != nil {
 		return fmt.Errorf("server statefulset: %w", err)
+	}
+	if err := r.reconcileServerPDB(ctx, oxia); err != nil {
+		return fmt.Errorf("server poddisruptionbudget: %w", err)
 	}
 	return nil
 }
@@ -119,7 +123,13 @@ func (r *OxiaClusterReconciler) reconcileServerStatefulSet(ctx context.Context, 
 		sts.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: labels},
 			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{serverContainer(oxia)},
+				// oxia-server is a stateful quorum tier (odd replicas,
+				// majority-vote shard replication): co-locating two
+				// replicas on one node would let a single node loss cost
+				// quorum outright, so anti-affinity here is hard.
+				Affinity:                  builder.PodAntiAffinity(true, selector),
+				TopologySpreadConstraints: builder.ZoneTopologySpreadConstraints(selector),
+				Containers:                []corev1.Container{serverContainer(oxia)},
 			},
 		}
 
@@ -135,6 +145,26 @@ func (r *OxiaClusterReconciler) reconcileServerStatefulSet(ctx context.Context, 
 		}
 
 		return builder.SetControllerOwner(oxia, sts, r.Scheme)
+	})
+	return err
+}
+
+// reconcileServerPDB bounds voluntary oxia-server disruption to
+// builder.QuorumMaxUnavailable(replicas): the server StatefulSet is an
+// odd-sized majority-vote quorum (like a Raft-replicated group), so a
+// majority must always remain available through a voluntary disruption,
+// exactly like the bookie ensemble's write/ack-quorum math protects
+// BookKeeper.
+func (r *OxiaClusterReconciler) reconcileServerPDB(ctx context.Context, oxia *metadatav1alpha1.OxiaCluster) error {
+	name := serverName(oxia.Name)
+	pdb := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: oxia.Namespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
+		labels := builder.Labels(oxia.Name, componentServer)
+		selector := builder.SelectorLabels(oxia.Name, componentServer)
+		desired := builder.PodDisruptionBudget(name, oxia.Namespace, labels, selector, builder.QuorumMaxUnavailable(serverReplicas(oxia)))
+		pdb.Labels = desired.Labels
+		pdb.Spec = desired.Spec
+		return builder.SetControllerOwner(oxia, pdb, r.Scheme)
 	})
 	return err
 }

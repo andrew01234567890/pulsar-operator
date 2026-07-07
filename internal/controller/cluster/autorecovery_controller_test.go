@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
@@ -114,6 +115,28 @@ var _ = Describe("AutoRecovery Controller", func() {
 			Expect(deploy.Spec.Template.Spec.Containers[0].ReadinessProbe).NotTo(BeNil())
 			Expect(deploy.Spec.Template.Annotations).To(HaveKey(builder.ConfigChecksumAnnotation))
 
+			By("hard anti-affinity keyed on the autorecovery selector (stateful quorum tier)")
+			affinity := deploy.Spec.Template.Spec.Affinity
+			Expect(affinity).NotTo(BeNil())
+			Expect(affinity.PodAntiAffinity).NotTo(BeNil())
+			Expect(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution).To(HaveLen(1))
+			Expect(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0].TopologyKey).To(Equal(builder.HostnameTopologyKey))
+			Expect(affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution).To(BeEmpty())
+
+			By("default zone topology spread constraints")
+			Expect(deploy.Spec.Template.Spec.TopologySpreadConstraints).To(HaveLen(1))
+			Expect(deploy.Spec.Template.Spec.TopologySpreadConstraints[0].TopologyKey).To(Equal(builder.ZoneTopologyKey))
+			Expect(deploy.Spec.Template.Spec.TopologySpreadConstraints[0].WhenUnsatisfiable).To(Equal(corev1.ScheduleAnyway))
+
+			By("a quorum-derived PodDisruptionBudget")
+			pdb := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, key, pdb)).To(Succeed())
+			Expect(pdb.Spec.Selector.MatchLabels).To(Equal(builder.SelectorLabels(resourceName, autoRecoveryComponent)))
+			Expect(pdb.Spec.MaxUnavailable).NotTo(BeNil())
+			// floor((2-1)/2) = 0: a 2-replica majority-vote group has no
+			// safe margin, so voluntary disruption is fully blocked.
+			Expect(pdb.Spec.MaxUnavailable.IntValue()).To(Equal(0))
+
 			cm := &corev1.ConfigMap{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-config", Namespace: resourceNamespace}, cm)).To(Succeed())
 			Expect(cm.Data[autoRecoveryConfigFileName]).To(ContainSubstring("httpServerPort=8000"))
@@ -200,6 +223,7 @@ var _ = Describe("AutoRecovery Controller", func() {
 			reconcileAutoRecovery(resourceName)
 			Expect(k8sClient.Get(ctx, key, &appsv1.Deployment{})).To(Succeed())
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-config", Namespace: resourceNamespace}, &corev1.ConfigMap{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, key, &policyv1.PodDisruptionBudget{})).To(Succeed())
 
 			autoRecovery := &clusterv1alpha1.AutoRecovery{}
 			Expect(k8sClient.Get(ctx, key, autoRecovery)).To(Succeed())
@@ -209,6 +233,7 @@ var _ = Describe("AutoRecovery Controller", func() {
 			autoRecovery = reconcileAutoRecovery(resourceName)
 
 			Expect(k8sClient.Get(ctx, key, &appsv1.Deployment{})).To(MatchError(errors.IsNotFound, "IsNotFound"))
+			Expect(k8sClient.Get(ctx, key, &policyv1.PodDisruptionBudget{})).To(MatchError(errors.IsNotFound, "IsNotFound"))
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-config", Namespace: resourceNamespace}, &corev1.ConfigMap{})).
 				To(MatchError(errors.IsNotFound, "IsNotFound"))
 

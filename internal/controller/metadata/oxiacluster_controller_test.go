@@ -22,6 +22,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -89,6 +90,23 @@ var _ = Describe("OxiaCluster Controller", func() {
 			Expect(deploy.Spec.Template.Spec.ServiceAccountName).To(Equal(coordinatorName(resourceName)))
 			Expect(deploy.Spec.Template.Annotations).To(HaveKey(builder.ConfigChecksumAnnotation))
 
+			By("soft anti-affinity keyed on the coordinator selector (stateless tier)")
+			affinity := deploy.Spec.Template.Spec.Affinity
+			Expect(affinity).NotTo(BeNil())
+			Expect(affinity.PodAntiAffinity).NotTo(BeNil())
+			Expect(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution).To(BeEmpty())
+			Expect(affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution).To(HaveLen(1))
+
+			By("default zone topology spread constraints")
+			Expect(deploy.Spec.Template.Spec.TopologySpreadConstraints).To(HaveLen(1))
+			Expect(deploy.Spec.Template.Spec.TopologySpreadConstraints[0].TopologyKey).To(Equal(builder.ZoneTopologyKey))
+
+			By("a flat-1 PodDisruptionBudget (stateless: losing a coordinator only costs a leader-election handover)")
+			pdb := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: coordinatorName(resourceName), Namespace: resourceNamespace}, pdb)).To(Succeed())
+			Expect(pdb.Spec.MaxUnavailable.IntValue()).To(Equal(1))
+			Expect(pdb.OwnerReferences).To(HaveLen(1))
+
 			cm := &corev1.ConfigMap{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: coordinatorName(resourceName), Namespace: resourceNamespace}, cm)).To(Succeed())
 			Expect(cm.OwnerReferences).To(HaveLen(1))
@@ -137,6 +155,23 @@ var _ = Describe("OxiaCluster Controller", func() {
 			Expect(sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests.Storage().String()).To(Equal("8Gi"))
 			Expect(sts.OwnerReferences).To(HaveLen(1))
 			Expect(sts.OwnerReferences[0].Name).To(Equal(resourceName))
+
+			By("hard anti-affinity keyed on the server selector (stateful quorum tier)")
+			affinity := sts.Spec.Template.Spec.Affinity
+			Expect(affinity).NotTo(BeNil())
+			Expect(affinity.PodAntiAffinity).NotTo(BeNil())
+			Expect(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution).To(HaveLen(1))
+			Expect(affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution).To(BeEmpty())
+
+			By("default zone topology spread constraints")
+			Expect(sts.Spec.Template.Spec.TopologySpreadConstraints).To(HaveLen(1))
+			Expect(sts.Spec.Template.Spec.TopologySpreadConstraints[0].TopologyKey).To(Equal(builder.ZoneTopologyKey))
+
+			By("a quorum-derived PodDisruptionBudget: floor((3-1)/2) = 1")
+			pdb := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: serverName(resourceName), Namespace: resourceNamespace}, pdb)).To(Succeed())
+			Expect(pdb.Spec.MaxUnavailable.IntValue()).To(Equal(1))
+			Expect(pdb.OwnerReferences).To(HaveLen(1))
 
 			headless := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: serverHeadlessServiceName(resourceName), Namespace: resourceNamespace}, headless)).To(Succeed())

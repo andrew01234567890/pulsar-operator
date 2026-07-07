@@ -109,6 +109,17 @@ var _ = Describe("FunctionsWorker Controller", func() {
 			Expect(sts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"functions-worker"}))
 			Expect(sts.Spec.Template.Annotations).To(HaveKey(builder.ConfigChecksumAnnotation))
 
+			By("soft anti-affinity keyed on the functionsworker selector (stateless tier)")
+			affinity := sts.Spec.Template.Spec.Affinity
+			Expect(affinity).NotTo(BeNil())
+			Expect(affinity.PodAntiAffinity).NotTo(BeNil())
+			Expect(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution).To(BeEmpty())
+			Expect(affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution).To(HaveLen(1))
+
+			By("default zone topology spread constraints")
+			Expect(sts.Spec.Template.Spec.TopologySpreadConstraints).To(HaveLen(1))
+			Expect(sts.Spec.Template.Spec.TopologySpreadConstraints[0].TopologyKey).To(Equal(builder.ZoneTopologyKey))
+
 			svc := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, key, svc)).To(Succeed())
 			Expect(svc.Spec.ClusterIP).To(Equal("None"))

@@ -22,6 +22,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -61,6 +62,9 @@ func (r *OxiaClusterReconciler) reconcileCoordinator(ctx context.Context, oxia *
 	}
 	if err := r.reconcileCoordinatorDeployment(ctx, oxia, configContent); err != nil {
 		return "", fmt.Errorf("coordinator deployment: %w", err)
+	}
+	if err := r.reconcileCoordinatorPDB(ctx, oxia); err != nil {
+		return "", fmt.Errorf("coordinator poddisruptionbudget: %w", err)
 	}
 
 	return configContent, nil
@@ -243,6 +247,12 @@ func (r *OxiaClusterReconciler) reconcileCoordinatorDeployment(ctx context.Conte
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: name,
+				// The coordinator is stateless from a scheduling standpoint:
+				// shard-assignment state lives in the status ConfigMap, not
+				// on the pod, and losing one replica just costs an election,
+				// not data - so anti-affinity here is soft, not hard.
+				Affinity:                  builder.PodAntiAffinity(false, selector),
+				TopologySpreadConstraints: builder.ZoneTopologySpreadConstraints(selector),
 				Containers: []corev1.Container{
 					coordinatorContainer(oxia),
 				},
@@ -250,6 +260,24 @@ func (r *OxiaClusterReconciler) reconcileCoordinatorDeployment(ctx context.Conte
 		}
 
 		return builder.SetControllerOwner(oxia, deploy, r.Scheme)
+	})
+	return err
+}
+
+// reconcileCoordinatorPDB bounds voluntary coordinator disruption to 1 at a
+// time: like other stateless tiers (broker, proxy), losing a coordinator
+// replica just costs a leader-election handover, not data, so a flat 1 (not
+// quorum math) is the right, conservative default.
+func (r *OxiaClusterReconciler) reconcileCoordinatorPDB(ctx context.Context, oxia *metadatav1alpha1.OxiaCluster) error {
+	name := coordinatorName(oxia.Name)
+	pdb := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: oxia.Namespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
+		labels := builder.Labels(oxia.Name, componentCoordinator)
+		selector := builder.SelectorLabels(oxia.Name, componentCoordinator)
+		desired := builder.PodDisruptionBudget(name, oxia.Namespace, labels, selector, intstr.FromInt32(1))
+		pdb.Labels = desired.Labels
+		pdb.Spec = desired.Spec
+		return builder.SetControllerOwner(oxia, pdb, r.Scheme)
 	})
 	return err
 }

@@ -501,3 +501,45 @@ func TestBrokerContainerPortsTrackConfig(t *testing.T) {
 func renderConfig(broker *clusterv1alpha1.Broker) string {
 	return config.RenderProperties(mergedBrokerConfig(broker))
 }
+
+func TestBrokerAffinity(t *testing.T) {
+	selector := map[string]string{"app.kubernetes.io/component": "broker"}
+
+	tests := []struct {
+		name     string
+		spec     *clusterv1alpha1.AntiAffinityConfig
+		wantNil  bool
+		wantHard bool
+	}{
+		{name: "unset spec defaults to soft", spec: nil, wantHard: false},
+		{name: "explicit host=true selects hard", spec: &clusterv1alpha1.AntiAffinityConfig{Host: boolPtr(true)}, wantHard: true},
+		{name: "explicit host=false stays soft", spec: &clusterv1alpha1.AntiAffinityConfig{Host: boolPtr(false)}, wantHard: false},
+		{name: "enabled=false disables anti-affinity entirely", spec: &clusterv1alpha1.AntiAffinityConfig{Enabled: boolPtr(false)}, wantNil: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := brokerAffinity(tt.spec, selector)
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("brokerAffinity(%+v) = %+v, want nil", tt.spec, got)
+				}
+				return
+			}
+			if got == nil || got.PodAntiAffinity == nil {
+				t.Fatalf("brokerAffinity(%+v) = %+v, want non-nil PodAntiAffinity", tt.spec, got)
+			}
+			hasHard := len(got.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) > 0
+			hasSoft := len(got.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution) > 0
+			if tt.wantHard {
+				if !hasHard || hasSoft {
+					t.Errorf("brokerAffinity(%+v) = %+v, want hard-only", tt.spec, got)
+				}
+			} else {
+				if !hasSoft || hasHard {
+					t.Errorf("brokerAffinity(%+v) = %+v, want soft-only", tt.spec, got)
+				}
+			}
+		})
+	}
+}
