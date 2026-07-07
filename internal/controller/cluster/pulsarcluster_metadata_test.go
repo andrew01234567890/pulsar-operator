@@ -354,14 +354,14 @@ func TestMetadataInitializedCondition(t *testing.T) {
 	const generation = int64(3)
 
 	t.Run("waiting for oxia", func(t *testing.T) {
-		got := metadataInitializedCondition(generation, false, nil, false)
+		got := metadataInitializedCondition(generation, false, nil, false, imagePullStuckInfo{})
 		if got.Status != metav1.ConditionFalse || got.Reason != reasonMetadataInitWaitingForOxia {
 			t.Errorf("got %+v, want False/%s", got, reasonMetadataInitWaitingForOxia)
 		}
 	})
 
 	t.Run("oxia ready but job not created yet", func(t *testing.T) {
-		got := metadataInitializedCondition(generation, true, nil, false)
+		got := metadataInitializedCondition(generation, true, nil, false, imagePullStuckInfo{})
 		if got.Status != metav1.ConditionFalse || got.Reason != reasonMetadataInitJobRunning {
 			t.Errorf("got %+v, want False/%s", got, reasonMetadataInitJobRunning)
 		}
@@ -369,7 +369,7 @@ func TestMetadataInitializedCondition(t *testing.T) {
 
 	t.Run("job running", func(t *testing.T) {
 		job := &batchv1.Job{}
-		got := metadataInitializedCondition(generation, true, job, false)
+		got := metadataInitializedCondition(generation, true, job, false, imagePullStuckInfo{})
 		if got.Status != metav1.ConditionFalse || got.Reason != reasonMetadataInitJobRunning {
 			t.Errorf("got %+v, want False/%s", got, reasonMetadataInitJobRunning)
 		}
@@ -377,7 +377,7 @@ func TestMetadataInitializedCondition(t *testing.T) {
 
 	t.Run("job succeeded via status count", func(t *testing.T) {
 		job := &batchv1.Job{Status: batchv1.JobStatus{Succeeded: 1}}
-		got := metadataInitializedCondition(generation, true, job, false)
+		got := metadataInitializedCondition(generation, true, job, false, imagePullStuckInfo{})
 		if got.Status != metav1.ConditionTrue || got.Reason != reasonMetadataInitJobSucceeded {
 			t.Errorf("got %+v, want True/%s", got, reasonMetadataInitJobSucceeded)
 		}
@@ -387,7 +387,7 @@ func TestMetadataInitializedCondition(t *testing.T) {
 		job := &batchv1.Job{Status: batchv1.JobStatus{
 			Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
 		}}
-		got := metadataInitializedCondition(generation, true, job, false)
+		got := metadataInitializedCondition(generation, true, job, false, imagePullStuckInfo{})
 		if got.Status != metav1.ConditionTrue || got.Reason != reasonMetadataInitJobSucceeded {
 			t.Errorf("got %+v, want True/%s", got, reasonMetadataInitJobSucceeded)
 		}
@@ -397,9 +397,39 @@ func TestMetadataInitializedCondition(t *testing.T) {
 		job := &batchv1.Job{Status: batchv1.JobStatus{
 			Conditions: []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue}},
 		}}
-		got := metadataInitializedCondition(generation, true, job, false)
+		got := metadataInitializedCondition(generation, true, job, false, imagePullStuckInfo{})
 		if got.Status != metav1.ConditionFalse || got.Reason != reasonMetadataInitJobFailed {
 			t.Errorf("got %+v, want False/%s", got, reasonMetadataInitJobFailed)
+		}
+	})
+
+	t.Run("job stuck on image pull", func(t *testing.T) {
+		// The bug this guards against: a Job whose pod is stuck in
+		// ImagePullBackOff/ErrImagePull never trips the Job's own Failed
+		// condition (it stays Pending forever), so without a distinct check
+		// this would otherwise fall through to the generic (and misleading)
+		// "still JobRunning" reason.
+		job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: testMetadataInitName}}
+		imagePull := imagePullStuckInfo{stuck: true, image: "apachepulsar/pulsar:bogus-tag", reason: containerWaitingReasonImagePullBackOff}
+		got := metadataInitializedCondition(generation, true, job, false, imagePull)
+		if got.Status != metav1.ConditionFalse || got.Reason != reasonMetadataInitImagePullError {
+			t.Errorf("got %+v, want False/%s", got, reasonMetadataInitImagePullError)
+		}
+		if !strings.Contains(got.Message, imagePull.image) || !strings.Contains(got.Message, containerWaitingReasonImagePullBackOff) {
+			t.Errorf("Message = %q, want it to name the image and reason", got.Message)
+		}
+	})
+
+	t.Run("stuck image pull is reported even when a permanently-Failed check would not apply and oxia is not ready", func(t *testing.T) {
+		// The image-pull-stuck reason must win over "waiting for Oxia" (the
+		// generic not-yet-progressing state): the Job already exists and its
+		// pod is observably stuck, which is a more specific and more useful
+		// diagnosis than "waiting for Oxia" ever would be.
+		job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: testMetadataInitName}}
+		imagePull := imagePullStuckInfo{stuck: true, image: "apachepulsar/pulsar:bogus-tag", reason: containerWaitingReasonErrImagePull}
+		got := metadataInitializedCondition(generation, false, job, false, imagePull)
+		if got.Status != metav1.ConditionFalse || got.Reason != reasonMetadataInitImagePullError {
+			t.Errorf("got %+v, want False/%s", got, reasonMetadataInitImagePullError)
 		}
 	})
 
@@ -408,7 +438,7 @@ func TestMetadataInitializedCondition(t *testing.T) {
 		// A transient Oxia readiness blip (oxiaReady=false) must NOT flip a
 		// previously-succeeded MetadataInitialized back to False/WaitingForOxia.
 		job := &batchv1.Job{Status: batchv1.JobStatus{Succeeded: 1}}
-		got := metadataInitializedCondition(generation, false, job, false)
+		got := metadataInitializedCondition(generation, false, job, false, imagePullStuckInfo{})
 		if got.Status != metav1.ConditionTrue || got.Reason != reasonMetadataInitJobSucceeded {
 			t.Errorf("got %+v, want True/%s", got, reasonMetadataInitJobSucceeded)
 		}
@@ -418,20 +448,20 @@ func TestMetadataInitializedCondition(t *testing.T) {
 		// Regression: a deleted succeeded Job (kubectl delete job, finished-Job
 		// TTL/cleanup) must not regress a previously-True MetadataInitialized
 		// to False/JobRunning or JobFailed - bootstrap is a permanent fact.
-		got := metadataInitializedCondition(generation, true, nil, true)
+		got := metadataInitializedCondition(generation, true, nil, true, imagePullStuckInfo{})
 		if got.Status != metav1.ConditionTrue || got.Reason != reasonMetadataInitJobSucceeded {
 			t.Errorf("got %+v, want True/%s", got, reasonMetadataInitJobSucceeded)
 		}
 	})
 
 	t.Run("already-initialized stays True even when oxia is not Ready and the Job is absent", func(t *testing.T) {
-		got := metadataInitializedCondition(generation, false, nil, true)
+		got := metadataInitializedCondition(generation, false, nil, true, imagePullStuckInfo{})
 		if got.Status != metav1.ConditionTrue || got.Reason != reasonMetadataInitJobSucceeded {
 			t.Errorf("got %+v, want True/%s", got, reasonMetadataInitJobSucceeded)
 		}
 	})
 
-	if got := metadataInitializedCondition(generation, true, nil, false).Type; got != conditionTypeMetadataInitialized {
+	if got := metadataInitializedCondition(generation, true, nil, false, imagePullStuckInfo{}).Type; got != conditionTypeMetadataInitialized {
 		t.Errorf("Type = %q, want %q", got, conditionTypeMetadataInitialized)
 	}
 }
