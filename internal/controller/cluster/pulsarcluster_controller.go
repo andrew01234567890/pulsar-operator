@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 
+	batchv1 "k8s.io/api/batch/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -81,6 +82,7 @@ const (
 // +kubebuilder:rbac:groups=cluster.pulsaroperator.io,resources=functionsworkers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=metadata.pulsaroperator.io,resources=oxiaclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=metadata.pulsaroperator.io,resources=oxiaclusters/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile decomposes a PulsarCluster into its per-component child CRs,
 // creates or updates the desired ones (owned by the PulsarCluster so they are
@@ -144,6 +146,13 @@ func (r *PulsarClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	cluster.Status.OxiaPhase = componentPhase(oxiaReport)
 	reports = append(reports, oxiaReport)
 
+	metadataInitReport, requeueMetadataInit, err := r.reconcileMetadataInit(ctx, cluster, oxiaReport.ready)
+	if err != nil {
+		log.Error(err, "failed to reconcile cluster-metadata-init Job")
+		return ctrl.Result{}, err
+	}
+	reports = append(reports, metadataInitReport)
+
 	cluster.Status.ObservedGeneration = cluster.Generation
 	apimeta.SetStatusCondition(&cluster.Status.Conditions, aggregateReadyCondition(cluster.Generation, reports))
 
@@ -151,6 +160,9 @@ func (r *PulsarClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("updating PulsarCluster status: %w", err)
 	}
 
+	if requeueMetadataInit {
+		return ctrl.Result{RequeueAfter: metadataInitRetryInterval}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -164,6 +176,7 @@ func (r *PulsarClusterReconciler) reconcileBroker(ctx context.Context, cluster *
 	}
 
 	desired := buildBrokerSpec(cluster.Spec)
+	desired.Config = withBrokerProxyMetadataDefaults(desired.Config, cluster.Name)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
 		return nil
@@ -184,6 +197,7 @@ func (r *PulsarClusterReconciler) reconcileBookKeeper(ctx context.Context, clust
 	}
 
 	desired := buildBookKeeperSpec(cluster.Spec)
+	desired.Config = withBookKeeperMetadataDefault(desired.Config, cluster.Name)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
 		return nil
@@ -204,6 +218,7 @@ func (r *PulsarClusterReconciler) reconcileProxy(ctx context.Context, cluster *c
 	}
 
 	desired := buildProxySpec(cluster.Spec)
+	desired.Config = withBrokerProxyMetadataDefaults(desired.Config, cluster.Name)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
 		return nil
@@ -244,6 +259,7 @@ func (r *PulsarClusterReconciler) reconcileFunctionsWorker(ctx context.Context, 
 	}
 
 	desired := buildFunctionsWorkerSpec(cluster.Spec)
+	desired.Config = withFunctionsWorkerMetadataDefault(desired.Config, cluster.Name)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
 		return nil
@@ -561,6 +577,7 @@ func (r *PulsarClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&clusterv1alpha1.AutoRecovery{}).
 		Owns(&clusterv1alpha1.FunctionsWorker{}).
 		Owns(&metadatav1alpha1.OxiaCluster{}).
+		Owns(&batchv1.Job{}).
 		Named("cluster-pulsarcluster").
 		Complete(r)
 }
