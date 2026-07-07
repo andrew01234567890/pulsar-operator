@@ -149,6 +149,11 @@ spec:
                     minimum: 0
                     type: integer
                 type: object
+                x-kubernetes-validations:
+                - message: lower threshold must be below higher
+                  rule: self.lowerCpuThreshold < self.higherCpuThreshold
+                - message: min must be <= max
+                  rule: '!has(self.max) || !has(self.min) || self.min <= self.max'
               config:
                 additionalProperties:
                   type: string

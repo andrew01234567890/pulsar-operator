@@ -46,9 +46,9 @@ type OxiaCoordinatorSpec struct {
 // OxiaServerSpec configures the Oxia server StatefulSet, which holds the
 // authoritative Pulsar metadata (managed-ledger pointers, topic ownership,
 // schemas, cursors) and has no native snapshot/export tooling.
+// +kubebuilder:validation:XValidation:rule="self.replicas % 2 == 1",message="oxia server replicas must be odd (quorum)"
 type OxiaServerSpec struct {
-	// replicas is the number of server pods. Must be odd for quorum correctness;
-	// oddness is enforced by a future validating webhook.
+	// replicas is the number of server pods. Must be odd for quorum correctness.
 	// +optional
 	// +kubebuilder:default=3
 	// +kubebuilder:validation:Minimum=1

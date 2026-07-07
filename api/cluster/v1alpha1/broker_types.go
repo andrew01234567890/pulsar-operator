@@ -28,6 +28,8 @@ import (
 // bandwidth-out, mirroring Pulsar's ThresholdShedder) to exceed
 // higherCpuThreshold; scale-down requires every broker below lowerCpuThreshold.
 // A single hot or idle broker never triggers a scaling action on its own.
+// +kubebuilder:validation:XValidation:rule="self.lowerCpuThreshold < self.higherCpuThreshold",message="lower threshold must be below higher"
+// +kubebuilder:validation:XValidation:rule="!has(self.max) || !has(self.min) || self.min <= self.max",message="min must be <= max"
 type BrokerAutoscalerSpec struct {
 	// enabled turns on the broker autoscaler.
 	// +optional

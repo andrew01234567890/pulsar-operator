@@ -184,6 +184,9 @@ spec:
                         minimum: 0
                         type: integer
                     type: object
+                    x-kubernetes-validations:
+                    - message: Lwm must be below Hwm
+                      rule: self.diskUsageToleranceLwm < self.diskUsageToleranceHwm
                   config:
                     additionalProperties:
                       type: string
@@ -222,6 +225,10 @@ spec:
                         minimum: 1
                         type: integer
                     type: object
+                    x-kubernetes-validations:
+                    - message: ackQuorum <= writeQuorum <= ensembleSize
+                      rule: self.ackQuorum <= self.writeQuorum && self.writeQuorum
+                        <= self.ensembleSize
                   image:
                     description: |-
                       image overrides the bookie container image. Falls back to
@@ -231,12 +238,14 @@ spec:
                     default: Parallel
                     description: |-
                       podManagementPolicy is the StatefulSet pod management policy. Immutable
-                      once set; changing it requires operator-guarded validation in a future
-                      webhook.
+                      once set.
                     enum:
                     - OrderedReady
                     - Parallel
                     type: string
+                    x-kubernetes-validations:
+                    - message: podManagementPolicy is immutable
+                      rule: self == oldSelf
                   replicas:
                     description: replicas is the number of bookie pods.
                     format: int32
@@ -296,6 +305,10 @@ spec:
                         type: object
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: ensembleSize cannot exceed replicas
+                  rule: '!has(self.ensemble) || !has(self.ensemble.ensembleSize) ||
+                    !has(self.replicas) || self.ensemble.ensembleSize <= self.replicas'
               broker:
                 description: broker configures the broker component.
                 properties:
@@ -399,6 +412,11 @@ spec:
                         minimum: 0
                         type: integer
                     type: object
+                    x-kubernetes-validations:
+                    - message: lower threshold must be below higher
+                      rule: self.lowerCpuThreshold < self.higherCpuThreshold
+                    - message: min must be <= max
+                      rule: '!has(self.max) || !has(self.min) || self.min <= self.max'
                   config:
                     additionalProperties:
                       type: string
@@ -534,7 +552,11 @@ spec:
                       packageStorage selects the function-package storage backend. Oxia does
                       not provide the ZooKeeper-backed distributed log package storage KAAP
                       defaults to, so "FileSystemPackagesStorage" is required while the
-                      metadata store is Oxia-only; a future webhook enforces this.
+                      metadata store is Oxia-only. There is no CEL rule for this: the enum
+                      below has no ZooKeeper-dependent value to reject, since this operator's
+                      metadataStore is Oxia-only and ZooKeeper package storage was never
+                      exposed. If a ZooKeeper-backed value is ever added to the enum, add a
+                      same-struct CEL rule rejecting it here.
                     enum:
                     - FileSystemPackagesStorage
                     - S3PackagesStorage
@@ -1572,6 +1594,10 @@ spec:
                 required:
                 - driver
                 type: object
+                x-kubernetes-validations:
+                - message: bucket is required for object-store offload drivers (aws-s3,
+                    google-cloud-storage, azureblob)
+                  rule: self.driver == 'filesystem' || size(self.bucket) > 0
               oxia:
                 description: oxia configures the metadata.OxiaCluster child resource.
                 properties:
@@ -1703,9 +1729,8 @@ spec:
                         type: string
                       replicas:
                         default: 3
-                        description: |-
-                          replicas is the number of server pods. Must be odd for quorum correctness;
-                          oddness is enforced by a future validating webhook.
+                        description: replicas is the number of server pods. Must be
+                          odd for quorum correctness.
                         format: int32
                         minimum: 1
                         type: integer
@@ -1730,6 +1755,9 @@ spec:
                           write latency.
                         type: boolean
                     type: object
+                    x-kubernetes-validations:
+                    - message: oxia server replicas must be odd (quorum)
+                      rule: self.replicas % 2 == 1
                 type: object
               proxy:
                 description: proxy configures the optional proxy component.
