@@ -5,10 +5,12 @@ sidebar_position: 3
 # Autoscaling model
 
 :::caution WIP
-The autoscalers described here are designed but not yet implemented (see
-[phase 4](./intro.md) of the project plan). This page documents the target
-algorithm so operators know what to expect and can review the design before
-it ships.
+Bookie autoscaling is designed but not yet implemented (see
+[phase 4](./intro.md) of the project plan) - the bookie section below
+documents the target algorithm so operators know what to expect and can
+review the design before it ships. **Broker autoscaling is implemented**
+(`BrokerAutoscalerReconciler`); its section below describes shipped
+behavior, not a design target.
 :::
 
 Unlike a generic HPA/KEDA setup, broker and bookie autoscaling are handled by
@@ -18,35 +20,49 @@ disk usage alone doesn't tell you whether it's safe to remove a bookie.
 
 ## Broker autoscaling
 
-- **Loop:** one reconcile pass per broker set every `periodMs` (default 60s).
-- **Metric:** Pulsar's own load-report CPU
-  (`/admin/v2/broker-stats/load-report`, `resourcesUsageSource=PulsarLBReport`),
-  refined to mirror Pulsar's `ThresholdShedder` composite signal —
-  `max(cpu, bandwidthIn, bandwidthOut)` smoothed with an EMA of 0.9. This is
-  **not** raw kubelet/cgroup CPU; it reflects what Pulsar's own load balancer
-  considers "hot."
-- **Decision rule — unanimous:**
-  - Scale **up** only if **every** broker's CPU signal is above
-    `higherCpuThreshold = 0.8`.
-  - Scale **down** only if **every** broker's CPU signal is below
-    `lowerCpuThreshold = 0.3`.
-  - Otherwise, no-op. A single hot or idle broker never triggers a scaling
-    event on its own — this avoids oscillation from one noisy neighbor.
-- **Step size:** `scaleUpBy` / `scaleDownBy` = 1 broker at a time.
-- **Stabilization:** a 5-minute gate after any scaling event (all pods must
-  be `Ready`) before another decision is made, plus a `min` replica clamp.
-- **Scale-down drain:** the highest-ordinal broker is drained via the
-  `ExtensibleLoadManagerImpl` + `TransferShedder`
-  (`loadBalancerTransferEnabled=true`) — bundles are **live-transferred**,
-  not hard-unloaded, which avoids the reconnect storm a naive unload would
-  cause. The operator waits for the broker to own zero bundles before
-  terminating the pod, or auto-reverts the scale-down and raises a `Warning`
-  condition if it doesn't happen in time.
+A dedicated `BrokerAutoscalerReconciler` watches `Broker` objects
+independently of the main Broker reconciler, gated on
+`spec.autoscaler.enabled`.
 
-  Live transfer is a real improvement over unload-based draining, but it is
-  **not fully transparent** to clients — in-flight requests can still be
-  affected. Don't oversell this as zero-downtime; it's "no reconnect storm,"
-  not "no impact."
+- **Loop:** one reconcile pass per Broker every `periodSeconds` (default 60s).
+- **Metric:** pluggable behind a `BrokerLoadClient` interface (unit tests
+  substitute a mock), with two built-in sources selected by
+  `resourcesUsageSource`:
+  - `PulsarLBReport` (default) - each broker's own
+    `/admin/v2/broker-stats/load-report` `cpu: {usage, limit}` pair, turned
+    into a whole-number percent. This is what Pulsar's own load manager
+    considers "hot," not raw kubelet/cgroup CPU.
+  - `K8SMetrics` - the metrics-server aggregated API, expressed as a percent
+    of the pod's own CPU limit.
+- **Decision rule — unanimous:**
+  - Scale **up** only if **every** broker's CPU percent is strictly above
+    `higherCpuThreshold` (default 80).
+  - Scale **down** only if **every** broker's CPU percent is strictly below
+    `lowerCpuThreshold` (default 30).
+  - Otherwise (a broker in between the thresholds, or a mix of hot and cold
+    brokers), no-op. A single hot or idle broker never triggers a scaling
+    event on its own — this avoids oscillation from one noisy neighbor.
+- **Step size:** `scaleUpBy` / `scaleDownBy` (default 1 broker at a time),
+  clamped to `[min, max]` (`min` defaults to 2; `max` is unbounded if unset).
+- **Stabilization:** the decision is skipped unless every broker pod is
+  currently `Ready` *and* `stabilizationWindowSeconds` (default 300) have
+  elapsed since `status.lastScaleTime`.
+- **Observability:** every tick (scale or no-op) updates an `Autoscaling`
+  status condition explaining the outcome
+  (`ScaleUp`/`ScaleDown`/`MixedSignals`/`AtReplicaBound`/`PodsNotReady`/
+  `AwaitingStabilization`/`MetricsUnavailable`/`Disabled`); an actual scale
+  additionally records `status.lastScaleTime` and emits a Kubernetes Event.
+
+**Scale-down is a plain replica-count decrease** — the autoscaler does not
+pick which ordinal drains first or wait for zero owned bundles. It relies
+entirely on the Broker reconciler's existing preStop sleep +
+`terminationGracePeriodSeconds` (sized to Pulsar's own
+`brokerShutdownTimeoutMs` shutdown hook) to unload the terminating pod's
+bundles before the process is killed. That is a **graceful shutdown, not a
+live bundle-transfer handover** (`ExtensibleLoadManagerImpl`'s
+`TransferShedder`) - in-flight requests to the terminating broker can still
+be affected. Don't oversell this as zero-downtime; it's "graceful," not
+"no impact."
 
 ## Bookie autoscaling
 
