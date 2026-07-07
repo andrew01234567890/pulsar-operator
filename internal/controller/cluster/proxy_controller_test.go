@@ -18,6 +18,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -91,9 +92,13 @@ var _ = Describe("Proxy Controller", func() {
 			Expect(sts.Spec.ServiceName).To(Equal(resourceName))
 			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(sts.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"sh", "-c"}))
-			Expect(sts.Spec.Template.Spec.Containers[0].Args).To(HaveLen(1))
-			Expect(sts.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("echo OK > " + proxyStatusFilePath))
-			Expect(sts.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring(cmdBinPulsar + " proxy"))
+			// Pin the whole wrapper: `&& exec` is load-bearing (the proxy must
+			// stay PID 1 to receive SIGTERM directly for graceful drain), so a
+			// future edit dropping `exec`/`&&` must fail the test, not slip
+			// through the two end-anchored substring checks.
+			Expect(sts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+				fmt.Sprintf("echo OK > %s && exec %s proxy", proxyStatusFilePath, cmdBinPulsar),
+			}))
 			Expect(sts.Spec.Template.Annotations).To(HaveKey(builder.ConfigChecksumAnnotation))
 
 			By("soft anti-affinity keyed on the proxy selector (stateless tier)")
