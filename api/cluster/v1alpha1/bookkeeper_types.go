@@ -246,6 +246,15 @@ type BookKeeperStatus struct {
 	// +optional
 	Decommission *BookKeeperDecommissionStatus `json:"decommission,omitempty"`
 
+	// bookieRacks is the last-applied bookie-id -> rack mapping written by
+	// the rack-awareness sync controller (gated on spec.autoRackConfig).
+	// It is the operator's own cache for diffing the desired mapping against
+	// what was last applied, not a read-back of BookKeeper's rack-placement
+	// metadata, so a sync tick calls the rack setter only for bookies whose
+	// desired rack differs from this cache.
+	// +optional
+	BookieRacks map[string]string `json:"bookieRacks,omitempty"`
+
 	// observedGeneration is the most recent generation observed by the controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`

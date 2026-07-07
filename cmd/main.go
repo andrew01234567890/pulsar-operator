@@ -235,6 +235,16 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "cluster-bookkeeper-decommission")
 		os.Exit(1)
 	}
+	if err := (&clustercontroller.BookKeeperRackReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		RESTConfig: restConfig,
+		ClientSet:  clientset,
+		Recorder:   mgr.GetEventRecorder("cluster-bookkeeper-rack-sync"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "cluster-bookkeeper-rack-sync")
+		os.Exit(1)
+	}
 	if err := (&clustercontroller.ProxyReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
