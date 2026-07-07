@@ -147,7 +147,7 @@ func (r *AutoRecoveryReconciler) reconcileDedicated(ctx context.Context, autoRec
 		return metav1.Condition{}, err
 	}
 
-	if err := r.reconcilePDB(ctx, autoRecovery, labels, selector, desiredReplicas); err != nil {
+	if err := r.reconcilePDB(ctx, autoRecovery, labels, selector); err != nil {
 		return metav1.Condition{}, err
 	}
 
@@ -259,13 +259,17 @@ func (r *AutoRecoveryReconciler) reconcileDeployment(
 }
 
 // reconcilePDB bounds voluntary disruption of the dedicated autorecovery
-// replicas to builder.QuorumMaxUnavailable(replicas): the Auditor's leader
-// election is a majority-vote tier like oxia-server, not a flat-1 stateless
-// tier, so it gets the same odd-quorum formula rather than a hardcoded 1.
-func (r *AutoRecoveryReconciler) reconcilePDB(ctx context.Context, autoRecovery *clusterv1alpha1.AutoRecovery, labels, selector map[string]string, replicas int32) error {
+// replicas to a flat 1, NOT quorum math: the BookKeeper AutoRecovery Auditor
+// is leader-elected through the metadata store (ZooKeeper/Oxia), so exactly
+// one replica is the active auditor and the rest are idle standbys - there is
+// no peer majority-vote among the replicas to protect. Quorum math would
+// yield floor((replicas-1)/2)=0 at the default replica count (1) and at 2,
+// and a maxUnavailable=0 PDB denies every voluntary eviction, hanging
+// kubectl drain / cluster-autoscaler on any node hosting an auditor pod.
+func (r *AutoRecoveryReconciler) reconcilePDB(ctx context.Context, autoRecovery *clusterv1alpha1.AutoRecovery, labels, selector map[string]string) error {
 	pdb := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: autoRecovery.Name, Namespace: autoRecovery.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
-		desired := builder.PodDisruptionBudget(pdb.Name, autoRecovery.Namespace, labels, selector, builder.QuorumMaxUnavailable(replicas))
+		desired := builder.PodDisruptionBudget(pdb.Name, autoRecovery.Namespace, labels, selector, intstr.FromInt32(1))
 		pdb.Labels = desired.Labels
 		pdb.Spec = desired.Spec
 		return controllerutil.SetControllerReference(autoRecovery, pdb, r.Scheme)

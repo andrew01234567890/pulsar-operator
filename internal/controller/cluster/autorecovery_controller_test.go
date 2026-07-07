@@ -128,14 +128,12 @@ var _ = Describe("AutoRecovery Controller", func() {
 			Expect(deploy.Spec.Template.Spec.TopologySpreadConstraints[0].TopologyKey).To(Equal(builder.ZoneTopologyKey))
 			Expect(deploy.Spec.Template.Spec.TopologySpreadConstraints[0].WhenUnsatisfiable).To(Equal(corev1.ScheduleAnyway))
 
-			By("a quorum-derived PodDisruptionBudget")
+			By("a flat-1 PodDisruptionBudget (auditor is metadata-store leader-elected, not a peer majority; maxUnavailable=0 would block node drains)")
 			pdb := &policyv1.PodDisruptionBudget{}
 			Expect(k8sClient.Get(ctx, key, pdb)).To(Succeed())
 			Expect(pdb.Spec.Selector.MatchLabels).To(Equal(builder.SelectorLabels(resourceName, autoRecoveryComponent)))
 			Expect(pdb.Spec.MaxUnavailable).NotTo(BeNil())
-			// floor((2-1)/2) = 0: a 2-replica majority-vote group has no
-			// safe margin, so voluntary disruption is fully blocked.
-			Expect(pdb.Spec.MaxUnavailable.IntValue()).To(Equal(0))
+			Expect(pdb.Spec.MaxUnavailable.IntValue()).To(Equal(1))
 
 			cm := &corev1.ConfigMap{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-config", Namespace: resourceNamespace}, cm)).To(Succeed())

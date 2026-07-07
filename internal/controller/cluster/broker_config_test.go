@@ -503,7 +503,7 @@ func renderConfig(broker *clusterv1alpha1.Broker) string {
 }
 
 func TestBrokerAffinity(t *testing.T) {
-	selector := map[string]string{"app.kubernetes.io/component": "broker"}
+	selector := builder.SelectorLabels("test-broker", brokerComponent)
 
 	tests := []struct {
 		name     string
