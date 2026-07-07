@@ -22,9 +22,39 @@ import (
 )
 
 // FunctionsWorkerSpec defines the desired state of FunctionsWorker.
+//
+// standalone mode is rejected by the CEL rule below: Pulsar's standalone
+// functions-worker startup (PulsarStandalone/PulsarBrokerStarter's
+// runFunctionsWorker path) unconditionally builds a DistributedLog
+// package-storage URI from the metadata store URL, which throws "authority
+// component is missing in service uri" against oxia:// with no config
+// workaround - a hard upstream limitation, not something this operator can
+// route around. Colocated mode has no such crash (PulsarWorkerService.
+// initInBroker gates the same DLog init behind
+// ServiceConfiguration.isMetadataStoreBackedByZookeeper(), which is false for
+// Oxia, so it is skipped rather than attempted) and is fully supported - see
+// the umbrella PulsarCluster reconciler's broker package-management wiring.
+// If a future Pulsar release fixes the standalone DLog path to tolerate
+// non-ZooKeeper metadata stores, this rule can be relaxed.
+//
+// The second rule rejects any non-FileSystem packageStorage: on this
+// Oxia-only operator, FileSystemPackagesStorage is the only Packages
+// Management Service provider that initializes without ZooKeeper. Both the
+// core-Pulsar default (BookKeeperPackagesStorageProvider, DistributedLog-
+// backed) and the S3/GCS enum values (which have no built-in core-Pulsar
+// provider class, so the broker also falls back to the BookKeeper default)
+// require a ZooKeeper-backed metadata store and crash the broker at startup
+// on Oxia - the exact failure mode this whole feature exists to avoid. An
+// advanced user who has their own DistributedLog-free provider can still set
+// packagesManagementStorageProvider directly on Broker.spec.config while
+// leaving packageStorage=FileSystemPackagesStorage to pass this rule.
+// +kubebuilder:validation:XValidation:rule="self.mode != 'standalone'",message="standalone FunctionsWorker is unsupported on this Oxia-only operator (Pulsar's standalone functions-worker startup unconditionally requires a ZooKeeper-backed metadata store for its DistributedLog package storage); use mode: colocated instead"
+// +kubebuilder:validation:XValidation:rule="self.packageStorage == 'FileSystemPackagesStorage'",message="only FileSystemPackagesStorage is supported on this Oxia-only operator: S3PackagesStorage/GCSPackagesStorage have no built-in Pulsar package-storage provider, so the broker falls back to the ZooKeeper-backed BookKeeper provider and crashes on Oxia; use packageStorage: FileSystemPackagesStorage"
 type FunctionsWorkerSpec struct {
 	// mode selects whether the functions worker runs colocated inside broker
-	// pods or as its own standalone deployment.
+	// pods or as its own standalone deployment. standalone is rejected (see
+	// the CEL rule on this type) since it cannot run against an Oxia-only
+	// metadata store.
 	// +optional
 	// +kubebuilder:default=colocated
 	// +kubebuilder:validation:Enum=colocated;standalone
@@ -48,16 +78,32 @@ type FunctionsWorkerSpec struct {
 
 	// packageStorage selects the function-package storage backend. Oxia does
 	// not provide the ZooKeeper-backed distributed log package storage KAAP
-	// defaults to, so "FileSystemPackagesStorage" is required while the
-	// metadata store is Oxia-only. There is no CEL rule for this: the enum
-	// below has no ZooKeeper-dependent value to reject, since this operator's
-	// metadataStore is Oxia-only and ZooKeeper package storage was never
-	// exposed. If a ZooKeeper-backed value is ever added to the enum, add a
-	// same-struct CEL rule rejecting it here.
+	// defaults to, so "FileSystemPackagesStorage" is required (and enforced by
+	// the struct-level CEL rule) while the metadata store is Oxia-only. The
+	// S3PackagesStorage/GCSPackagesStorage enum values are retained only so a
+	// selection of them yields a clear, targeted CEL message rather than a
+	// generic enum error; they are rejected because core Pulsar ships no
+	// package-storage provider for them (unlike tiered-storage OFFLOAD of
+	// message data, which is a wholly separate S3/GCS path and is unaffected).
 	// +optional
 	// +kubebuilder:default=FileSystemPackagesStorage
 	// +kubebuilder:validation:Enum=FileSystemPackagesStorage;S3PackagesStorage;GCSPackagesStorage
 	PackageStorage string `json:"packageStorage,omitempty"`
+
+	// packageStorageVolume configures the PersistentVolumeClaim the operator
+	// provisions for FileSystemPackagesStorage when mode is colocated (the
+	// PVC is mounted on every broker pod, since colocated functions run
+	// embedded in the broker). Ignored when packageStorage is not
+	// FileSystemPackagesStorage. The operator only creates this PVC if it
+	// does not already exist and never edits it afterwards (most PVC fields
+	// are immutable) - a ReadWriteOnce PVC is created by default, which is
+	// fine for a single broker replica; for more than one broker replica the
+	// volume must be a shared ReadWriteMany filesystem, so pre-provision one
+	// yourself (matching this PVC's deterministic name,
+	// "<cluster>-functions-package-storage") before creating the
+	// PulsarCluster, or accept single-writer semantics.
+	// +optional
+	PackageStorageVolume *VolumeSpec `json:"packageStorageVolume,omitempty"`
 }
 
 // FunctionsWorkerStatus defines the observed state of FunctionsWorker.

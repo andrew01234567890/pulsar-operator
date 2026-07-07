@@ -23,8 +23,10 @@ Once wired up, this page (or section) will document, for every CRD:
 
 For each type: every field, its type, default, validation constraints (CEL
 rules and webhook-enforced invariants — e.g. odd Oxia server replica counts,
-`FileSystemPackagesStorage` being required for FunctionsWorker under Oxia),
-and a status/condition reference.
+`FileSystemPackagesStorage` being required for FunctionsWorker under Oxia,
+`FunctionsWorker.spec.mode: standalone` being rejected outright since it
+cannot run against an Oxia-backed metadata store), and a status/condition
+reference.
 
 ## In the meantime
 

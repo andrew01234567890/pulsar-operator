@@ -111,6 +111,14 @@ const (
 	brokerConfFileName  = "broker.conf"
 	brokerConfMountPath = "/pulsar/conf/broker.conf"
 
+	// functionsWorkerConfigVolumeName is deliberately distinct from
+	// configVolumeName ("config", broker.conf's own volume): a colocated
+	// FunctionsWorker mounts a SECOND file, functions_worker.yml, alongside
+	// broker.conf (see functionsWorkerConfigFileName/functionsWorkerConfigMountPath
+	// in functionsworker_controller.go, reused here unchanged since Pulsar's
+	// broker loads it from the identical relative conf/ path either way).
+	functionsWorkerConfigVolumeName = "functions-worker-config"
+
 	// The Ready condition type and the reason vocabulary
 	// (reasonAllReady / reasonProgressing / reasonNoReplicas) are shared
 	// across this package's mandatory-tier reconcilers; they are declared
@@ -157,11 +165,16 @@ func (r *BrokerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, fmt.Errorf("reconciling broker configmap: %w", err)
 	}
 
+	functionsWorkerRendered, err := r.reconcileFunctionsWorkerConfigMap(ctx, broker, name, labels)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconciling broker functions-worker configmap: %w", err)
+	}
+
 	if err := r.reconcileHeadlessService(ctx, broker, name, labels, selectorLabels, ports); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling broker headless service: %w", err)
 	}
 
-	stsSpec := desiredBrokerStatefulSetSpec(broker, name, selectorLabels, labels, mergedConfig, renderedConfig, ports)
+	stsSpec := desiredBrokerStatefulSetSpec(broker, name, selectorLabels, labels, mergedConfig, renderedConfig, functionsWorkerRendered, ports)
 	if err := r.reconcileStatefulSet(ctx, broker, name, labels, stsSpec); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling broker statefulset: %w", err)
 	}
@@ -187,6 +200,48 @@ func (r *BrokerReconciler) reconcileConfigMap(ctx context.Context, broker *clust
 		return builder.SetControllerOwner(broker, cm, r.Scheme)
 	})
 	return err
+}
+
+// functionsWorkerBrokerConfigMapName names the broker's own
+// functions_worker.yml ConfigMap distinctly from its broker.conf ConfigMap
+// (both are named after the Broker CR itself, so they cannot share a name).
+func functionsWorkerBrokerConfigMapName(brokerName string) string {
+	return brokerName + "-functions-worker"
+}
+
+// reconcileFunctionsWorkerConfigMap renders and reconciles the
+// functions_worker.yml ConfigMap a colocated FunctionsWorker needs mounted
+// on this broker (see BrokerSpec.FunctionsWorkerConfig's doc comment for
+// why), returning the rendered content so the caller can fold it into the
+// pod template's config checksum - otherwise a functions_worker.yml-only
+// change (broker.conf unchanged) would never trigger a rolling restart.
+// broker.Spec.FunctionsWorkerConfig == nil means no colocated worker on this
+// broker; any previously-created ConfigMap is deleted (it holds no user
+// data, unlike the package-storage PVC, so cleaning it up is safe) and "" is
+// returned.
+func (r *BrokerReconciler) reconcileFunctionsWorkerConfigMap(ctx context.Context, broker *clusterv1alpha1.Broker, name string, labels map[string]string) (string, error) {
+	cmName := functionsWorkerBrokerConfigMapName(name)
+
+	if broker.Spec.FunctionsWorkerConfig == nil {
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: cmName, Namespace: broker.Namespace}}
+		if err := r.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+			return "", err
+		}
+		return "", nil
+	}
+
+	rendered := renderFunctionsWorkerYAML(config.Merge(functionsWorkerDefaultConfig(), broker.Spec.FunctionsWorkerConfig))
+
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: cmName, Namespace: broker.Namespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+		cm.Labels = labels
+		cm.Data = map[string]string{functionsWorkerConfigFileName: rendered}
+		return builder.SetControllerOwner(broker, cm, r.Scheme)
+	})
+	if err != nil {
+		return "", err
+	}
+	return rendered, nil
 }
 
 func (r *BrokerReconciler) reconcileHeadlessService(ctx context.Context, broker *clusterv1alpha1.Broker, name string, labels, selectorLabels map[string]string, ports brokerPorts) error {
@@ -418,6 +473,18 @@ func brokerImage(specImage string) string {
 // (operator defaults merged with spec.Config), mounted straight over the
 // image's own conf/broker.conf.
 func brokerContainer(broker *clusterv1alpha1.Broker, ports brokerPorts) corev1.Container {
+	volumeMounts := append([]corev1.VolumeMount{
+		{Name: configVolumeName, MountPath: brokerConfMountPath, SubPath: brokerConfFileName, ReadOnly: true},
+	}, broker.Spec.VolumeMounts...)
+	if broker.Spec.FunctionsWorkerConfig != nil {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      functionsWorkerConfigVolumeName,
+			MountPath: functionsWorkerConfigMountPath,
+			SubPath:   functionsWorkerConfigFileName,
+			ReadOnly:  true,
+		})
+	}
+
 	return corev1.Container{
 		Name:    brokerComponent,
 		Image:   brokerImage(broker.Spec.Image),
@@ -426,11 +493,9 @@ func brokerContainer(broker *clusterv1alpha1.Broker, ports brokerPorts) corev1.C
 			{Name: brokerPortName, ContainerPort: ports.binary},
 			{Name: httpPortName, ContainerPort: ports.http},
 		},
-		Env:       broker.Spec.Env,
-		Resources: broker.Spec.Resources,
-		VolumeMounts: append([]corev1.VolumeMount{
-			{Name: configVolumeName, MountPath: brokerConfMountPath, SubPath: brokerConfFileName, ReadOnly: true},
-		}, broker.Spec.VolumeMounts...),
+		Env:            broker.Spec.Env,
+		Resources:      broker.Spec.Resources,
+		VolumeMounts:   volumeMounts,
 		ReadinessProbe: brokerProbe(ports.http, 10, 10, 3),
 		LivenessProbe:  brokerProbe(ports.http, 30, 30, 5),
 		Lifecycle: &corev1.Lifecycle{
@@ -455,18 +520,51 @@ func brokerProbe(httpPort, initialDelaySeconds, periodSeconds, failureThreshold 
 	}
 }
 
-// brokerPodAnnotations feeds WithConfigChecksum a single, already-rendered
-// properties string rather than ranging over the config map: map iteration
+// brokerPodAnnotations feeds WithConfigChecksum already-rendered content
+// strings rather than ranging over the config maps directly: map iteration
 // order is randomized, so hashing key/value pairs individually would make
 // the checksum - and therefore whether a config change triggers a rolling
-// restart - nondeterministic between reconciles.
-func brokerPodAnnotations(renderedConfig string) map[string]string {
-	return builder.WithConfigChecksum(nil, renderedConfig)
+// restart - nondeterministic between reconciles. functionsWorkerRendered is
+// "" whenever no colocated worker is mounted, which still participates
+// safely in the checksum (Checksum length-frames every part, so an empty
+// part can never collide with a change in another part) and so still flips
+// the checksum - and triggers a rolling restart - the moment a colocated
+// FunctionsWorker is added or removed, not just when its content changes.
+func brokerPodAnnotations(renderedConfig, functionsWorkerRendered string) map[string]string {
+	return builder.WithConfigChecksum(nil, renderedConfig, functionsWorkerRendered)
 }
 
-func desiredBrokerStatefulSetSpec(broker *clusterv1alpha1.Broker, name string, selectorLabels, podLabels map[string]string, mergedConfig map[string]string, renderedConfig string, ports brokerPorts) appsv1.StatefulSetSpec {
+func desiredBrokerStatefulSetSpec(
+	broker *clusterv1alpha1.Broker,
+	name string,
+	selectorLabels, podLabels map[string]string,
+	mergedConfig map[string]string,
+	renderedConfig, functionsWorkerRendered string,
+	ports brokerPorts,
+) appsv1.StatefulSetSpec {
 	replicas := brokerReplicas(broker.Spec.Replicas)
 	gracePeriod := terminationGracePeriodSeconds(mergedConfig)
+
+	volumes := append([]corev1.Volume{
+		{
+			Name: configVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: name},
+				},
+			},
+		},
+	}, broker.Spec.Volumes...)
+	if broker.Spec.FunctionsWorkerConfig != nil {
+		volumes = append(volumes, corev1.Volume{
+			Name: functionsWorkerConfigVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: functionsWorkerBrokerConfigMapName(name)},
+				},
+			},
+		})
+	}
 
 	return appsv1.StatefulSetSpec{
 		Replicas:    &replicas,
@@ -475,23 +573,14 @@ func desiredBrokerStatefulSetSpec(broker *clusterv1alpha1.Broker, name string, s
 		Template: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels:      podLabels,
-				Annotations: brokerPodAnnotations(renderedConfig),
+				Annotations: brokerPodAnnotations(renderedConfig, functionsWorkerRendered),
 			},
 			Spec: corev1.PodSpec{
 				TerminationGracePeriodSeconds: &gracePeriod,
 				Affinity:                      brokerAffinity(broker.Spec.Antiaffinity, selectorLabels),
 				TopologySpreadConstraints:     builder.ZoneTopologySpreadConstraints(selectorLabels),
 				Containers:                    []corev1.Container{brokerContainer(broker, ports)},
-				Volumes: append([]corev1.Volume{
-					{
-						Name: configVolumeName,
-						VolumeSource: corev1.VolumeSource{
-							ConfigMap: &corev1.ConfigMapVolumeSource{
-								LocalObjectReference: corev1.LocalObjectReference{Name: name},
-							},
-						},
-					},
-				}, broker.Spec.Volumes...),
+				Volumes:                       volumes,
 			},
 		},
 	}
