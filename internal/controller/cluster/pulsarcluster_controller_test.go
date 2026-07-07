@@ -676,6 +676,57 @@ var _ = Describe("PulsarCluster Controller", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-proxy", Namespace: namespace.Name}, proxy)).To(Succeed())
 		Expect(proxy.Spec.Config).To(HaveKeyWithValue("clusterName", "user-proxy-cluster"))
 	})
+
+	It("injects the BookKeeper metadataServiceUri into the AutoRecovery child, without overwriting a user-set value", func() {
+		// Regression: AutoRecovery shares BookKeeper's own metadata store, but
+		// unlike BookKeeper/Broker/Proxy/FunctionsWorker the umbrella used to
+		// never inject metadataServiceUri into it, leaving a dedicated-mode
+		// AutoRecovery daemon with no metadata store to connect to.
+		wantURI := "metadata-store:oxia://" + clusterName + "-oxia-oxia:6648/bookkeeper"
+
+		pulsarCluster := &clusterv1alpha1.PulsarCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: namespace.Name,
+			},
+			Spec: clusterv1alpha1.PulsarClusterSpec{
+				BookKeeper:   &clusterv1alpha1.BookKeeperSpec{},
+				AutoRecovery: &clusterv1alpha1.AutoRecoverySpec{Mode: "dedicated"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("setting the AutoRecovery child's metadataServiceUri to the SAME URI as the BookKeeper child")
+		bookKeeper := &clusterv1alpha1.BookKeeper{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-bookkeeper", Namespace: namespace.Name}, bookKeeper)).To(Succeed())
+		Expect(bookKeeper.Spec.Config).To(HaveKeyWithValue("metadataServiceUri", wantURI))
+
+		autoRecovery := &clusterv1alpha1.AutoRecovery{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-autorecovery", Namespace: namespace.Name}, autoRecovery)).To(Succeed())
+		Expect(metav1.IsControlledBy(autoRecovery, pulsarCluster)).To(BeTrue())
+		Expect(autoRecovery.Spec.Config).To(HaveKeyWithValue("metadataServiceUri", wantURI))
+
+		By("marking Oxia Ready so the ordered-rollout gate lets the AutoRecovery config change through")
+		oxia := &metadatav1alpha1.OxiaCluster{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-oxia", Namespace: namespace.Name}, oxia)).To(Succeed())
+		oxia.Status.Conditions = []metav1.Condition{readyConditionForGeneration(oxia.Generation, "all oxia pods ready")}
+		Expect(k8sClient.Status().Update(ctx, oxia)).To(Succeed())
+
+		By("not overwriting a user-set metadataServiceUri")
+		const userURI = "metadata-store:oxia://user-store:6648/bookkeeper"
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		pulsarCluster.Spec.AutoRecovery.Config = map[string]string{"metadataServiceUri": userURI}
+		Expect(k8sClient.Update(ctx, pulsarCluster)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-autorecovery", Namespace: namespace.Name}, autoRecovery)).To(Succeed())
+		Expect(autoRecovery.Spec.Config).To(HaveKeyWithValue("metadataServiceUri", userURI))
+	})
 })
 
 // readyConditionForGeneration builds a Ready=True metav1.Condition observed

@@ -316,7 +316,12 @@ func (r *PulsarClusterReconciler) reconcileProxy(ctx context.Context, cluster *c
 
 // reconcileAutoRecovery gates its update on upstreamSettled - the caller
 // passes Oxia's settled state, the same gate BookKeeper uses, so AutoRecovery
-// rolls alongside the bookie tier rather than waiting on it.
+// rolls alongside the bookie tier rather than waiting on it. It also injects
+// metadataServiceUri onto the child, same as reconcileBookKeeper: AutoRecovery
+// shares BookKeeper's own metadata store, and the standalone AutoRecovery
+// reconciler never invents this value on its own (see
+// autoRecoveryDefaultConfig), so the umbrella must wire it in here or a
+// dedicated-mode AutoRecovery daemon has no metadata store to connect to.
 func (r *PulsarClusterReconciler) reconcileAutoRecovery(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, upstreamSettled bool) (componentReport, tierOutcome, error) {
 	const name = "autorecovery"
 	child := &clusterv1alpha1.AutoRecovery{
@@ -328,6 +333,7 @@ func (r *PulsarClusterReconciler) reconcileAutoRecovery(ctx context.Context, clu
 	}
 
 	desired := buildAutoRecoverySpec(cluster.Spec)
+	desired.Config = withAutoRecoveryMetadataDefault(desired.Config, cluster.Name)
 
 	outcome, err := r.applyOrderedChild(ctx, cluster, child, desired,
 		func() any { return child.Spec }, func() { child.Spec = *desired }, upstreamSettled, nil)
