@@ -46,10 +46,11 @@ import (
 // FunctionsWorker controller test files, collected here to satisfy goconst
 // rather than repeating the same literal across all three.
 const (
-	testCaseUnsetDefaultsToOne = "unset defaults to 1"
-	testCaseExplicitValueWins  = "explicit value wins"
-	testResourceNotFound       = "does-not-exist"
-	testCustomImage            = "custom:tag"
+	testCaseUnsetDefaultsToOne      = "unset defaults to 1"
+	testCaseUnsetFallsBackToDefault = "unset falls back to default"
+	testCaseExplicitValueWins       = "explicit value wins"
+	testResourceNotFound            = "does-not-exist"
+	testCustomImage                 = "custom:tag"
 )
 
 var _ = Describe("Proxy Controller", func() {

@@ -254,6 +254,13 @@ func pulsarClusterReconciliationSpecs() {
 		// test output (never a silent pass), so a reader sees exactly which
 		// tiers came up and which did not - while still turning green
 		// automatically if a future change lets the whole cluster stabilize.
+		//
+		// This is deliberately left best-effort rather than promoted to a hard
+		// assertion: single-node CI Kind is resource-constrained, and full
+		// multi-tier convergence is already proven elsewhere - the chainsaw
+		// suite, the consolidated envtest lifecycle spec
+		// (internal/controller/cluster/pulsarcluster_lifecycle_envtest_test.go),
+		// and the documented #28 KIND validation.
 		It("brings the full Pulsar data plane to Ready and PulsarCluster Ready=True [best-effort, skip-logged]", func() {
 			deadline := time.Now().Add(4 * time.Minute)
 			const poll = 10 * time.Second
