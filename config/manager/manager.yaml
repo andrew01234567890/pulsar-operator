@@ -65,6 +65,13 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        env:
+          # The Backup reconciler launches export Jobs that run this same
+          # operator image with the `manager backup-export` subcommand, so it
+          # must know its own image. Kept in sync with the container image
+          # above by a kustomize replacement (config/default/kustomization.yaml).
+          - name: OPERATOR_IMAGE
+            value: controller:latest
         ports:
         - containerPort: 8081
           name: health

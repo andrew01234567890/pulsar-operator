@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	backupv1alpha1 "github.com/andrew01234567890/pulsar-operator/api/backup/v1alpha1"
+	clusterv1alpha1 "github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -61,6 +62,8 @@ var _ = BeforeSuite(func() {
 
 	var err error
 	err = backupv1alpha1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
+	err = clusterv1alpha1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
 	// +kubebuilder:scaffold:scheme

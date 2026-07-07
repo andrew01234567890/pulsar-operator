@@ -27,6 +27,12 @@ manager:
   args:
     - --leader-elect
 
+  ## Extra environment variables for the manager container. OPERATOR_IMAGE is
+  ## always injected from the image above (the Backup reconciler needs it to run
+  ## export Jobs); anything here is appended.
+  ##
+  extraEnv: []
+
   ## Image pull secrets
   ##
   # imagePullSecrets:

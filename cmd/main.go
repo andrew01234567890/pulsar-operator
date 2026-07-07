@@ -317,8 +317,13 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&backupcontroller.BackupReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("backup-backup"),
+		// The export Job runs this same operator image with the
+		// `manager backup-export` subcommand; OPERATOR_IMAGE is injected onto
+		// the controller-manager pod (config/manager/manager.yaml).
+		OperatorImage: os.Getenv("OPERATOR_IMAGE"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "backup-backup")
 		os.Exit(1)
