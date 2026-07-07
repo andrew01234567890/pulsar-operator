@@ -629,6 +629,13 @@ func (in *BrokerSpec) DeepCopyInto(out *BrokerSpec) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.FunctionsWorkerConfig != nil {
+		in, out := &in.FunctionsWorkerConfig, &out.FunctionsWorkerConfig
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
 	in.Resources.DeepCopyInto(&out.Resources)
 	if in.Autoscaler != nil {
 		in, out := &in.Autoscaler, &out.Autoscaler
@@ -756,6 +763,11 @@ func (in *FunctionsWorkerSpec) DeepCopyInto(out *FunctionsWorkerSpec) {
 		for key, val := range *in {
 			(*out)[key] = val
 		}
+	}
+	if in.PackageStorageVolume != nil {
+		in, out := &in.PackageStorageVolume, &out.PackageStorageVolume
+		*out = new(VolumeSpec)
+		(*in).DeepCopyInto(*out)
 	}
 }
 

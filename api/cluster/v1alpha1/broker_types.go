@@ -131,6 +131,20 @@ type BrokerSpec struct {
 	// +optional
 	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
 
+	// functionsWorkerConfig sets functions_worker.yml key/value overrides for
+	// the embedded (colocated-mode) functions worker. Nil means no embedded
+	// worker runs on this broker (colocated FunctionsWorker is off); the
+	// umbrella PulsarCluster reconciler sets this (always to a non-nil map,
+	// even with zero user overrides) when FunctionsWorker.spec.mode is
+	// colocated, alongside the config.functionsWorkerEnabled key that
+	// actually turns the embedded worker on - Pulsar's broker startup loads
+	// conf/functions_worker.yml unconditionally whenever functionsWorkerEnabled
+	// is true (see PulsarBrokerStarter/PulsarService.
+	// initializeWorkerConfigFromBrokerConfig), so this file must exist
+	// alongside broker.conf whenever that key is set.
+	// +optional
+	FunctionsWorkerConfig map[string]string `json:"functionsWorkerConfig,omitempty"`
+
 	// resources are the compute resource requirements for the broker container.
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`

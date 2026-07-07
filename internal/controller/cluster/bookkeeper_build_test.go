@@ -89,7 +89,7 @@ func TestMergeConfig_OperatorManagedKeysAreNotUserOverridable(t *testing.T) {
 		Config: map[string]string{
 			keyBookiePort:         "9999",
 			keyHTTPServerPort:     "1234",
-			keyHTTPServerEnabled:  "false",
+			keyHTTPServerEnabled:  testConfigValFalse,
 			keyHTTPServerClass:    "com.example.CustomHttpServer",
 			keyJournalDirectories: "/tmp/a,/tmp/b",
 			keyLedgerDirectories:  "",
