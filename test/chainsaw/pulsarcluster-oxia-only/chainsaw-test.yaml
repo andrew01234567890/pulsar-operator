@@ -1,0 +1,90 @@
+# Declarative reconcile-contract case: a PulsarCluster with only spec.oxia
+# configured. Asserts the operator's conditional-child-creation contract
+# (PulsarClusterReconciler.reconcileOxia/reconcileBroker/etc. in
+# internal/controller/cluster/pulsarcluster_controller.go): Oxia is always
+# provisioned - including its coordinator Deployment and server StatefulSet -
+# while Broker/BookKeeper/Proxy are only stamped out when their own sub-spec
+# is set. It deliberately never waits for pods to become Ready (that full
+# end-to-end path is exercised in test/e2e's Ginkgo suite); every assertion
+# here resolves as soon as the controller's first reconcile writes the child
+# objects/status.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: pulsarcluster-oxia-only
+spec:
+  steps:
+  - try:
+    - apply:
+        resource:
+          apiVersion: cluster.pulsaroperator.io/v1alpha1
+          kind: PulsarCluster
+          metadata:
+            name: oxia-only
+          spec:
+            pulsarVersion: "5.0.0-M1"
+            oxia:
+              coordinator:
+                replicas: 1
+              server:
+                replicas: 1
+                storageSize: 1Gi
+                dbCacheSizeMb: 64
+              namespaces:
+              - name: default
+                initialShardCount: 1
+                replicationFactor: 1
+              - name: bookkeeper
+                initialShardCount: 1
+                replicationFactor: 1
+              allowExtraAuthorities: true
+
+    - assert:
+        resource:
+          apiVersion: metadata.pulsaroperator.io/v1alpha1
+          kind: OxiaCluster
+          metadata:
+            name: oxia-only-oxia
+          spec:
+            coordinator:
+              replicas: 1
+            server:
+              replicas: 1
+
+    # The oxia-coordinator Deployment is asserted here (it was blocked before
+    # the coordinator-RBAC fix in #26 - reconcileCoordinatorRole tried to grant
+    # coordination.k8s.io/leases that the manager ClusterRole didn't hold, so
+    # the Deployment was never created; #26 added the marker). This assertion
+    # is the declarative regression guard for that fix.
+    - assert:
+        resource:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: oxia-only-oxia-oxia-coordinator
+          spec:
+            replicas: 1
+
+    - assert:
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: oxia-only-oxia-oxia-server
+          spec:
+            replicas: 1
+
+    # brokerPhase/bookKeeperPhase/proxyPhase are deliberately not asserted
+    # here: PulsarClusterStatus declares them `omitempty`, and unconfigured
+    # components are never stamped out (so the umbrella never sets a phase
+    # for them), meaning the key is entirely absent from the object rather
+    # than present with an empty-string value - Chainsaw's assertion tree
+    # requires an explicitly-listed key to actually be present.
+    - assert:
+        resource:
+          apiVersion: cluster.pulsaroperator.io/v1alpha1
+          kind: PulsarCluster
+          metadata:
+            name: oxia-only
+          status:
+            oxiaPhase: NotReady

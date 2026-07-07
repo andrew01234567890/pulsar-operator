@@ -280,6 +280,14 @@ var _ = Describe("Manager", Ordered, func() {
 		//    strings.ToLower(<Kind>),
 		// ))
 	})
+
+	// pulsarClusterReconciliationSpecs (test/e2e/pulsarcluster_test.go) registers
+	// a sibling Context that applies a minimal PulsarCluster sample and
+	// asserts progressive reconciliation readiness. It must be called here,
+	// inside this Ordered Describe, rather than from a second top-level
+	// Describe, so it runs after this BeforeAll's controller-manager deploy
+	// and before this AfterAll's undeploy.
+	pulsarClusterReconciliationSpecs()
 })
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.
