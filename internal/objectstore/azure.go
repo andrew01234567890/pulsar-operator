@@ -43,8 +43,18 @@ type azureStore struct {
 }
 
 func newAzureStore(cfg Config) (*azureStore, error) {
-	account := os.Getenv(envAzureStorageAccount)
-	key := os.Getenv(envAzureStorageAccessKey)
+	// An inline credential (see Config's doc) overrides the environment - used
+	// by the Restore reconciler's in-process manifest-header peek, which
+	// resolves credentialsSecretRef itself rather than relying on env vars the
+	// way the export/import Job does.
+	account := cfg.AzureAccount
+	key := cfg.AzureAccessKey
+	if account == "" {
+		account = os.Getenv(envAzureStorageAccount)
+	}
+	if key == "" {
+		key = os.Getenv(envAzureStorageAccessKey)
+	}
 	if account == "" || key == "" {
 		return nil, fmt.Errorf("objectstore: azureblob requires %s and %s in the environment",
 			envAzureStorageAccount, envAzureStorageAccessKey)

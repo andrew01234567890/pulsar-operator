@@ -201,3 +201,14 @@ func (mr *manifestReader) ReadRecord() (ManifestRecord, error) {
 	err := mr.dec.Decode(&r)
 	return r, err
 }
+
+// ReadManifestHeader decodes and returns just a manifest's header from r,
+// without reading any records after it. It exists so a caller that only
+// needs the header - notably the Restore reconciler's pre-flight
+// cookie-lineage check, which must compare CapturedInstanceID against the
+// target cluster before deciding whether to even run a full Import - can
+// inspect a manifest without buffering or replaying its entire record
+// stream.
+func ReadManifestHeader(r io.Reader) (ManifestHeader, error) {
+	return newManifestReader(r).ReadHeader()
+}

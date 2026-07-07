@@ -56,8 +56,8 @@ func TestExportImportRoundTrip(t *testing.T) {
 	if result.KeysSkippedEphemeral != 1 {
 		t.Errorf("KeysSkippedEphemeral = %d, want 1", result.KeysSkippedEphemeral)
 	}
-	if result.KeysWritten != 5 {
-		t.Errorf("KeysWritten = %d, want 5", result.KeysWritten)
+	if result.KeysRestored != 5 {
+		t.Errorf("KeysRestored = %d, want 5", result.KeysRestored)
 	}
 
 	// The ephemeral "/owner/broker-1" key must never reach the target.
@@ -85,6 +85,35 @@ func TestExportImportRoundTrip(t *testing.T) {
 		if !c.closed {
 			t.Errorf("namespace %q target client was not closed", ns)
 		}
+	}
+}
+
+func TestImportIncludeEphemeralReplaysEphemeralRecords(t *testing.T) {
+	exporter := newTestExporter(seedSourceClients())
+
+	var manifest bytes.Buffer
+	if _, err := exporter.Export(context.Background(), &manifest, fixedCapturedAt); err != nil {
+		t.Fatalf("Export() error = %v", err)
+	}
+
+	targets := targetClients()
+	importer := &Importer{NewClient: fakeClientFactory(targets), IncludeEphemeral: true}
+
+	result, err := importer.Import(context.Background(), &manifest)
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+
+	if result.KeysSkippedEphemeral != 0 {
+		t.Errorf("KeysSkippedEphemeral = %d, want 0 (IncludeEphemeral=true)", result.KeysSkippedEphemeral)
+	}
+	if result.KeysRestored != 6 {
+		t.Errorf("KeysRestored = %d, want 6 (IncludeEphemeral=true)", result.KeysRestored)
+	}
+
+	def := targets[metadata.DefaultNamespace]
+	if len(def.puts) != 2 {
+		t.Fatalf("default namespace received %d put(s), want 2 (ephemeral key must be replayed)", len(def.puts))
 	}
 }
 

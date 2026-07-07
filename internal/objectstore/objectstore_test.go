@@ -88,6 +88,7 @@ func TestDownloadNotExist(t *testing.T) {
 }
 
 const testManifestKey = "b.manifest"
+const testRestoreBucket = "restore-test-bucket"
 
 func TestURI(t *testing.T) {
 	tests := []struct {
@@ -144,6 +145,53 @@ func TestURI(t *testing.T) {
 
 func TestNewUnsupportedDriver(t *testing.T) {
 	if _, err := New(context.Background(), Config{Driver: "made-up"}); err == nil {
+		t.Fatal("expected an error for an unsupported driver")
+	}
+}
+
+func TestKeyFromURIRoundTrip(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		key  string
+	}{
+		{name: "s3 with prefix", cfg: Config{Driver: DriverAWSS3, Bucket: testRestoreBucket, Prefix: "backups/c1"}, key: testManifestKey},
+		{name: "s3 no prefix", cfg: Config{Driver: DriverAWSS3, Bucket: testRestoreBucket}, key: testManifestKey},
+		{name: "gcs", cfg: Config{Driver: DriverGCS, Bucket: "gb", Prefix: "p"}, key: testManifestKey},
+		{name: "azure", cfg: Config{Driver: DriverAzureBlob, Bucket: "container", Prefix: "p"}, key: testManifestKey},
+		{name: "filesystem with bucket and prefix", cfg: Config{Driver: DriverFilesystem, Bucket: "/mnt/backups", Prefix: "p"}, key: testManifestKey},
+		{name: "filesystem default root, no prefix", cfg: Config{Driver: DriverFilesystem}, key: testManifestKey},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uri := URI(tt.cfg, tt.key)
+			got, err := KeyFromURI(tt.cfg, uri)
+			if err != nil {
+				t.Fatalf("KeyFromURI(%q) error = %v", uri, err)
+			}
+			if got != tt.key {
+				t.Fatalf("KeyFromURI(%q) = %q, want %q", uri, got, tt.key)
+			}
+		})
+	}
+}
+
+func TestKeyFromURIRejectsWrongBucketOrPrefix(t *testing.T) {
+	cfg := Config{Driver: DriverAWSS3, Bucket: testRestoreBucket, Prefix: "restores/c9"}
+	tests := []string{
+		"s3://other-bucket/restores/c9/b.manifest",
+		"s3://my-bucket/wrong-prefix/b.manifest",
+		"gs://my-bucket/restores/c9/b.manifest", // wrong scheme for the driver
+	}
+	for _, uri := range tests {
+		if _, err := KeyFromURI(cfg, uri); err == nil {
+			t.Errorf("KeyFromURI(%q) error = nil, want an error", uri)
+		}
+	}
+}
+
+func TestKeyFromURIUnsupportedDriver(t *testing.T) {
+	if _, err := KeyFromURI(Config{Driver: "made-up"}, "made-up://x"); err == nil {
 		t.Fatal("expected an error for an unsupported driver")
 	}
 }

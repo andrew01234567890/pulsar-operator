@@ -25,6 +25,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -42,6 +43,14 @@ func newS3Store(ctx context.Context, cfg Config) (*s3Store, error) {
 	loadOpts := []func(*awsconfig.LoadOptions) error{}
 	if cfg.Region != "" {
 		loadOpts = append(loadOpts, awsconfig.WithRegion(cfg.Region))
+	}
+	if cfg.AWSAccessKeyID != "" {
+		// An inline credential (see Config's doc) overrides the SDK's default
+		// chain - used by the Restore reconciler's in-process manifest-header
+		// peek, which resolves credentialsSecretRef itself rather than
+		// relying on env vars/IRSA the way the export/import Job does.
+		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(cfg.AWSAccessKeyID, cfg.AWSSecretAccessKey, "")))
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {

@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	"testing"
+
+	"github.com/andrew01234567890/pulsar-operator/internal/objectstore"
 )
 
 const testFlagOxiaAddress = "my-oxia:6648"
@@ -67,6 +69,62 @@ func TestParseExportFlagsRequiresOxiaAddress(t *testing.T) {
 func TestParseImportFlagsRequiresOxiaAddress(t *testing.T) {
 	if _, err := parseImportFlags([]string{"--in", "-"}); err == nil {
 		t.Fatal("parseImportFlags() error = nil, want an error for missing --oxia")
+	}
+}
+
+func TestParseImportFlagsSrcRequiresKey(t *testing.T) {
+	_, err := parseImportFlags([]string{flagOxia, testFlagOxiaAddress, "--src-driver", "filesystem"})
+	if err == nil {
+		t.Fatal("expected an error when --src-driver is set without --src-key")
+	}
+}
+
+func TestParseImportFlagsSrc(t *testing.T) {
+	flags, err := parseImportFlags([]string{
+		flagOxia, testFlagOxiaAddress,
+		"--src-driver", objectstore.DriverAWSS3,
+		"--src-bucket", "b",
+		"--src-region", "eu-west-2",
+		"--src-endpoint", "https://minio.restore-test.internal:9000",
+		"--src-prefix", "restores/c9",
+		"--src-key", testDestManifestKey,
+		"--include-ephemeral",
+		"--result-path", "/tmp/result.json",
+	})
+	if err != nil {
+		t.Fatalf("parseImportFlags: %v", err)
+	}
+	want := objectstore.Config{
+		Driver:   objectstore.DriverAWSS3,
+		Bucket:   "b",
+		Region:   "eu-west-2",
+		Endpoint: "https://minio.restore-test.internal:9000",
+		Prefix:   "restores/c9",
+	}
+	if flags.Src != want {
+		t.Errorf("Src = %+v, want %+v", flags.Src, want)
+	}
+	if flags.SrcKey != testDestManifestKey {
+		t.Errorf("SrcKey = %q, want %q", flags.SrcKey, testDestManifestKey)
+	}
+	if !flags.IncludeEphemeral {
+		t.Error("IncludeEphemeral = false, want true")
+	}
+	if flags.ResultPath != "/tmp/result.json" {
+		t.Errorf("ResultPath = %q, want /tmp/result.json", flags.ResultPath)
+	}
+}
+
+func TestParseImportFlagsDefaultResultPath(t *testing.T) {
+	flags, err := parseImportFlags([]string{flagOxia, testFlagOxiaAddress})
+	if err != nil {
+		t.Fatalf("parseImportFlags: %v", err)
+	}
+	if flags.ResultPath != defaultResultPath {
+		t.Errorf("ResultPath = %q, want %q", flags.ResultPath, defaultResultPath)
+	}
+	if flags.IncludeEphemeral {
+		t.Error("IncludeEphemeral = true, want false by default")
 	}
 }
 

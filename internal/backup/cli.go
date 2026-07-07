@@ -164,20 +164,59 @@ func RunExportCommand(ctx context.Context, args []string, stdout io.Writer, stde
 type ImportFlags struct {
 	OxiaAddress string
 	InPath      string
+
+	// Src, when Src.Driver is non-empty, downloads the manifest from an
+	// object store under SrcKey instead of --in: this is the mode the
+	// Restore reconciler's import Job runs in, mirroring the export Job's
+	// Dest/DestKey. --in is ignored in that mode.
+	Src    objectstore.Config
+	SrcKey string
+
+	// IncludeEphemeral replays ephemeral records instead of skipping them;
+	// see Importer.IncludeEphemeral.
+	IncludeEphemeral bool
+
+	// ResultPath is where the machine-readable ImportResult is written (the
+	// Job's termination-message file), only consulted when Src.Driver is set.
+	ResultPath string
 }
 
 func parseImportFlags(args []string) (ImportFlags, error) {
 	fs := flag.NewFlagSet(ImportCommandName, flag.ContinueOnError)
 	oxiaAddr := fs.String("oxia", "", "Oxia service address (host:port) to import into")
 	inPath := fs.String("in", stdioPath, "Input manifest file path, or - for stdin")
+	srcDriver := fs.String("src-driver", "", "Object-store driver to download the manifest from (aws-s3|google-cloud-storage|azureblob|filesystem); empty reads from --in instead")
+	srcBucket := fs.String("src-bucket", "", "Object-store bucket/container (or base directory for the filesystem driver)")
+	srcRegion := fs.String("src-region", "", "Object-store region")
+	srcEndpoint := fs.String("src-endpoint", "", "Object-store endpoint override (S3-compatible stores, Azure service URL)")
+	srcPrefix := fs.String("src-prefix", "", "Key/path prefix under the bucket the manifest was written under")
+	srcKey := fs.String("src-key", "", "Object key (filename) to download the manifest from under the prefix")
+	includeEphemeral := fs.Bool("include-ephemeral", false, "Replay ephemeral (session-scoped) records instead of skipping them")
+	resultPath := fs.String("result-path", defaultResultPath, "File to write the machine-readable ImportResult to (the container termination-message path)")
 	if err := fs.Parse(args); err != nil {
 		return ImportFlags{}, err
 	}
 	if *oxiaAddr == "" {
 		return ImportFlags{}, fmt.Errorf("%s: --oxia is required", ImportCommandName)
 	}
+	if *srcDriver != "" && *srcKey == "" {
+		return ImportFlags{}, fmt.Errorf("%s: --src-key is required when --src-driver is set", ImportCommandName)
+	}
 
-	return ImportFlags{OxiaAddress: *oxiaAddr, InPath: *inPath}, nil
+	return ImportFlags{
+		OxiaAddress: *oxiaAddr,
+		InPath:      *inPath,
+		Src: objectstore.Config{
+			Driver:   *srcDriver,
+			Bucket:   *srcBucket,
+			Region:   *srcRegion,
+			Endpoint: *srcEndpoint,
+			Prefix:   *srcPrefix,
+		},
+		SrcKey:           *srcKey,
+		IncludeEphemeral: *includeEphemeral,
+		ResultPath:       *resultPath,
+	}, nil
 }
 
 // RunImport runs an import against an already-constructed ClientFactory,
@@ -186,7 +225,7 @@ func parseImportFlags(args []string) (ImportFlags, error) {
 // can be tested against a fake ClientFactory without touching the
 // filesystem or a real Oxia service.
 func RunImport(ctx context.Context, flags ImportFlags, newClient ClientFactory, in io.Reader, log io.Writer) (ImportResult, error) {
-	importer := &Importer{NewClient: newClient}
+	importer := &Importer{NewClient: newClient, IncludeEphemeral: flags.IncludeEphemeral}
 
 	result, err := importer.Import(ctx, in)
 	if err != nil {
@@ -194,19 +233,26 @@ func RunImport(ctx context.Context, flags ImportFlags, newClient ClientFactory, 
 	}
 
 	if _, err := fmt.Fprintf(log, "%s: wrote %d key(s), skipped %d ephemeral key(s) (capturedInstanceId=%q)\n",
-		ImportCommandName, result.KeysWritten, result.KeysSkippedEphemeral, result.CapturedInstanceID); err != nil {
+		ImportCommandName, result.KeysRestored, result.KeysSkippedEphemeral, result.CapturedInstanceID); err != nil {
 		return result, fmt.Errorf("%s: write summary: %w", ImportCommandName, err)
 	}
 	return result, nil
 }
 
-// RunImportCommand parses args as the backup-import subcommand's flags,
-// opens --in (or uses stdin for "-"), connects to the real Oxia client at
-// --oxia, and runs the import.
-func RunImportCommand(ctx context.Context, args []string, stdin io.Reader, stderr io.Writer) error {
+// RunImportCommand parses args as the backup-import subcommand's flags and
+// connects to the real Oxia client at --oxia. When --src-driver is set the
+// manifest is downloaded from that object store (see
+// runImportFromObjectStore) and the result is written to --result-path;
+// otherwise the manifest is read from --in (or stdin for "-"), matching the
+// export command's --dest-driver/--out symmetry.
+func RunImportCommand(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	flags, err := parseImportFlags(args)
 	if err != nil {
 		return err
+	}
+
+	if flags.Src.Driver != "" {
+		return runImportFromObjectStore(ctx, flags, NewOxiaClientFactory(flags.OxiaAddress), stdout, stderr)
 	}
 
 	in := stdin

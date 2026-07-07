@@ -197,14 +197,13 @@ Until the operator ships its own backup tooling, mitigate this yourself:
    is not a validated restore drill.
 4. Don't treat tiered storage as a substitute for any of the above.
 
-## What's coming: `Backup` / `Restore` / `BackupSchedule` CRDs
+## `Backup` / `Restore` / `BackupSchedule` CRDs
 
-The operator is adding a new CRD family — `Backup`, `Restore`, and
-`BackupSchedule` — under a new `backup.pulsaroperator.io` group, following
-the same per-concern group split as `cluster.pulsaroperator.io` and
-`metadata.pulsaroperator.io`. None of this is implemented yet; it's described
-here so the plan is judged on what it will and won't actually fix, not on
-what it sounds like it fixes.
+The operator ships a CRD family — `Backup`, `Restore`, and (not yet
+implemented) `BackupSchedule` — under a new `backup.pulsaroperator.io` group,
+following the same per-concern group split as `cluster.pulsaroperator.io` and
+`metadata.pulsaroperator.io`. It's described here so the feature is judged on
+what it actually fixes, not on what it sounds like it fixes.
 
 - **What it does:** `Backup` performs a **logical export of Oxia's
   metadata** — topics, namespaces, schemas, cursors, managed-ledger/ledger
@@ -235,6 +234,86 @@ what it sounds like it fixes.
   the cluster in another failure domain. Correlated total-cluster loss —
   where you need a genuinely separate cluster to fail over to — is still
   only addressed by `PulsarGeoReplication`, deferred to v2 below.
+
+## Restore runbook
+
+A `Restore` replays a `Backup` artifact's Oxia metadata into a target
+cluster's Oxia. Before you create one, re-read the two hazards above — this
+runbook assumes you have:
+
+1. **Respected the snapshot-ordering rule.** The `Backup` you're restoring
+   from must have captured Oxia at-or-before any BookKeeper-side snapshot
+   you're pairing it with — **never Oxia after BookKeeper.** Restoring an
+   Oxia snapshot that's *newer* than the BookKeeper data it's paired with can
+   silently point at ledger ranges that copy of BookKeeper never persisted
+   (see the ordering hazard above). If you're only restoring Oxia against an
+   already-running, untouched BookKeeper fleet (the common DR case — Oxia
+   lost, bookies survived), this doesn't apply: there's only one BookKeeper
+   state to reattach to.
+2. **Decided how to handle `instanceId`/cookie lineage**, which `Restore`
+   enforces automatically — see below.
+
+### What `Restore` does, step by step
+
+1. Resolves `spec.targetClusterRef` to the target `PulsarCluster` and its
+   Oxia address.
+2. **Cookie-lineage pre-flight check (runs before anything is written):**
+   - Reads the target Oxia's `bookkeeper` namespace for an existing
+     BookKeeper `instanceId`.
+   - If the target has **no existing `instanceId`** (a fresh Oxia — the
+     normal "Oxia died, bookies survived" DR case): the check **Passes**
+     unconditionally. The import will write the backup's captured
+     `instanceId`/cookies, and every surviving bookie's on-disk cookie will
+     match it — lineage is preserved by construction.
+   - If the target **already has an `instanceId`**, it is compared against
+     the backup manifest's captured `instanceId`. Matching **Passes**;
+     differing is a **Mismatch**; a manifest with no captured `instanceId` at
+     all (its `bookkeeper` namespace wasn't part of the backup) against an
+     already-initialized target is **Unknown** — treated exactly like a
+     `Mismatch` for gating purposes, since lineage can't be confirmed safe
+     either way.
+   - `status.cookieLineageCheck.result`/`.detail` always records the
+     outcome, whether or not the restore proceeds.
+3. On `Mismatch` or `Unknown`, `spec.cookieLineagePolicy` decides what
+   happens next:
+   - **`enforce` (the default): the `Restore` HALTS — `status.phase` goes
+     straight to `Failed`, no import Job is ever created, and a `Warning`
+     event is emitted naming both `instanceId`s.** This is deliberate:
+     replaying metadata that disagrees with the target's existing lineage is
+     exactly the scenario from the boot-layer hazard above — every bookie
+     would fail `InvalidCookieException` on next restart.
+   - **`override`: the restore proceeds anyway**, but never silently. The
+     mismatch/uncertainty is still recorded in `status.cookieLineageCheck`,
+     and a loud `Warning` event is emitted every time reconciliation reaches
+     this point, precisely so an override is never mistaken for a clean
+     pass. Only set `override` when you have independently verified the
+     override is safe (e.g. you are intentionally re-pointing bookies at a
+     different lineage and will run BookKeeper's own `updatecookie` escape
+     hatch — see the boot-layer hazard section — on every affected bookie).
+     `override` is a supervised, risk-acknowledged force; it is never the
+     right default and the operator will never choose it for you.
+4. Once the check passes (or is overridden), an owner-ref'd Job runs
+   `manager backup-import` to download the manifest and replay it into the
+   target Oxia, skipping ephemeral/session-scoped records by default
+   (`spec.skipEphemeral: true`) since they're stale lock/ownership claims
+   from sessions that no longer exist by restore time.
+5. `status.phase` moves `Pending` → `Running` → `Completed`/`Failed`, with
+   `status.keysRestored` populated from the Job's own report once it
+   succeeds — the same "trust only a verified result" discipline `Backup`
+   uses: a Job that reports success but whose result can't be read back is
+   treated as `Failed`, never as a zeroed `Completed`.
+
+### Caveats
+
+- The lineage check is a **point-in-time** read of the target's `instanceId`
+  taken once, before the import Job is created. It is not re-verified once
+  the Job is running; do not run a concurrent, unrelated cookie-rewrite
+  operation against the same target while a `Restore` is in flight.
+- The `filesystem` destination driver requires the operator's own
+  controller-manager Pod to have the same path mounted that the `Backup`
+  Job wrote to — it is intended for local/dev use, not multi-node
+  production deployments. `aws-s3`/`google-cloud-storage`/`azureblob`
+  destinations work over the network with no such mount requirement.
 
 ## What's planned for v2
 
