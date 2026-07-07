@@ -18,6 +18,7 @@ package bookkeeper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -87,15 +88,35 @@ type Decision struct {
 // above the HWM, scale up by params.ScaleUpBy; (3) else, no-op. The result is
 // clamped to params.ScaleUpMaxLimit and never drops below
 // params.CurrentReplicas: this package only ever scales up.
+//
+// Evaluate is resilient to a flaky bookie: a per-bookie ConnectionError
+// (unreachable/unhealthy right now) skips that bookie and keeps polling the
+// rest, so one dead bookie can't suppress a legitimate high-watermark
+// scale-up on the healthy ones. But because a partial poll under-counts
+// writable bookies, the deficit branch fires ONLY when every polled bookie
+// responded — an incomplete poll can raise disk usage (a safe, positive
+// signal) but never fabricate a writable-bookie deficit (which, being
+// scale-up-only, would strand a permanent phantom replica). The tick fails
+// (returns an error) when too few bookies responded to decide safely, or on
+// the first data-integrity error (a corrupt reading, distinct from a
+// ConnectionError), so a misread can never silently drive a scale-up.
 func Evaluate(ctx context.Context, client BookieAdminClient, bookieAddrs []string, params Params) (Decision, error) {
-	var writable int32
+	var writable, responded int32
 	atRisk := false
+	pollComplete := true
+	var connErrs []error
 
 	for _, addr := range bookieAddrs {
 		state, err := client.State(ctx, addr)
 		if err != nil {
+			if IsConnectionError(err) {
+				pollComplete = false
+				connErrs = append(connErrs, err)
+				continue
+			}
 			return Decision{}, fmt.Errorf("get bookie state for %s: %w", addr, err)
 		}
+		responded++
 		if !state.Writable() {
 			continue
 		}
@@ -103,6 +124,11 @@ func Evaluate(ctx context.Context, client BookieAdminClient, bookieAddrs []strin
 
 		info, err := client.Info(ctx, addr)
 		if err != nil {
+			if IsConnectionError(err) {
+				pollComplete = false
+				connErrs = append(connErrs, err)
+				continue
+			}
 			return Decision{}, fmt.Errorf("get bookie info for %s: %w", addr, err)
 		}
 		if allLedgerDisksAtOrAboveHwm(info.LedgerDisks, params.DiskUsageToleranceHwmPercent) {
@@ -110,8 +136,21 @@ func Evaluate(ctx context.Context, client BookieAdminClient, bookieAddrs []strin
 		}
 	}
 
-	decision := decide(params, writable, atRisk)
-	return decision, nil
+	// Require at least min(MinWritableBookies, len(addrs)) bookies to answer
+	// before deciding. Clamping to len(addrs) preserves the legitimate
+	// deficit case where the ensemble is smaller than MinWritableBookies (so
+	// every addressed bookie must respond), while still refusing to act when
+	// the ensemble is mostly dark.
+	quorum := params.MinWritableBookies
+	if n := int32(len(bookieAddrs)); n < quorum {
+		quorum = n
+	}
+	if responded < quorum {
+		return Decision{}, fmt.Errorf("only %d of %d bookies responded; too few to safely evaluate scale-up: %w",
+			responded, len(bookieAddrs), errors.Join(connErrs...))
+	}
+
+	return decide(params, writable, atRisk, pollComplete), nil
 }
 
 // allLedgerDisksAtOrAboveHwm reports whether disks is non-empty and every
@@ -132,14 +171,19 @@ func allLedgerDisksAtOrAboveHwm(disks []BookieDiskUsage, hwmPercent int32) bool 
 
 // decide is the pure priority-ordered scale-up decision, split out from
 // Evaluate so it never needs a BookieAdminClient (or a mock of one) to test.
-func decide(params Params, writableBookies int32, anyWritableBookieAtRisk bool) Decision {
+// pollComplete guards the deficit branch: a writable-bookie deficit is only
+// trustworthy when every polled bookie responded, since an unreachable bookie
+// could actually be writable and counting it as missing would strand a
+// permanent phantom replica. The high-watermark branch needs no such guard —
+// any writable bookie observed at/above the HWM is a real, positive signal.
+func decide(params Params, writableBookies int32, anyWritableBookieAtRisk, pollComplete bool) Decision {
 	current := params.CurrentReplicas
 	target := current
 	reason := ReasonStable
 	message := "writable bookie count and disk usage are within tolerance; no scale-up needed"
 
 	switch {
-	case writableBookies < params.MinWritableBookies:
+	case pollComplete && writableBookies < params.MinWritableBookies:
 		deficit := params.MinWritableBookies - writableBookies
 		target = current + deficit
 		reason = ReasonWritableBookieDeficit

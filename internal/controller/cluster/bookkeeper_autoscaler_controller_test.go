@@ -18,6 +18,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -46,6 +47,7 @@ type fakeBookieAdminClient struct {
 	state    bkautoscaler.BookieState
 	info     bkautoscaler.BookieInfo
 	stateErr error
+	infoErr  error
 }
 
 func (f *fakeBookieAdminClient) State(_ context.Context, _ string) (bkautoscaler.BookieState, error) {
@@ -56,6 +58,9 @@ func (f *fakeBookieAdminClient) State(_ context.Context, _ string) (bkautoscaler
 }
 
 func (f *fakeBookieAdminClient) Info(_ context.Context, _ string) (bkautoscaler.BookieInfo, error) {
+	if f.infoErr != nil {
+		return bkautoscaler.BookieInfo{}, f.infoErr
+	}
 	return f.info, nil
 }
 
@@ -70,13 +75,14 @@ func writableClient(usedBytes, totalBytes int64) *fakeBookieAdminClient {
 	}
 }
 
-// createBookiePods creates n bare Pods matching bk's bookie selector labels,
-// each with a distinct PodIP set directly via the status subresource: no
-// scheduler/kubelet runs against envtest, so this is the standard way to
-// simulate "the StatefulSet's pods are up and addressable" without a real
-// StatefulSet controller.
-func createBookiePods(ctx context.Context, namespace, bkName string, n int) {
-	for i := range n {
+// createBookiePods creates total bare Pods matching bk's bookie selector
+// labels. The first addressable pods get a distinct PodIP (set directly via
+// the status subresource, since no scheduler/kubelet runs against envtest);
+// the remaining total-addressable pods are left without an IP, modelling a
+// pod mid-recreate that is not yet reachable. addressable == total is the
+// normal "every bookie is up and addressable" case.
+func createBookiePods(ctx context.Context, namespace, bkName string, total, addressable int) {
+	for i := range total {
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      fmt.Sprintf("%s-bookie-%d", bkName, i),
@@ -88,8 +94,17 @@ func createBookiePods(ctx context.Context, namespace, bkName string, n int) {
 			},
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		pod.Status.PodIP = fmt.Sprintf("10.0.0.%d", i+1)
-		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		if i < addressable {
+			pod.Status.PodIP = fmt.Sprintf("10.0.0.%d", i+1)
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		}
+	}
+}
+
+func deleteBookiePods(ctx context.Context, namespace, bkName string, total int) {
+	for i := range total {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-bookie-%d", bkName, i), Namespace: namespace}}
+		_ = k8sClient.Delete(ctx, pod)
 	}
 }
 
@@ -192,13 +207,8 @@ var _ = Describe("BookKeeper Autoscaler Controller", func() {
 			Enabled: true, MinWritableBookies: int32Ptr(4), ScaleUpBy: int32Ptr(1), ScaleUpMaxLimit: int32Ptr(10),
 		}, nil)
 		markStabilized(ctx, bk, 2, nil)
-		createBookiePods(ctx, namespace, bk.Name, 2)
-		DeferCleanup(func() {
-			for i := range 2 {
-				pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-bookie-%d", bk.Name, i), Namespace: namespace}}
-				_ = k8sClient.Delete(ctx, pod)
-			}
-		})
+		createBookiePods(ctx, namespace, bk.Name, 2, 2)
+		DeferCleanup(func() { deleteBookiePods(ctx, namespace, bk.Name, 2) })
 
 		recorder := record.NewFakeRecorder(5)
 		reconciler := &BookKeeperAutoscalerReconciler{
@@ -223,6 +233,60 @@ var _ = Describe("BookKeeper Autoscaler Controller", func() {
 		Expect(cond.Reason).To(Equal(bkautoscaler.ReasonWritableBookieDeficit))
 
 		Eventually(recorder.Events).Should(Receive(ContainSubstring("WritableBookieDeficit")))
+	})
+
+	It("skips the tick without scaling when a bookie is not yet addressable", func() {
+		// A minWritableBookies of 4 against only 2 addressable (writable)
+		// pods would fire the deficit branch and permanently scale up if the
+		// incomplete ensemble were evaluated. The completeness guard must
+		// skip the tick instead: status is (stale) all-ready, but the third
+		// pod has no PodIP yet.
+		bk := createBookKeeper("autoscaler-partial-pods", 3, &clusterv1alpha1.BookKeeperAutoscalerSpec{
+			Enabled: true, MinWritableBookies: int32Ptr(4), ScaleUpBy: int32Ptr(1), ScaleUpMaxLimit: int32Ptr(10),
+		}, nil)
+		markStabilized(ctx, bk, 3, nil)
+		createBookiePods(ctx, namespace, bk.Name, 3, 2) // 3 desired, only 2 addressable
+		DeferCleanup(func() { deleteBookiePods(ctx, namespace, bk.Name, 3) })
+
+		reconciler := &BookKeeperAutoscalerReconciler{
+			Client:      k8sClient,
+			Scheme:      k8sClient.Scheme(),
+			AdminClient: writableClient(10, 100),
+		}
+		result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: bk.Name, Namespace: namespace}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(bk), bk)).To(Succeed())
+		Expect(*bk.Spec.Replicas).To(Equal(int32(3)))
+		Expect(findCondition(bk.Status.Conditions, conditionTypeAutoscaling)).To(BeNil())
+	})
+
+	It("does not scale up when a bookie returns a malformed disk-info reading", func() {
+		bk := createBookKeeper("autoscaler-malformed-info", 3, &clusterv1alpha1.BookKeeperAutoscalerSpec{
+			Enabled: true, MinWritableBookies: int32Ptr(3), ScaleUpBy: int32Ptr(1), ScaleUpMaxLimit: int32Ptr(10),
+		}, nil)
+		markStabilized(ctx, bk, 3, nil)
+		createBookiePods(ctx, namespace, bk.Name, 3, 3)
+		DeferCleanup(func() { deleteBookiePods(ctx, namespace, bk.Name, 3) })
+
+		recorder := record.NewFakeRecorder(5)
+		reconciler := &BookKeeperAutoscalerReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: recorder,
+			AdminClient: &fakeBookieAdminClient{
+				state:   bkautoscaler.BookieState{Running: true},
+				infoErr: errors.New("bookie reported non-positive totalSpace 0 from /api/v1/bookie/info"),
+			},
+		}
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: bk.Name, Namespace: namespace}})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(bk), bk)).To(Succeed())
+		Expect(*bk.Spec.Replicas).To(Equal(int32(3)))
+		Expect(findCondition(bk.Status.Conditions, conditionTypeAutoscaling)).To(BeNil())
+		Eventually(recorder.Events).Should(Receive(ContainSubstring(reasonBookieAdminPollFailed)))
 	})
 
 	It("flags an invalid configuration instead of scaling when minWritableBookies is below the ensemble size", func() {

@@ -28,7 +28,14 @@ const (
 	bk1 = "bk-1"
 	bk2 = "bk-2"
 	bk3 = "bk-3"
+	bk4 = "bk-4"
 )
+
+// connErr is a ConnectionError, modelling a bookie that is unreachable or
+// unhealthy this tick (as opposed to a data-integrity error).
+func connErr(addr string) error {
+	return &ConnectionError{BookieAddr: addr, Err: errors.New("connection refused")}
+}
 
 // mockAdminClient is a BookieAdminClient test double keyed by bookie
 // address, so table-driven tests can describe an ensemble as plain maps
@@ -36,6 +43,11 @@ const (
 type mockAdminClient struct {
 	states map[string]BookieState
 	infos  map[string]BookieInfo
+
+	// stateErrs/infoErrs inject a per-address error for that call, letting a
+	// test model one flaky bookie in an otherwise healthy ensemble.
+	stateErrs map[string]error
+	infoErrs  map[string]error
 
 	stateErr error
 	infoErr  error
@@ -45,12 +57,18 @@ func (m *mockAdminClient) State(_ context.Context, addr string) (BookieState, er
 	if m.stateErr != nil {
 		return BookieState{}, m.stateErr
 	}
+	if err := m.stateErrs[addr]; err != nil {
+		return BookieState{}, err
+	}
 	return m.states[addr], nil
 }
 
 func (m *mockAdminClient) Info(_ context.Context, addr string) (BookieInfo, error) {
 	if m.infoErr != nil {
 		return BookieInfo{}, m.infoErr
+	}
+	if err := m.infoErrs[addr]; err != nil {
+		return BookieInfo{}, err
 	}
 	return m.infos[addr], nil
 }
@@ -225,9 +243,120 @@ func TestEvaluate(t *testing.T) {
 
 func TestEvaluate_PropagatesClientErrors(t *testing.T) {
 	client := &mockAdminClient{stateErr: errors.New("boom")}
-	_, err := Evaluate(context.Background(), client, []string{bk0}, Params{})
+	_, err := Evaluate(context.Background(), client, []string{bk0}, Params{MinWritableBookies: 1})
 	if err == nil {
 		t.Fatal("expected an error from a failing State() call, got nil")
+	}
+}
+
+// One unreachable bookie must not suppress a high-watermark scale-up on the
+// healthy bookies: the connection error is skipped and the at-risk signal on
+// the responders still drives a scale-up.
+func TestEvaluate_UnreachableBookieStillScalesUpOnHighWatermark(t *testing.T) {
+	fullState, fullInfo := writableBookie(0.95) // at/above the 92% HWM
+	_, lowInfo := writableBookie(0.10)
+
+	client := &mockAdminClient{
+		states:    map[string]BookieState{bk0: fullState, bk2: {Running: true}, bk3: {Running: true}},
+		infos:     map[string]BookieInfo{bk0: fullInfo, bk2: lowInfo, bk3: lowInfo},
+		stateErrs: map[string]error{bk1: connErr(bk1)},
+	}
+	params := Params{
+		CurrentReplicas:              4,
+		MinWritableBookies:           3,
+		ScaleUpBy:                    1,
+		ScaleUpMaxLimit:              10,
+		DiskUsageToleranceHwmPercent: 92,
+	}
+
+	got, err := Evaluate(context.Background(), client, []string{bk0, bk1, bk2, bk3}, params)
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	if !got.ShouldScale || got.TargetReplicas != 5 || got.Reason != ReasonDiskUsageAtHighWatermark {
+		t.Errorf("got %+v, want a HWM scale-up to 5", got)
+	}
+}
+
+// A partial poll (some bookies unreachable) must never fabricate a
+// writable-bookie deficit: even though only 2 writable bookies were observed
+// against a minimum of 3, the incomplete poll makes the deficit branch
+// unsafe, so the tick is a no-op rather than a permanent phantom scale-up.
+func TestEvaluate_IncompletePollSuppressesDeficit(t *testing.T) {
+	_, lowInfo := writableBookie(0.10)
+	client := &mockAdminClient{
+		states: map[string]BookieState{
+			bk1: readOnlyBookie(), bk2: readOnlyBookie(),
+			bk3: {Running: true}, bk4: {Running: true},
+		},
+		infos:     map[string]BookieInfo{bk3: lowInfo, bk4: lowInfo},
+		stateErrs: map[string]error{bk0: connErr(bk0)},
+	}
+	params := Params{
+		CurrentReplicas:              5,
+		MinWritableBookies:           3,
+		ScaleUpBy:                    1,
+		ScaleUpMaxLimit:              10,
+		DiskUsageToleranceHwmPercent: 92,
+	}
+
+	got, err := Evaluate(context.Background(), client, []string{bk0, bk1, bk2, bk3, bk4}, params)
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	if got.ShouldScale {
+		t.Errorf("expected no scale-up from an incomplete poll, got %+v", got)
+	}
+	if got.WritableBookies != 2 {
+		t.Errorf("WritableBookies = %d, want 2", got.WritableBookies)
+	}
+}
+
+// When too few bookies respond to safely decide (below the responder quorum),
+// the tick fails with an error rather than acting on a sliver of the
+// ensemble.
+func TestEvaluate_TooFewRespondersFailsTick(t *testing.T) {
+	client := &mockAdminClient{
+		states:    map[string]BookieState{bk2: {Running: true}, bk3: {Running: true}},
+		infos:     map[string]BookieInfo{},
+		stateErrs: map[string]error{bk0: connErr(bk0), bk1: connErr(bk1)},
+	}
+	params := Params{
+		CurrentReplicas:              4,
+		MinWritableBookies:           3,
+		ScaleUpBy:                    1,
+		ScaleUpMaxLimit:              10,
+		DiskUsageToleranceHwmPercent: 92,
+	}
+
+	_, err := Evaluate(context.Background(), client, []string{bk0, bk1, bk2, bk3}, params)
+	if err == nil {
+		t.Fatal("expected an error when only 2 of 4 bookies respond, got nil")
+	}
+}
+
+// A data-integrity error (a corrupt reading, not a ConnectionError) must fail
+// the whole tick, so a misread can never be silently skipped and let a
+// scale-up proceed on incomplete data.
+func TestEvaluate_DataIntegrityErrorFailsTick(t *testing.T) {
+	client := &mockAdminClient{
+		states:   map[string]BookieState{bk0: {Running: true}},
+		infoErrs: map[string]error{bk0: errors.New("bookie bk-0 reported non-positive totalSpace 0")},
+	}
+	params := Params{
+		CurrentReplicas:              3,
+		MinWritableBookies:           1,
+		ScaleUpBy:                    1,
+		ScaleUpMaxLimit:              10,
+		DiskUsageToleranceHwmPercent: 92,
+	}
+
+	_, err := Evaluate(context.Background(), client, []string{bk0}, params)
+	if err == nil {
+		t.Fatal("expected a data-integrity Info error to fail the tick, got nil")
+	}
+	if IsConnectionError(err) {
+		t.Errorf("data-integrity error must not be classified as a ConnectionError: %v", err)
 	}
 }
 

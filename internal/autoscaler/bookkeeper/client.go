@@ -25,10 +25,35 @@ package bookkeeper
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 )
+
+// ConnectionError marks a poll failure that means a single bookie is
+// unreachable or unhealthy right now (a transport failure, or a non-2xx
+// admin-API response) — as opposed to a data-integrity failure (a 200 whose
+// body is unparseable or nonsensical). Evaluate skips a bookie that returns a
+// ConnectionError and keeps evaluating the rest, but fails the whole tick on
+// a data-integrity error, so one flaky bookie can't block a legitimate
+// scale-up while a corrupt reading still can't silently drive one.
+type ConnectionError struct {
+	BookieAddr string
+	Err        error
+}
+
+func (e *ConnectionError) Error() string {
+	return fmt.Sprintf("bookie %s unreachable: %v", e.BookieAddr, e.Err)
+}
+
+func (e *ConnectionError) Unwrap() error { return e.Err }
+
+// IsConnectionError reports whether err is (or wraps) a ConnectionError.
+func IsConnectionError(err error) bool {
+	var connErr *ConnectionError
+	return errors.As(err, &connErr)
+}
 
 // BookieState mirrors the response body of the bookie admin REST endpoint
 // GET /api/v1/bookie/state.
@@ -51,9 +76,11 @@ type BookieDiskUsage struct {
 	TotalBytes int64
 }
 
-// Fraction returns the disk used, in [0,1]. A bookie reporting
-// TotalBytes<=0 is treated as fully used (1.0), so a broken or zero-size
-// report can never hide a scale-up that should happen.
+// Fraction returns the disk used, in [0,1]. The HTTP client rejects a
+// non-positive totalSpace upstream in Info (a misread fails the tick rather
+// than reaching here), so TotalBytes<=0 only arises from a directly
+// constructed value; it is reported as fully used (1.0) as a last-resort
+// defensive default.
 func (d BookieDiskUsage) Fraction() float64 {
 	if d.TotalBytes <= 0 {
 		return 1
@@ -136,7 +163,7 @@ func (c *HTTPBookieAdminClient) get(ctx context.Context, bookieAddr, path string
 	}
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request %s: %w", url, err)
+		return nil, &ConnectionError{BookieAddr: bookieAddr, Err: fmt.Errorf("request %s: %w", url, err)}
 	}
 	return resp, nil
 }
@@ -150,7 +177,7 @@ func (c *HTTPBookieAdminClient) State(ctx context.Context, bookieAddr string) (B
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return BookieState{}, fmt.Errorf("bookie %s: unexpected status %d from /api/v1/bookie/state", bookieAddr, resp.StatusCode)
+		return BookieState{}, &ConnectionError{BookieAddr: bookieAddr, Err: fmt.Errorf("unexpected status %d from /api/v1/bookie/state", resp.StatusCode)}
 	}
 
 	var body struct {
@@ -174,15 +201,28 @@ func (c *HTTPBookieAdminClient) Info(ctx context.Context, bookieAddr string) (Bo
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return BookieInfo{}, fmt.Errorf("bookie %s: unexpected status %d from /api/v1/bookie/info", bookieAddr, resp.StatusCode)
+		return BookieInfo{}, &ConnectionError{BookieAddr: bookieAddr, Err: fmt.Errorf("unexpected status %d from /api/v1/bookie/info", resp.StatusCode)}
 	}
 
 	var body struct {
 		FreeSpace  int64 `json:"freeSpace"`
 		TotalSpace int64 `json:"totalSpace"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	// DisallowUnknownFields makes a drifted or truncated response an explicit
+	// decode error rather than a silent zero-value struct: a body missing the
+	// fields we need must fail the tick, not fabricate a reading.
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
 		return BookieInfo{}, fmt.Errorf("bookie %s: decode /api/v1/bookie/info: %w", bookieAddr, err)
+	}
+
+	// A non-positive totalSpace is a nonsense reading (an empty or partial
+	// body decodes to totalSpace=0). Returning it would let BookieDiskUsage
+	// .Fraction() report the bookie as 100% full and trigger an unbounded
+	// scale-up, so treat it as a hard error and fail this tick instead.
+	if body.TotalSpace <= 0 {
+		return BookieInfo{}, fmt.Errorf("bookie %s reported non-positive totalSpace %d from /api/v1/bookie/info", bookieAddr, body.TotalSpace)
 	}
 
 	return BookieInfo{

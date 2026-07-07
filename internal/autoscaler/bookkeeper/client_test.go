@@ -62,6 +62,62 @@ func TestHTTPBookieAdminClient_Info(t *testing.T) {
 	}
 }
 
+// A 200 with an empty or drifted body decodes totalSpace=0; without the
+// guard in Info that reads as a 100%-full disk and drives an unbounded
+// scale-up. Each of these must instead fail the tick with a plain
+// (non-ConnectionError) data-integrity error.
+func TestHTTPBookieAdminClient_Info_RejectsMalformedBody(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"empty body", `{}`},
+		{"zero totalSpace", `{"freeSpace":0,"totalSpace":0}`},
+		{"missing totalSpace", `{"freeSpace":25}`},
+		{"negative totalSpace", `{"freeSpace":0,"totalSpace":-1}`},
+		{"unknown/drifted fields only", `{"usedBytes":50,"capacityBytes":100}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+
+			client := NewHTTPBookieAdminClient()
+			_, err := client.Info(context.Background(), strings.TrimPrefix(srv.URL, "http://"))
+			if err == nil {
+				t.Fatalf("Info() with body %q: expected an error, got nil", tt.body)
+			}
+			if IsConnectionError(err) {
+				t.Errorf("Info() malformed-body error must be a data-integrity error, not a ConnectionError: %v", err)
+			}
+		})
+	}
+}
+
+// A non-2xx response from a bookie's admin API means it is unhealthy/not
+// serving right now; both State and Info must surface that as a
+// ConnectionError so Evaluate skips just that one bookie instead of failing
+// the whole tick.
+func TestHTTPBookieAdminClient_NonOKStatusIsConnectionError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	client := NewHTTPBookieAdminClient()
+
+	if _, err := client.State(context.Background(), addr); !IsConnectionError(err) {
+		t.Errorf("State() on a 503 = %v, want a ConnectionError", err)
+	}
+	if _, err := client.Info(context.Background(), addr); !IsConnectionError(err) {
+		t.Errorf("Info() on a 503 = %v, want a ConnectionError", err)
+	}
+}
+
 func TestHTTPBookieAdminClient_UnderReplicatedLedgerCount(t *testing.T) {
 	tests := []struct {
 		name       string

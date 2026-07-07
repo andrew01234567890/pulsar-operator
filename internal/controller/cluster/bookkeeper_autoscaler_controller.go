@@ -141,15 +141,31 @@ func (r *BookKeeperAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{}, err
 	}
 
+	currentReplicas := resolveReplicas(bk.Spec)
+
+	// Only evaluate when every desired bookie is addressable this tick. A
+	// pod mid-recreate has no PodIP yet, so polling would silently see a
+	// short ensemble; combined with the stale (still all-ready) status the
+	// stabilization gate reads, that under-counts writable bookies and — in
+	// this scale-up-only controller — would fire the deficit branch and
+	// strand a permanent phantom replica. Skipping the tick (and requeuing)
+	// until the poll can be complete is the safe choice.
+	addrs := bookieAdminAddrs(pods)
+	if int32(len(addrs)) < currentReplicas {
+		log.V(1).Info("bookie autoscaler skipping tick: not every bookie is addressable yet",
+			"addressable", len(addrs), "desiredReplicas", currentReplicas)
+		return result, nil
+	}
+
 	params := bkautoscaler.Params{
-		CurrentReplicas:              resolveReplicas(bk.Spec),
+		CurrentReplicas:              currentReplicas,
 		MinWritableBookies:           minWritable,
 		ScaleUpBy:                    resolveAutoscalerScaleUpBy(autoscaler),
 		ScaleUpMaxLimit:              resolveAutoscalerScaleUpMaxLimit(autoscaler),
 		DiskUsageToleranceHwmPercent: resolveAutoscalerHwmPercent(autoscaler),
 	}
 
-	decision, err := bkautoscaler.Evaluate(ctx, r.adminClient(), bookieAdminAddrs(pods), params)
+	decision, err := bkautoscaler.Evaluate(ctx, r.adminClient(), addrs, params)
 	if err != nil {
 		log.Error(err, "failed to poll bookie admin API")
 		r.recorder().Eventf(bk, corev1.EventTypeWarning, reasonBookieAdminPollFailed, "failed to poll bookie admin API: %v", err)
@@ -227,9 +243,10 @@ func (r *BookKeeperAutoscalerReconciler) listBookiePods(ctx context.Context, bk 
 // bookieAdminAddrs resolves each pod to its admin REST address via pod IP
 // rather than headless-Service DNS: it needs no assumption about the
 // cluster's DNS suffix and works identically against a real cluster or an
-// envtest-style test double. Pods without an assigned IP yet are skipped -
-// they are also, by construction, not yet Ready, so isStabilized already
-// blocked this tick unless every replica has one.
+// envtest-style test double. Pods without an assigned IP yet are dropped;
+// the caller compares the returned count against the desired replica count
+// and skips the whole tick when any bookie is not yet addressable, so a
+// partial ensemble is never handed to Evaluate.
 func bookieAdminAddrs(pods []corev1.Pod) []string {
 	addrs := make([]string, 0, len(pods))
 	for _, pod := range pods {
