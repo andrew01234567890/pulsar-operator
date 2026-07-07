@@ -106,6 +106,17 @@ spec:
                   autoscaler:
                     description: autoscaler configures the disk-watermark-driven autoscaler.
                     properties:
+                      decommissionTimeoutSeconds:
+                        default: 1800
+                        description: |-
+                          decommissionTimeoutSeconds bounds how long the guarded scale-down state
+                          machine waits, once a bookie is marked read-only, for re-replication to
+                          finish (zero ledgers on the target bookie and zero cluster-wide
+                          under-replicated ledgers) before auto-reverting the bookie to writable,
+                          clearing the decommission state, and raising a Warning condition.
+                        format: int32
+                        minimum: 60
+                        type: integer
                       diskUsageToleranceHwm:
                         default: 92
                         description: |-
