@@ -20,6 +20,13 @@ package backup
 const (
 	testClusterName       = "test-cluster"
 	testDriverFilesystem  = "filesystem"
+	testDriverAWSS3       = "aws-s3"
+	testRegionUSEast      = "us-east-1"
+	testPrefixC1          = "backups/c1"
+	testSecretS3          = "s3-creds"
+	testBucket            = "my-bucket"
+	testJobOwnerAPIVer    = "batch/v1"
+	testJobOwnerKind      = "Job"
 	testCronDaily         = "0 0 * * *"
 	testArtifactURI       = "file:///backups/test-cluster/backup-1.tar"
 	testCaseExplicitTrue  = "explicit true"

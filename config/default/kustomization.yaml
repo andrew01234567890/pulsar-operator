@@ -41,6 +41,22 @@ patches:
   target:
     kind: Deployment
 
+# Keep the Backup reconciler's OPERATOR_IMAGE env in sync with the actual
+# controller-manager image, so `make deploy IMG=...` (which rewrites the image
+# via `kustomize edit set image`) also propagates that image to the export Jobs
+# the reconciler launches, without hand-editing the env value.
+replacements:
+- source:
+    kind: Deployment
+    name: controller-manager
+    fieldPath: spec.template.spec.containers.[name=manager].image
+  targets:
+  - select:
+      kind: Deployment
+      name: controller-manager
+    fieldPaths:
+    - spec.template.spec.containers.[name=manager].env.[name=OPERATOR_IMAGE].value
+
 # Uncomment the patches line if you enable Metrics and CertManager
 # [METRICS-WITH-CERTS] To enable metrics protected with certManager, uncomment the following line.
 # This patch will protect the metrics with certManager self-signed certs.

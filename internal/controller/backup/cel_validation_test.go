@@ -47,7 +47,7 @@ var _ = Describe("CEL admission validation", func() {
 				Spec: backupv1alpha1.BackupSpec{
 					ClusterRef: corev1.LocalObjectReference{Name: testClusterName},
 					Destination: backupv1alpha1.BackupDestination{
-						Driver: "aws-s3",
+						Driver: testDriverAWSS3,
 					},
 				},
 			}
@@ -63,7 +63,7 @@ var _ = Describe("CEL admission validation", func() {
 				Spec: backupv1alpha1.BackupSpec{
 					ClusterRef: corev1.LocalObjectReference{Name: testClusterName},
 					Destination: backupv1alpha1.BackupDestination{
-						Driver: "aws-s3",
+						Driver: testDriverAWSS3,
 						Bucket: "my-backup-bucket",
 					},
 				},

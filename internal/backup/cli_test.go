@@ -23,10 +23,11 @@ import (
 )
 
 const testFlagOxiaAddress = "my-oxia:6648"
+const flagOxia = "--oxia"
 
 func TestParseExportFlags(t *testing.T) {
 	flags, err := parseExportFlags([]string{
-		"--oxia", testFlagOxiaAddress,
+		flagOxia, testFlagOxiaAddress,
 		"--out", "/tmp/manifest.jsonl",
 		"--namespaces", "default, broker ,bookkeeper",
 	})
@@ -45,7 +46,7 @@ func TestParseExportFlags(t *testing.T) {
 }
 
 func TestParseExportFlagsDefaults(t *testing.T) {
-	flags, err := parseExportFlags([]string{"--oxia", testFlagOxiaAddress})
+	flags, err := parseExportFlags([]string{flagOxia, testFlagOxiaAddress})
 	if err != nil {
 		t.Fatalf("parseExportFlags() error = %v", err)
 	}

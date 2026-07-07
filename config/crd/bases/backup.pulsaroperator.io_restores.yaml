@@ -88,7 +88,17 @@ spec:
                       credentialsSecretRef:
                         description: |-
                           credentialsSecretRef references the Secret holding the destination
-                          driver's object-storage credentials.
+                          driver's object-storage credentials. The Secret's data keys must match
+                          what the selected driver expects, mirroring the tiered-storage offload
+                          convention:
+                            - aws-s3: keys AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+                            - azureblob: keys AZURE_STORAGE_ACCOUNT and AZURE_STORAGE_ACCESS_KEY.
+                            - google-cloud-storage: a single key named "key.json" holding the
+                              service-account JSON (it is mounted as a file and pointed at by
+                              GOOGLE_APPLICATION_CREDENTIALS). A GCS credentials Secret that stores
+                              the JSON under any other data key will fail to mount and the backup
+                              Job will not start.
+                            - filesystem: not used.
                         properties:
                           name:
                             default: ""

@@ -24,6 +24,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/andrew01234567890/pulsar-operator/internal/objectstore"
 )
 
 // ExportCommandName and ImportCommandName are the manager subcommands
@@ -43,6 +45,15 @@ type ExportFlags struct {
 	OxiaAddress string
 	OutPath     string
 	Namespaces  []string
+
+	// Dest, when Dest.Driver is non-empty, redirects the manifest to an
+	// object store instead of --out: the manifest is uploaded to
+	// Dest under DestKey and a machine-readable ExportResult is written to
+	// ResultPath (the Job's termination-message file) for the reconciler to
+	// read back. --out is ignored in that mode.
+	Dest       objectstore.Config
+	DestKey    string
+	ResultPath string
 }
 
 func parseExportFlags(args []string) (ExportFlags, error) {
@@ -51,17 +62,36 @@ func parseExportFlags(args []string) (ExportFlags, error) {
 	outPath := fs.String("out", stdioPath, "Output manifest file path, or - for stdout")
 	namespaces := fs.String("namespaces", strings.Join(DefaultNamespaces, ","),
 		"Comma-separated Oxia namespaces to export")
+	destDriver := fs.String("dest-driver", "", "Object-store driver to upload the manifest to (aws-s3|google-cloud-storage|azureblob|filesystem); empty writes to --out instead")
+	destBucket := fs.String("dest-bucket", "", "Object-store bucket/container (or base directory for the filesystem driver)")
+	destRegion := fs.String("dest-region", "", "Object-store region")
+	destEndpoint := fs.String("dest-endpoint", "", "Object-store endpoint override (S3-compatible stores, Azure service URL)")
+	destPrefix := fs.String("dest-prefix", "", "Key/path prefix under the bucket for this manifest")
+	destKey := fs.String("dest-key", "", "Object key (filename) to write the manifest to under the prefix")
+	resultPath := fs.String("result-path", defaultResultPath, "File to write the machine-readable ExportResult to (the container termination-message path)")
 	if err := fs.Parse(args); err != nil {
 		return ExportFlags{}, err
 	}
 	if *oxiaAddr == "" {
 		return ExportFlags{}, fmt.Errorf("%s: --oxia is required", ExportCommandName)
 	}
+	if *destDriver != "" && *destKey == "" {
+		return ExportFlags{}, fmt.Errorf("%s: --dest-key is required when --dest-driver is set", ExportCommandName)
+	}
 
 	return ExportFlags{
 		OxiaAddress: *oxiaAddr,
 		OutPath:     *outPath,
 		Namespaces:  splitNamespaces(*namespaces),
+		Dest: objectstore.Config{
+			Driver:   *destDriver,
+			Bucket:   *destBucket,
+			Region:   *destRegion,
+			Endpoint: *destEndpoint,
+			Prefix:   *destPrefix,
+		},
+		DestKey:    *destKey,
+		ResultPath: *resultPath,
 	}, nil
 }
 
@@ -101,13 +131,19 @@ func RunExport(ctx context.Context, flags ExportFlags, newClient ClientFactory, 
 }
 
 // RunExportCommand parses args as the backup-export subcommand's flags,
-// opens --out (or uses stdout for "-"), connects to the real Oxia client at
-// --oxia, and runs the export. capturedAt is supplied by the caller (main.go
-// calls time.Now() once, right at the process boundary).
+// connects to the real Oxia client at --oxia, and runs the export. When
+// --dest-driver is set the manifest is uploaded to that object store (see
+// runExportToObjectStore); otherwise it is written to --out (or stdout for
+// "-"). capturedAt is supplied by the caller (main.go calls time.Now() once,
+// right at the process boundary).
 func RunExportCommand(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer, capturedAt time.Time) error {
 	flags, err := parseExportFlags(args)
 	if err != nil {
 		return err
+	}
+
+	if flags.Dest.Driver != "" {
+		return runExportToObjectStore(ctx, flags, NewOxiaClientFactory(flags.OxiaAddress), capturedAt, stdout, stderr)
 	}
 
 	out := stdout

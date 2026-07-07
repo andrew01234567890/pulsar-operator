@@ -89,6 +89,15 @@ spec:
         {{- end }}
         command:
         - /manager
+        env:
+        # The Backup reconciler launches export Jobs that run this same operator
+        # image with the `manager backup-export` subcommand, so it must know its
+        # own image. Kept identical to the container image below.
+        - name: OPERATOR_IMAGE
+          value: "{{ .Values.manager.image.repository }}{{- if not (contains "@" .Values.manager.image.repository) }}:{{ .Values.manager.image.tag | default .Chart.AppVersion }}{{- end }}"
+        {{- with .Values.manager.extraEnv }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
         image: "{{ .Values.manager.image.repository }}{{- if not (contains "@" .Values.manager.image.repository) }}:{{ .Values.manager.image.tag | default .Chart.AppVersion }}{{- end }}"
         {{- with .Values.manager.image.pullPolicy }}
         imagePullPolicy: {{ . }}
