@@ -177,9 +177,8 @@ spec:
                     type: string
                   replicas:
                     default: 3
-                    description: |-
-                      replicas is the number of server pods. Must be odd for quorum correctness;
-                      oddness is enforced by a future validating webhook.
+                    description: replicas is the number of server pods. Must be odd
+                      for quorum correctness.
                     format: int32
                     minimum: 1
                     type: integer
@@ -204,6 +203,9 @@ spec:
                       write latency.
                     type: boolean
                 type: object
+                x-kubernetes-validations:
+                - message: oxia server replicas must be odd (quorum)
+                  rule: self.replicas % 2 == 1
             type: object
           status:
             description: status defines the observed state of OxiaCluster

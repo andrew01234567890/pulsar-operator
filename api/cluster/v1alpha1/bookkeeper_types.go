@@ -41,6 +41,7 @@ type BookKeeperVolumes struct {
 // The operator rejects an ensembleSize greater than the bookie replica count.
 // For 3-AZ deployments, writeQuorum=3/ackQuorum=2 is recommended over the
 // Pulsar-production default of 2/2 so the cluster survives one AZ loss.
+// +kubebuilder:validation:XValidation:rule="self.ackQuorum <= self.writeQuorum && self.writeQuorum <= self.ensembleSize",message="ackQuorum <= writeQuorum <= ensembleSize"
 type BookKeeperEnsembleSpec struct {
 	// ensembleSize is the number of bookies each ledger is striped across.
 	// +optional
@@ -69,6 +70,7 @@ type BookKeeperEnsembleSpec struct {
 // diskUsageToleranceLwm and there is zero cluster-wide under-replication.
 // Scale-down is a guarded, opt-in, serialized decommission workflow and is
 // OFF by default.
+// +kubebuilder:validation:XValidation:rule="self.diskUsageToleranceLwm < self.diskUsageToleranceHwm",message="Lwm must be below Hwm"
 type BookKeeperAutoscalerSpec struct {
 	// enabled turns on the bookie disk-watermark autoscaler (scale-up).
 	// +optional
@@ -156,6 +158,7 @@ type BookKeeperAutoRackConfig struct {
 }
 
 // BookKeeperSpec defines the desired state of BookKeeper.
+// +kubebuilder:validation:XValidation:rule="!has(self.ensemble) || !has(self.ensemble.ensembleSize) || !has(self.replicas) || self.ensemble.ensembleSize <= self.replicas",message="ensembleSize cannot exceed replicas"
 type BookKeeperSpec struct {
 	// replicas is the number of bookie pods.
 	// +optional
@@ -190,11 +193,11 @@ type BookKeeperSpec struct {
 	Autoscaler *BookKeeperAutoscalerSpec `json:"autoscaler,omitempty"`
 
 	// podManagementPolicy is the StatefulSet pod management policy. Immutable
-	// once set; changing it requires operator-guarded validation in a future
-	// webhook.
+	// once set.
 	// +optional
 	// +kubebuilder:default=Parallel
 	// +kubebuilder:validation:Enum=OrderedReady;Parallel
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="podManagementPolicy is immutable"
 	PodManagementPolicy string `json:"podManagementPolicy,omitempty"`
 
 	// autoRackConfig configures the bookie rack-awareness sync daemon.

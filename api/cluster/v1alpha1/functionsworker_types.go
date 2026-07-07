@@ -49,7 +49,11 @@ type FunctionsWorkerSpec struct {
 	// packageStorage selects the function-package storage backend. Oxia does
 	// not provide the ZooKeeper-backed distributed log package storage KAAP
 	// defaults to, so "FileSystemPackagesStorage" is required while the
-	// metadata store is Oxia-only; a future webhook enforces this.
+	// metadata store is Oxia-only. There is no CEL rule for this: the enum
+	// below has no ZooKeeper-dependent value to reject, since this operator's
+	// metadataStore is Oxia-only and ZooKeeper package storage was never
+	// exposed. If a ZooKeeper-backed value is ever added to the enum, add a
+	// same-struct CEL rule rejecting it here.
 	// +optional
 	// +kubebuilder:default=FileSystemPackagesStorage
 	// +kubebuilder:validation:Enum=FileSystemPackagesStorage;S3PackagesStorage;GCSPackagesStorage

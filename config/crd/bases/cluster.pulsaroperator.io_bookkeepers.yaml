@@ -146,6 +146,9 @@ spec:
                     minimum: 0
                     type: integer
                 type: object
+                x-kubernetes-validations:
+                - message: Lwm must be below Hwm
+                  rule: self.diskUsageToleranceLwm < self.diskUsageToleranceHwm
               config:
                 additionalProperties:
                   type: string
@@ -184,6 +187,10 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
+                x-kubernetes-validations:
+                - message: ackQuorum <= writeQuorum <= ensembleSize
+                  rule: self.ackQuorum <= self.writeQuorum && self.writeQuorum <=
+                    self.ensembleSize
               image:
                 description: |-
                   image overrides the bookie container image. Falls back to
@@ -193,12 +200,14 @@ spec:
                 default: Parallel
                 description: |-
                   podManagementPolicy is the StatefulSet pod management policy. Immutable
-                  once set; changing it requires operator-guarded validation in a future
-                  webhook.
+                  once set.
                 enum:
                 - OrderedReady
                 - Parallel
                 type: string
+                x-kubernetes-validations:
+                - message: podManagementPolicy is immutable
+                  rule: self == oldSelf
               replicas:
                 description: replicas is the number of bookie pods.
                 format: int32
@@ -258,6 +267,10 @@ spec:
                     type: object
                 type: object
             type: object
+            x-kubernetes-validations:
+            - message: ensembleSize cannot exceed replicas
+              rule: '!has(self.ensemble) || !has(self.ensemble.ensembleSize) || !has(self.replicas)
+                || self.ensemble.ensembleSize <= self.replicas'
           status:
             description: status defines the observed state of BookKeeper
             properties:
