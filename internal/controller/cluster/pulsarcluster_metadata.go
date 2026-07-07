@@ -209,12 +209,14 @@ func (r *PulsarClusterReconciler) reconcileMetadataInit(ctx context.Context, clu
 		return report, false, err
 	}
 
-	job, requeue, err := r.reconcileMetadataInitJob(ctx, cluster, oxiaReady)
+	alreadyInitialized := apimeta.IsStatusConditionTrue(cluster.Status.Conditions, conditionTypeMetadataInitialized)
+
+	job, requeue, err := r.reconcileMetadataInitJob(ctx, cluster, oxiaReady, alreadyInitialized)
 	if err != nil {
 		return componentReport{}, false, fmt.Errorf("%s: %w", metadataInitComponentName, err)
 	}
 
-	cond := metadataInitializedCondition(cluster.Generation, oxiaReady, job)
+	cond := metadataInitializedCondition(cluster.Generation, oxiaReady, job, alreadyInitialized)
 	apimeta.SetStatusCondition(&cluster.Status.Conditions, cond)
 
 	return componentReport{
@@ -230,12 +232,22 @@ func (r *PulsarClusterReconciler) reconcileMetadataInit(ctx context.Context, clu
 // OxiaCluster child is Ready, and otherwise leaves a running/succeeded Job
 // untouched: a Job's pod template is immutable, and initialize-cluster-metadata
 // is meant to run exactly once per cluster. A nil Job with a nil error means
-// the Job hasn't been created yet (Oxia isn't Ready). A terminally-Failed Job
+// the Job hasn't been created yet (Oxia isn't Ready, or bootstrap is already
+// permanently done - see alreadyInitialized below). A terminally-Failed Job
 // is deleted so a fresh attempt is recreated on the next reconcile - it must
 // never wedge the cluster forever - and the still-Failed Job is returned so
 // this cycle's status truthfully reports the failure; the returned bool then
 // asks the caller to requeue the retry.
-func (r *PulsarClusterReconciler) reconcileMetadataInitJob(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, oxiaReady bool) (*batchv1.Job, bool, error) {
+//
+// alreadyInitialized short-circuits the NotFound case before it would
+// otherwise recreate the Job: initialize-cluster-metadata is NOT idempotent
+// (it errors if the cluster's metadata already exists), so once
+// MetadataInitialized has ever gone True, that bootstrap is a permanent fact
+// and the Job must never be recreated even if it's since been deleted (e.g.
+// an admin ran `kubectl delete job`, or a finished-Job TTL/cleanup policy
+// reaped it). Recreating it would rerun the non-idempotent command, fail, and
+// wedge the cluster Ready=False forever.
+func (r *PulsarClusterReconciler) reconcileMetadataInitJob(ctx context.Context, cluster *clusterv1alpha1.PulsarCluster, oxiaReady, alreadyInitialized bool) (*batchv1.Job, bool, error) {
 	job := &batchv1.Job{}
 	key := types.NamespacedName{Name: metadataInitJobName(cluster.Name), Namespace: cluster.Namespace}
 	err := r.Get(ctx, key, job)
@@ -254,6 +266,10 @@ func (r *PulsarClusterReconciler) reconcileMetadataInitJob(ctx context.Context, 
 		return nil, false, nil
 	}
 
+	if alreadyInitialized {
+		return nil, false, nil
+	}
+
 	desired := buildMetadataInitJob(cluster)
 	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
 		return nil, false, fmt.Errorf("setting owner reference on cluster-metadata-init job: %w", err)
@@ -265,20 +281,24 @@ func (r *PulsarClusterReconciler) reconcileMetadataInitJob(ctx context.Context, 
 }
 
 // metadataInitializedCondition computes the MetadataInitialized condition
-// from whether Oxia is Ready and the observed state of the
-// cluster-metadata-init Job (nil until it has been created).
+// from whether Oxia is Ready, the observed state of the cluster-metadata-init
+// Job (nil until it has been created, or once it's been pruned per
+// alreadyInitialized below), and whether the condition was already True on a
+// prior reconcile.
 //
-// A succeeded Job is checked FIRST so the condition is monotonic: cluster
-// metadata bootstrap is a permanent one-time fact, so a later transient Oxia
-// readiness blip (e.g. an Oxia pod restart) must never flip
+// A succeeded Job - or a prior True condition with the Job now absent - is
+// checked FIRST so the condition is monotonic: cluster metadata bootstrap is
+// a permanent one-time fact, so neither a later transient Oxia readiness blip
+// (e.g. an Oxia pod restart) nor the Job object being deleted out from under
+// the operator (admin cleanup, finished-Job TTL) may ever flip
 // MetadataInitialized True->False and flap the umbrella's Ready. A
 // terminally-Failed Job is likewise reported regardless of Oxia readiness so
 // the real failure isn't masked as "waiting for Oxia".
-func metadataInitializedCondition(generation int64, oxiaReady bool, job *batchv1.Job) metav1.Condition {
+func metadataInitializedCondition(generation int64, oxiaReady bool, job *batchv1.Job, alreadyInitialized bool) metav1.Condition {
 	base := metav1.Condition{Type: conditionTypeMetadataInitialized, ObservedGeneration: generation}
 
 	switch {
-	case jobSucceeded(job):
+	case jobSucceeded(job) || (alreadyInitialized && job == nil):
 		base.Status = metav1.ConditionTrue
 		base.Reason = reasonMetadataInitJobSucceeded
 		base.Message = "cluster metadata initialized"

@@ -26,6 +26,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	clusterv1alpha1 "github.com/andrew01234567890/pulsar-operator/api/cluster/v1alpha1"
@@ -426,6 +427,129 @@ var _ = Describe("PulsarCluster Controller", func() {
 		retriedCond := apimeta.FindStatusCondition(pulsarCluster.Status.Conditions, conditionTypeMetadataInitialized)
 		Expect(retriedCond).NotTo(BeNil())
 		Expect(retriedCond.Reason).To(Equal(reasonMetadataInitJobRunning))
+	})
+
+	It("never recreates the metadata-init Job once MetadataInitialized is True, even if the Job is deleted", func() {
+		// Regression: bin/pulsar initialize-cluster-metadata is NOT idempotent
+		// (it errors if the cluster's metadata already exists). A deleted
+		// succeeded Job (admin kubectl delete job, finished-Job TTL/cleanup)
+		// must never be recreated once bootstrap has permanently succeeded, or
+		// the re-run fails and wedges the cluster Ready=False forever.
+		pulsarCluster := &clusterv1alpha1.PulsarCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: namespace.Name,
+			},
+			Spec: clusterv1alpha1.PulsarClusterSpec{
+				Broker: &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(1))},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
+
+		By("reconciling, marking Oxia Ready, and reconciling again to create the Job")
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		oxia := &metadatav1alpha1.OxiaCluster{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-oxia", Namespace: namespace.Name}, oxia)).To(Succeed())
+		oxia.Status.Conditions = []metav1.Condition{readyConditionForGeneration(oxia.Generation, "all oxia pods ready")}
+		Expect(k8sClient.Status().Update(ctx, oxia)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		jobKey := types.NamespacedName{Name: clusterName + "-metadata-init", Namespace: namespace.Name}
+		metadataInitJob := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, jobKey, metadataInitJob)).To(Succeed())
+
+		By("marking the Job Succeeded and reconciling so MetadataInitialized goes True")
+		metadataInitJob.Status.Succeeded = 1
+		Expect(k8sClient.Status().Update(ctx, metadataInitJob)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		Expect(apimeta.IsStatusConditionTrue(pulsarCluster.Status.Conditions, conditionTypeMetadataInitialized)).To(BeTrue())
+
+		By("deleting the succeeded Job out from under the operator")
+		// Background propagation removes the Job object immediately - envtest
+		// runs no garbage-collector controller to clear a foreground-deletion
+		// finalizer, so a plain Delete() would otherwise leave it Get-able
+		// forever with a DeletionTimestamp set.
+		Expect(k8sClient.Delete(ctx, metadataInitJob, client.PropagationPolicy(metav1.DeletePropagationBackground))).To(Succeed())
+
+		By("re-reconciling: the non-idempotent init Job must NOT be recreated")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		recreated := &batchv1.Job{}
+		err = k8sClient.Get(ctx, jobKey, recreated)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+		By("MetadataInitialized stays True, not regressed to JobRunning/JobFailed")
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		initCond := apimeta.FindStatusCondition(pulsarCluster.Status.Conditions, conditionTypeMetadataInitialized)
+		Expect(initCond).NotTo(BeNil())
+		Expect(initCond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(initCond.Reason).To(Equal(reasonMetadataInitJobSucceeded))
+	})
+
+	It("wires tiered-storage offload into the Broker child, and leaves it untouched when unconfigured", func() {
+		By("reconciling a cluster with s3 offload configured")
+		threshold := int64(1073741824)
+		pulsarCluster := &clusterv1alpha1.PulsarCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: namespace.Name,
+			},
+			Spec: clusterv1alpha1.PulsarClusterSpec{
+				PulsarVersion: testPulsarVersion,
+				Broker:        &clusterv1alpha1.BrokerSpec{Replicas: ptr(int32(1))},
+				Offload: &clusterv1alpha1.OffloadSpec{
+					Driver:                offloadDriverAWSS3,
+					Bucket:                testOffloadBucket,
+					Region:                testOffloadRegion,
+					OffloadThresholdBytes: &threshold,
+					CredentialsSecretRef:  &corev1.LocalObjectReference{Name: "offload-creds"},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pulsarCluster)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		broker := &clusterv1alpha1.Broker{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
+
+		By("selecting the pulsar-all image and setting the S3 offload keys")
+		Expect(broker.Spec.Image).To(Equal("apachepulsar/pulsar-all:" + testPulsarVersion))
+		Expect(broker.Spec.Config).To(HaveKeyWithValue("managedLedgerOffloadDriver", "aws-s3"))
+		Expect(broker.Spec.Config).To(HaveKeyWithValue("s3ManagedLedgerOffloadBucket", testOffloadBucket))
+		Expect(broker.Spec.Config).To(HaveKeyWithValue("s3ManagedLedgerOffloadRegion", testOffloadRegion))
+		Expect(broker.Spec.Config).To(HaveKeyWithValue("managedLedgerOffloadAutoTriggerSizeThresholdBytes", "1073741824"))
+
+		By("wiring the credentials secret in as broker env vars")
+		envNames := make([]string, 0, len(broker.Spec.Env))
+		for _, e := range broker.Spec.Env {
+			envNames = append(envNames, e.Name)
+			Expect(e.ValueFrom.SecretKeyRef.Name).To(Equal("offload-creds"))
+		}
+		Expect(envNames).To(ConsistOf("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"))
+
+		By("removing offload leaves the broker on the base image with no offload keys")
+		Expect(k8sClient.Get(ctx, req.NamespacedName, pulsarCluster)).To(Succeed())
+		pulsarCluster.Spec.Offload = nil
+		Expect(k8sClient.Update(ctx, pulsarCluster)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-broker", Namespace: namespace.Name}, broker)).To(Succeed())
+		Expect(broker.Spec.Image).To(Equal("apachepulsar/pulsar:" + testPulsarVersion))
+		Expect(broker.Spec.Config).NotTo(HaveKey("managedLedgerOffloadDriver"))
+		Expect(broker.Spec.Env).To(BeEmpty())
 	})
 })
 

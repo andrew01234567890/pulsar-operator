@@ -113,6 +113,12 @@ type BrokerSpec struct {
 	// +optional
 	Config map[string]string `json:"config,omitempty"`
 
+	// env are additional environment variables set on the broker container,
+	// e.g. tiered-storage offload driver credentials the umbrella PulsarCluster
+	// reconciler wires in from spec.offload.credentialsSecretRef.
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
+
 	// resources are the compute resource requirements for the broker container.
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`

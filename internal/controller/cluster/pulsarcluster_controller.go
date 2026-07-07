@@ -177,6 +177,7 @@ func (r *PulsarClusterReconciler) reconcileBroker(ctx context.Context, cluster *
 
 	desired := buildBrokerSpec(cluster.Spec)
 	desired.Config = withBrokerProxyMetadataDefaults(desired.Config, cluster.Name)
+	desired.Config = withBrokerOffloadDefaults(desired.Config, cluster.Spec.Offload)
 	if err := r.createOrUpdateChild(ctx, cluster, child, func() error {
 		child.Spec = *desired
 		return nil
@@ -361,13 +362,32 @@ func globalStorageClassName(spec clusterv1alpha1.PulsarClusterSpec) *string {
 }
 
 // buildBrokerSpec copies PulsarCluster.spec.broker into the child Broker
-// spec, applying the cluster-wide image default.
+// spec, applying the cluster-wide image default. When spec.offload is set,
+// it also swaps in the apachepulsar/pulsar-all image (which bundles the
+// tiered-storage offloader jars the slim default image lacks) unless the
+// user set an explicit image of their own - either on the Broker sub-spec or
+// cluster-wide - which is left untouched since it may already be pulsar-all
+// or a custom build with offloaders baked in. It also wires
+// spec.offload.credentialsSecretRef in as broker container env vars so the
+// offloader driver can authenticate.
 func buildBrokerSpec(spec clusterv1alpha1.PulsarClusterSpec) *clusterv1alpha1.BrokerSpec {
 	out := spec.Broker.DeepCopy()
 	if out == nil {
 		return out
 	}
+
+	explicitImage := out.Image != "" || spec.Image != ""
 	out.Image = effectiveImage(out.Image, clusterDefaultImage(spec))
+
+	if spec.Offload != nil {
+		if !explicitImage {
+			if img := pulsarAllImage(spec.PulsarVersion); img != "" {
+				out.Image = img
+			}
+		}
+		out.Env = append(out.Env, offloadCredentialEnv(spec.Offload)...)
+	}
+
 	return out
 }
 

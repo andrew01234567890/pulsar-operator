@@ -406,6 +406,7 @@ func brokerContainer(broker *clusterv1alpha1.Broker, ports brokerPorts) corev1.C
 			{Name: brokerPortName, ContainerPort: ports.binary},
 			{Name: httpPortName, ContainerPort: ports.http},
 		},
+		Env:       broker.Spec.Env,
 		Resources: broker.Spec.Resources,
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: configVolumeName, MountPath: brokerConfMountPath, SubPath: brokerConfFileName, ReadOnly: true},
