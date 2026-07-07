@@ -31,7 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -136,7 +136,7 @@ var _ = Describe("Proxy Controller", func() {
 			Expect(k8sClient.Create(ctx, &clusterv1alpha1.Proxy{
 				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
 				Spec: clusterv1alpha1.ProxySpec{
-					Config: map[string]string{"metadataStoreUrl": "oxia://oxia-coordinator:6648/default"},
+					Config: map[string]string{configKeyMetadataStoreURL: "oxia://oxia-coordinator:6648/default"},
 				},
 			})).To(Succeed())
 		})
@@ -414,7 +414,7 @@ func TestProxyReconcileTLSMisconfiguredIsDegraded(t *testing.T) {
 		WithObjects(proxy).
 		WithStatusSubresource(&clusterv1alpha1.Proxy{}).
 		Build()
-	rec := record.NewFakeRecorder(8)
+	rec := events.NewFakeRecorder(8)
 	r := &ProxyReconciler{Client: c, Scheme: scheme, Recorder: rec}
 
 	ctx := context.Background()
@@ -454,8 +454,8 @@ func TestProxyReconcileTLSMisconfiguredIsDegraded(t *testing.T) {
 func TestProxyMergedConfig(t *testing.T) {
 	t.Run("defaults leave metadataStoreUrl blank", func(t *testing.T) {
 		got := proxyMergedConfig(clusterv1alpha1.ProxySpec{})
-		if got["metadataStoreUrl"] != "" {
-			t.Errorf("metadataStoreUrl = %q, want blank (must not hardcode a store naming convention)", got["metadataStoreUrl"])
+		if got[configKeyMetadataStoreURL] != "" {
+			t.Errorf("metadataStoreUrl = %q, want blank (must not hardcode a store naming convention)", got[configKeyMetadataStoreURL])
 		}
 	})
 

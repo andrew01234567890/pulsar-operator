@@ -28,7 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -48,6 +48,7 @@ const (
 
 	cmdBinPulsar = "bin/pulsar"
 
+	configKeyMetadataStoreURL              = "metadataStoreUrl"
 	configKeyConfigurationMetadataStoreURL = "configurationMetadataStoreUrl"
 
 	configValTrue = "true"
@@ -97,7 +98,7 @@ type ProxyReconciler struct {
 	// Recorder emits Warning events for misconfigurations (e.g. TLS enabled
 	// without a cert Secret). Optional: nil-safe so unit/integration tests can
 	// construct the reconciler without a recorder.
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=cluster.pulsaroperator.io,resources=proxies,verbs=get;list;watch;create;update;patch;delete
@@ -283,7 +284,9 @@ func (r *ProxyReconciler) reportTLSMisconfigured(ctx context.Context, proxy *clu
 	const msg = "tls.enabled=true but tls.secretName is empty; refusing to serve the proxy plaintext-only"
 
 	if r.Recorder != nil {
-		r.Recorder.Event(proxy, corev1.EventTypeWarning, reasonTLSMisconfigured, msg)
+		// events API: regarding=proxy, no related object, action describes what
+		// the controller did (refused to roll out), note is the human message.
+		r.Recorder.Eventf(proxy, nil, corev1.EventTypeWarning, reasonTLSMisconfigured, "RefusePlaintext", msg)
 	}
 
 	proxy.Status.ObservedGeneration = proxy.Generation
@@ -307,7 +310,7 @@ func (r *ProxyReconciler) reportTLSMisconfigured(ctx context.Context, proxy *clu
 // so it never invents a store URL itself; it flows in only via spec.config.
 func proxyDefaultConfig() map[string]string {
 	return map[string]string{
-		"metadataStoreUrl":                     "",
+		configKeyMetadataStoreURL:              "",
 		configKeyConfigurationMetadataStoreURL: "",
 		"bindAddress":                          "0.0.0.0",
 		"servicePort":                          strconv.Itoa(proxyPulsarPort),

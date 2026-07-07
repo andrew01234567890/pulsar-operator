@@ -92,9 +92,9 @@ func TestMergedBrokerConfig_UserOverridesWin(t *testing.T) {
 	broker := &clusterv1alpha1.Broker{
 		Spec: clusterv1alpha1.BrokerSpec{
 			Config: map[string]string{
-				"metadataStoreUrl":              testMetadataStoreURL,
-				"configurationMetadataStoreUrl": testMetadataStoreURL,
-				confKeyLoadManagerClassName:     "com.example.CustomLoadManager",
+				configKeyMetadataStoreURL:              testMetadataStoreURL,
+				configKeyConfigurationMetadataStoreURL: testMetadataStoreURL,
+				confKeyLoadManagerClassName:            "com.example.CustomLoadManager",
 			},
 		},
 	}
@@ -104,10 +104,10 @@ func TestMergedBrokerConfig_UserOverridesWin(t *testing.T) {
 	if got[confKeyLoadManagerClassName] != "com.example.CustomLoadManager" {
 		t.Errorf("loadManagerClassName = %q, want spec.Config override to win", got[confKeyLoadManagerClassName])
 	}
-	if got["metadataStoreUrl"] != testMetadataStoreURL {
-		t.Errorf("metadataStoreUrl = %q, want value from spec.Config", got["metadataStoreUrl"])
+	if got[configKeyMetadataStoreURL] != testMetadataStoreURL {
+		t.Errorf("metadataStoreUrl = %q, want value from spec.Config", got[configKeyMetadataStoreURL])
 	}
-	if _, present := defaultBrokerConfig(broker.Spec)["metadataStoreUrl"]; present {
+	if _, present := defaultBrokerConfig(broker.Spec)[configKeyMetadataStoreURL]; present {
 		t.Error("metadataStoreUrl must not be an operator default - it must only ever come from spec.Config")
 	}
 }
