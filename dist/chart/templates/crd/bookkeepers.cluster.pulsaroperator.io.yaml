@@ -1,0 +1,355 @@
+{{- if .Values.crd.enabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    {{- if .Values.crd.keep }}
+    "helm.sh/resource-policy": keep
+    {{- end }}
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: bookkeepers.cluster.pulsaroperator.io
+spec:
+  group: cluster.pulsaroperator.io
+  names:
+    kind: BookKeeper
+    listKind: BookKeeperList
+    plural: bookkeepers
+    singular: bookkeeper
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .status.writableBookies
+      name: Writable
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: BookKeeper is the Schema for the bookkeepers API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of BookKeeper
+            properties:
+              autoRackConfig:
+                description: autoRackConfig configures the bookie rack-awareness sync
+                  daemon.
+                properties:
+                  enabled:
+                    default: false
+                    description: enabled turns on the rack-awareness sync daemon.
+                    type: boolean
+                  periodSeconds:
+                    default: 60
+                    description: periodSeconds is the interval between rack-metadata
+                      sync passes.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                type: object
+              autoscaler:
+                description: autoscaler configures the disk-watermark-driven autoscaler.
+                properties:
+                  diskUsageToleranceHwm:
+                    default: 92
+                    description: |-
+                      diskUsageToleranceHwm is the high watermark; a writable bookie at or above
+                      this disk usage triggers a pre-emptive scale-up. Expressed as a
+                      whole-number percent in the range 0-100 (e.g. 92 means 92% disk used);
+                      autoscaler controllers divide by 100.
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  diskUsageToleranceLwm:
+                    default: 75
+                    description: |-
+                      diskUsageToleranceLwm is the low watermark; every writable bookie must be
+                      below this, with zero under-replicated ledgers cluster-wide, before a
+                      scale-down is considered. Expressed as a whole-number percent in the range
+                      0-100 (e.g. 75 means 75% disk used); autoscaler controllers divide by 100.
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  enabled:
+                    default: false
+                    description: enabled turns on the bookie disk-watermark autoscaler
+                      (scale-up).
+                    type: boolean
+                  minWritableBookies:
+                    description: |-
+                      minWritableBookies is the minimum number of writable bookies to maintain.
+                      Must be >= the largest configured ensembleSize.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  periodSeconds:
+                    default: 10
+                    description: periodSeconds is the interval between autoscaler
+                      evaluations.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  scaleDownBy:
+                    default: 1
+                    description: scaleDownBy is the number of bookies to remove on
+                      each scale-down.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  scaleDownEnabled:
+                    default: false
+                    description: |-
+                      scaleDownEnabled gates the guarded bookie decommission state machine.
+                      Kept OFF by default; enable only after validating the safe-decommission
+                      workflow against your metadata store.
+                    type: boolean
+                  scaleUpBy:
+                    default: 1
+                    description: scaleUpBy is the number of bookies to add on each
+                      scale-up.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  scaleUpMaxLimit:
+                    description: |-
+                      scaleUpMaxLimit is the maximum number of bookies. The autoscaler never
+                      scales above this.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  stabilizationWindowSeconds:
+                    default: 300
+                    description: |-
+                      stabilizationWindowSeconds gates scaling decisions until all bookie pods
+                      have been continuously Ready for this long, preventing flapping.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
+              config:
+                additionalProperties:
+                  type: string
+                description: |-
+                  config sets bookkeeper.conf key/value overrides layered on top of operator
+                  defaults. Structural/wiring keys the operator owns —
+                  journalDirectories, ledgerDirectories, indexDirectories, bookiePort,
+                  httpServerEnabled, and httpServerPort — are re-asserted by the operator to
+                  keep the rendered config in sync with the generated Service, probes, and
+                  volume mounts, so overrides of those specific keys are ignored. Every
+                  other key is applied as given.
+                type: object
+              ensemble:
+                description: ensemble configures the default ledger ensemble/write/ack
+                  quorum sizes.
+                properties:
+                  ackQuorum:
+                    default: 2
+                    description: ackQuorum is the number of acks required before an
+                      entry is confirmed.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  ensembleSize:
+                    default: 3
+                    description: ensembleSize is the number of bookies each ledger
+                      is striped across.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  writeQuorum:
+                    default: 2
+                    description: writeQuorum is the number of bookies each entry is
+                      written to.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                type: object
+              image:
+                description: |-
+                  image overrides the bookie container image. Falls back to
+                  PulsarCluster.spec.image when unset.
+                type: string
+              podManagementPolicy:
+                default: Parallel
+                description: |-
+                  podManagementPolicy is the StatefulSet pod management policy. Immutable
+                  once set; changing it requires operator-guarded validation in a future
+                  webhook.
+                enum:
+                - OrderedReady
+                - Parallel
+                type: string
+              replicas:
+                description: replicas is the number of bookie pods.
+                format: int32
+                minimum: 0
+                type: integer
+              volumes:
+                description: volumes configures the journal/ledgers/index disk-role
+                  volumes.
+                properties:
+                  index:
+                    description: index is the ledger-index volume.
+                    properties:
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: size is the requested storage capacity.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      storageClassName:
+                        description: |-
+                          storageClassName is the StorageClass used to provision the volume's PVC.
+                          Falls back to PulsarCluster.spec.global.storageClassName when unset.
+                        type: string
+                    type: object
+                  journal:
+                    description: journal is the write-ahead-log volume.
+                    properties:
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: size is the requested storage capacity.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      storageClassName:
+                        description: |-
+                          storageClassName is the StorageClass used to provision the volume's PVC.
+                          Falls back to PulsarCluster.spec.global.storageClassName when unset.
+                        type: string
+                    type: object
+                  ledgers:
+                    description: ledgers is the ledger-storage volume.
+                    properties:
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: size is the requested storage capacity.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      storageClassName:
+                        description: |-
+                          storageClassName is the StorageClass used to provision the volume's PVC.
+                          Falls back to PulsarCluster.spec.global.storageClassName when unset.
+                        type: string
+                    type: object
+                type: object
+            type: object
+          status:
+            description: status defines the observed state of BookKeeper
+            properties:
+              conditions:
+                description: conditions represent the current state of the BookKeeper
+                  resource.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: observedGeneration is the most recent generation observed
+                  by the controller.
+                format: int64
+                type: integer
+              readyReplicas:
+                description: readyReplicas is the observed number of Ready bookie
+                  pods.
+                format: int32
+                type: integer
+              replicas:
+                description: replicas is the observed number of bookie pods.
+                format: int32
+                type: integer
+              writableBookies:
+                description: writableBookies is the observed number of writable (non-read-only)
+                  bookies.
+                format: int32
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+{{- end }}
